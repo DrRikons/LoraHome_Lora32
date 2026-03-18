@@ -1,24 +1,4 @@
-/*
-   LoRa Remote Sensor Example
-
-   This device acts as a remote sensor:
-   - Reads temperature from DS18B20
-   - Reads battery voltage/current/capacity from INA226
-   - Transmits data via LoRa
-   - Enters deep sleep to conserve energy
-   - Supports dev mode for debugging
-*/
-
-#include "LoRaBoards.h"
-#include <RadioLib.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <INA226_WE.h>
-
-// Pin definitions
-#define DS18B20_PIN 4  // GPIO4 for DS18B20
-// Use a non-strapping pin to avoid boot issues (GPIO0/2/4/12/15 are strapping pins)
-#define DEV_MODE_PIN 13 // GPIO13 for dev mode toggle (pull low to enable)
+#include "Sensor.h"
 
 // Dev mode flag
 bool devMode = true;
@@ -29,121 +9,28 @@ DallasTemperature sensors(&oneWire);
 INA226_WE ina226 = INA226_WE(0x40); // INA226 at default I2C address 0x40
 
 // Data structure for transmission
-struct SensorData {
-  float temperature;
-  float batteryVoltage;
-  float batteryCurrent;
-  float batteryPower;
-  uint32_t timestamp;
-  uint8_t configVersion;
-} sensorData;
+SensorData sensorData;
 
 // Configuration structure
-struct Config {
-  uint32_t sleepInterval; // seconds
-  uint8_t configVersion;
-} config = {20, 1}; // Default 20 seconds
+Config config = {20, 1}; // Default 20 seconds
 
 // RTC memory for config persistence
 RTC_DATA_ATTR Config rtcConfig;
 
 #if     defined(USING_SX1276)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           868.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   17
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             125.0
-#endif
 SX1276 radio = new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN);
-
 #elif   defined(USING_SX1278)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           433.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   17
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             125.0
-#endif
 SX1278 radio = new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN);
-
 #elif   defined(USING_SX1262)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           850.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   22
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             125.0
-#endif
-
 SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
-
 #elif   defined(USING_SX1280)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           2400.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   13
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             203.125
-#endif
 SX1280 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
-
 #elif  defined(USING_SX1280PA)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           2400.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   3           // PA Version power range : -18 ~ 3dBm
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             203.125
-#endif
 SX1280 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
-
 #elif   defined(USING_SX1268)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           433.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   22
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             125.0
-#endif
 SX1268 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
-
 #elif   defined(USING_LR1121)
-
-/*
-* Important: LR1121 PA Version
-*
-* The 2.4G version does not have a power amplifier (PA). The permissible power setting is 13dBm.
-*
-* If it is a version with a built-in PA, please do not exceed 0dBm in the maximum power setting.
-* This is because a power amplifier has been added to the RF front-end; setting it to 0dBm will achieve an output power of 22dBm.
-* Setting it to more than 1dBm may damage the PA.
-*
-* */
-
-#define CONFIG_RADIO_FREQ           2450.0
-#define CONFIG_RADIO_OUTPUT_POWER   LILYGO_RADIO_2G4_TX_POWER_LIMIT
-#define CONFIG_RADIO_BW             125.0
-
-// The maximum power of LR1121 Sub 1G band can only be set to 22 dBm
-// #define CONFIG_RADIO_FREQ           868.0
-// #define CONFIG_RADIO_OUTPUT_POWER   22
-// #define CONFIG_RADIO_BW             125.0
-
 LR1121 radio = new Module(RADIO_CS_PIN, RADIO_DIO9_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
-
 #ifdef USING_LR1121PA
 // LR1121 Version PA RF switch table
 static const uint32_t pa_version_rf_switch_dio_pins[] = {
@@ -177,7 +64,6 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 #endif /*USING_LR1121PA*/
 #endif /*Radio define end*/
 
-void drawMain();
 
 // save transmission state between loops
 static int transmissionState = RADIOLIB_ERR_NONE;
@@ -191,10 +77,6 @@ static String deviceId;
 static int screenNum = -1;
 static int msgOffset = 0;
 
-// this function is called when a complete packet
-// is transmitted by the module
-// IMPORTANT: this function MUST be 'void' type
-//            and MUST NOT have any arguments!
 void setFlag(void)
 {
     // we sent a packet, set the flag
