@@ -39,3 +39,11 @@
 
 # debug information files
 *.dwo
+
+#platformio/IDEs
+.pio
+.vscode
+
+#build files
+src*
+include*
