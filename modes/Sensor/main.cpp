@@ -1,0 +1,590 @@
+/*
+   LoRa Remote Sensor Example
+
+   This device acts as a remote sensor:
+   - Reads temperature from DS18B20
+   - Reads battery voltage/current/capacity from INA226
+   - Transmits data via LoRa
+   - Enters deep sleep to conserve energy
+   - Supports dev mode for debugging
+*/
+
+#include "LoRaBoards.h"
+#include <RadioLib.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <INA226_WE.h>
+
+// Pin definitions
+#define DS18B20_PIN 4  // GPIO4 for DS18B20
+// Use a non-strapping pin to avoid boot issues (GPIO0/2/4/12/15 are strapping pins)
+#define DEV_MODE_PIN 13 // GPIO13 for dev mode toggle (pull low to enable)
+
+// Dev mode flag
+bool devMode = true;
+
+// Function Prototypes
+void readSensors();
+void transmitData();
+void enterDeepSleep();
+void listenForConfig();
+void drawMain();
+
+// Sensor objects
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature sensors(&oneWire);
+INA226_WE ina226 = INA226_WE(0x40); // INA226 at default I2C address 0x40
+
+// Data structure for transmission
+struct SensorData {
+  float temperature;
+  float batteryVoltage;
+  float batteryCurrent;
+  float batteryPower;
+  uint8_t batteryPercent;
+  float cpuTemp;
+  uint32_t freeRam;
+  float lastSNR;
+  float lastRSSI;
+  uint32_t timestamp;
+  uint8_t configVersion;
+} sensorData;
+
+// Configuration structure
+struct Config {
+  uint32_t sleepInterval; // seconds
+  uint8_t configVersion;
+  bool isDevMode; // Remote dev mode flag #10
+} config = {20, 1, false}; // Default 20 seconds
+
+// RTC memory for config persistence
+RTC_DATA_ATTR Config rtcConfig;
+
+#if     defined(USING_SX1276)
+#ifndef CONFIG_RADIO_FREQ
+#define CONFIG_RADIO_FREQ           868.0
+#endif
+#ifndef CONFIG_RADIO_OUTPUT_POWER
+#define CONFIG_RADIO_OUTPUT_POWER   17
+#endif
+#ifndef CONFIG_RADIO_BW
+#define CONFIG_RADIO_BW             125.0
+#endif
+SX1276 radio = new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN);
+
+#elif   defined(USING_SX1278)
+#ifndef CONFIG_RADIO_FREQ
+#define CONFIG_RADIO_FREQ           433.0
+#endif
+#ifndef CONFIG_RADIO_OUTPUT_POWER
+#define CONFIG_RADIO_OUTPUT_POWER   17
+#endif
+#ifndef CONFIG_RADIO_BW
+#define CONFIG_RADIO_BW             125.0
+#endif
+SX1278 radio = new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN);
+
+#elif   defined(USING_SX1262)
+#ifndef CONFIG_RADIO_FREQ
+#define CONFIG_RADIO_FREQ           850.0
+#endif
+#ifndef CONFIG_RADIO_OUTPUT_POWER
+#define CONFIG_RADIO_OUTPUT_POWER   22
+#endif
+#ifndef CONFIG_RADIO_BW
+#define CONFIG_RADIO_BW             125.0
+#endif
+
+SX1262 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+
+#elif   defined(USING_SX1280)
+#ifndef CONFIG_RADIO_FREQ
+#define CONFIG_RADIO_FREQ           2400.0
+#endif
+#ifndef CONFIG_RADIO_OUTPUT_POWER
+#define CONFIG_RADIO_OUTPUT_POWER   13
+#endif
+#ifndef CONFIG_RADIO_BW
+#define CONFIG_RADIO_BW             203.125
+#endif
+SX1280 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+
+#elif  defined(USING_SX1280PA)
+#ifndef CONFIG_RADIO_FREQ
+#define CONFIG_RADIO_FREQ           2400.0
+#endif
+#ifndef CONFIG_RADIO_OUTPUT_POWER
+#define CONFIG_RADIO_OUTPUT_POWER   3           // PA Version power range : -18 ~ 3dBm
+#endif
+#ifndef CONFIG_RADIO_BW
+#define CONFIG_RADIO_BW             203.125
+#endif
+SX1280 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+
+#elif   defined(USING_SX1268)
+#ifndef CONFIG_RADIO_FREQ
+#define CONFIG_RADIO_FREQ           433.0
+#endif
+#ifndef CONFIG_RADIO_OUTPUT_POWER
+#define CONFIG_RADIO_OUTPUT_POWER   22
+#endif
+#ifndef CONFIG_RADIO_BW
+#define CONFIG_RADIO_BW             125.0
+#endif
+SX1268 radio = new Module(RADIO_CS_PIN, RADIO_DIO1_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+
+#elif   defined(USING_LR1121)
+
+/*
+* Important: LR1121 PA Version
+*
+* The 2.4G version does not have a power amplifier (PA). The permissible power setting is 13dBm.
+*
+* If it is a version with a built-in PA, please do not exceed 0dBm in the maximum power setting.
+* This is because a power amplifier has been added to the RF front-end; setting it to 0dBm will achieve an output power of 22dBm.
+* Setting it to more than 1dBm may damage the PA.
+*
+* */
+
+#define CONFIG_RADIO_FREQ           2450.0
+#define CONFIG_RADIO_OUTPUT_POWER   LILYGO_RADIO_2G4_TX_POWER_LIMIT
+#define CONFIG_RADIO_BW             125.0
+
+// The maximum power of LR1121 Sub 1G band can only be set to 22 dBm
+// #define CONFIG_RADIO_FREQ           868.0
+// #define CONFIG_RADIO_OUTPUT_POWER   22
+// #define CONFIG_RADIO_BW             125.0
+
+LR1121 radio = new Module(RADIO_CS_PIN, RADIO_DIO9_PIN, RADIO_RST_PIN, RADIO_BUSY_PIN);
+
+#ifdef USING_LR1121PA
+// LR1121 Version PA RF switch table
+static const uint32_t pa_version_rf_switch_dio_pins[] = {
+    RADIOLIB_LR11X0_DIO5, RADIOLIB_LR11X0_DIO6, RADIOLIB_LR11X0_DIO7, RADIOLIB_LR11X0_DIO8, RADIOLIB_NC
+};
+
+static const Module::RfSwitchMode_t high_freq_switch_table[] = {
+    // mode                  DIO5  DIO6 DIO7 DIO8
+    { LR11x0::MODE_STBY,   { LOW,  LOW, LOW, LOW} },
+    { LR11x0::MODE_TX,     { LOW,  LOW, LOW, HIGH} },
+    { LR11x0::MODE_RX,     { LOW,  LOW, HIGH, LOW} },
+    { LR11x0::MODE_TX_HP,  { LOW,  LOW, HIGH, LOW} },
+    { LR11x0::MODE_TX_HF,  { LOW,  LOW, HIGH, LOW} },
+    { LR11x0::MODE_GNSS,   { LOW,  LOW, LOW, HIGH} },
+    { LR11x0::MODE_WIFI,   { LOW,  LOW, LOW, HIGH} },
+    END_OF_MODE_TABLE,
+};
+
+static const Module::RfSwitchMode_t low_freq_switch_table[] = {
+    // mode                  DIO5  DIO6 DIO7 DIO8
+    { LR11x0::MODE_STBY,   { LOW,  LOW, LOW, LOW} },
+    { LR11x0::MODE_TX,     { LOW,  HIGH, LOW, LOW} },
+    { LR11x0::MODE_RX,     { HIGH, LOW, LOW, LOW} },
+    { LR11x0::MODE_TX_HP,  { LOW,  HIGH, LOW, LOW} },
+    { LR11x0::MODE_TX_HF,  { LOW,  LOW, LOW, LOW} },
+    { LR11x0::MODE_GNSS,   { LOW,  LOW, LOW, LOW} },
+    { LR11x0::MODE_WIFI,   { LOW,  LOW, LOW, LOW} },
+    END_OF_MODE_TABLE,
+};
+
+#endif /*USING_LR1121PA*/
+#endif /*Radio define end*/
+
+// save transmission state between loops
+static int transmissionState = RADIOLIB_ERR_NONE;
+// flag to indicate that a packet was sent
+static volatile bool transmittedFlag = false;
+static uint32_t counter = 0;
+static String payload;
+
+// Transmission details
+static String deviceId;
+static int screenNum = -1;
+static int msgOffset = 0;
+
+// Callback function for LoRa transmission completion.
+// IMPORTANT: This function MUST be 'void' type and MUST NOT have any arguments!
+void setFlag(void)
+{
+    // we sent a packet, set the flag
+    transmittedFlag = true;
+}
+
+// Standard Arduino setup function. Initializes hardware, sensors, and radio.
+// Used in: Both Operation and Dev modes
+void setup()
+{
+    // Load config from RTC memory first to evaluate remote dev mode
+    config = rtcConfig;
+    if (config.sleepInterval < 10 || config.sleepInterval > 86400) {
+        // Protect against invalid or uninitialized RTC values
+        config.sleepInterval = 60;
+        config.configVersion = 1;
+        config.isDevMode = false;
+    }
+
+    // Check dev mode (hardware pin OR remote config)
+    pinMode(DEV_MODE_PIN, INPUT_PULLUP);
+    devMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
+
+    if (devMode) {
+        setupBoards(); // Enable all peripherals for dev mode
+        Serial.println("Dev/Debug mode");
+    } else {
+        // Minimal setup for power saving
+        Serial.begin(115200);
+        delay(100);
+        Serial.println("Operation mode");
+        
+        // Disable WiFi and Bluetooth
+        WiFi.mode(WIFI_OFF);
+        btStop();
+        
+        // Initialize I2C only for sensors
+        Wire.begin(21, 22); // SDA, SCL
+        
+        // Initialize display if available
+        #ifdef HAS_DISPLAY
+        beginDisplay();
+        #endif
+        
+        // Initialize SPI for radio
+        SPI.begin(5, 19, 27);
+        
+        // Set radio pins
+        pinMode(18, OUTPUT); // RADIO_CS_PIN
+        digitalWrite(18, HIGH);
+        pinMode(23, OUTPUT); // RADIO_RST_PIN
+        digitalWrite(23, HIGH);
+        pinMode(32, INPUT); // RADIO_DIO2_PIN
+    }
+    
+    // Initialize LED
+    pinMode(BOARD_LED, OUTPUT);
+    digitalWrite(BOARD_LED, !LED_ON);
+
+    // Initialize sensors
+    sensors.begin();
+    ina226.init(); // Initialize INA226
+    ina226.setResistorRange(0.1, 1); // 0.1 ohm shunt, range 1
+
+    // Radio setup (same as before, but only if not sleeping)
+    int state = radio.begin();
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.print(F("Radio init failed: "));
+        Serial.println(state);
+        return;
+    }
+
+    // Set radio parameters (same as before)
+    radio.setFrequency(CONFIG_RADIO_FREQ);
+    radio.setBandwidth(CONFIG_RADIO_BW);
+    radio.setSpreadingFactor(12);
+    radio.setCodingRate(6);
+    radio.setSyncWord(0xAB);
+    radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER);
+    radio.setCRC(false);
+
+    // Set packet sent callback
+    radio.setPacketSentAction(setFlag);
+
+    // Display mode message
+    #ifdef HAS_DISPLAY
+    if (disp) {
+        // Unique device identity (use MAC)
+        uint64_t mac = ESP.getEfuseMac();
+        char idBuf[17];
+        sprintf(idBuf, "%08X%08X", (uint32_t)(mac >> 32), (uint32_t)mac);
+        deviceId = String(idBuf);
+
+        const char *modeText = devMode ? "DEV MODE" : "OP MODE";
+        disp->clearBuffer();
+        disp->setFont(u8g2_font_fur11_tf);
+        int16_t x = (disp->getDisplayWidth() - disp->getUTF8Width(modeText)) / 2;
+        disp->drawStr(x, 30, modeText);
+        disp->sendBuffer();
+        delay(2000);
+        disp->clearBuffer();
+        disp->sendBuffer();
+    }
+    #endif
+
+    // Read sensors and transmit
+    readSensors();
+    if (devMode) {
+        drawMain();
+    }
+    transmitData();
+
+    // deep sleep, prevents from entering loop
+    enterDeepSleep();
+}
+
+// Standard Arduino loop function.
+// Used in: ONLY Dev mode (Simulates the device lifecycle continuously. Bypassed in Operation mode via deep sleep).
+void loop()
+{
+    // In operation mode, we don't loop - we transmit and sleep
+    // In dev mode, we can add debug functionality here
+    if (devMode) {
+        Serial.println("\n[DEV] --- Wake ---");
+        readSensors();
+        
+        Serial.println("[DEV] --- Transmit ---");
+        transmitData();
+        
+        Serial.println("[DEV] --- Receive ---");
+        listenForConfig(); // Listen for config every cycle in dev mode
+        
+        Serial.println("[DEV] --- Display ---");
+        // Rotate through all 4 screens
+        for (int i = 0; i < 4; i++) {
+            drawMain();
+            delay(2000); // Show each screen for 2 seconds
+        }
+        
+        Serial.println("[DEV] --- Sleep ---");
+        delay(4000); // Simulated sleep duration
+    }
+    // Otherwise, loop does nothing as we sleep after setup
+}
+
+// Converts a given voltage to an estimated percentage (0-100%) for a typical 18650 Li-Ion battery #6
+// Used in: Both Operation and Dev modes
+uint8_t getBatteryPercentage(float voltage) {
+    int voltage_mv = voltage * 1000;
+    // Voltage lookup table for 0%, 10%, 20%, ..., 100%
+    const static int table[11] = {
+        3000, 3650, 3700, 3740, 3760, 3795,
+        3840, 3910, 3980, 4070, 4150
+    };
+    if (voltage_mv < table[0]) return 0;
+    for (int i = 1; i < 11; i++) {
+        if (voltage_mv < table[i]) {
+            return i * 10 - (10 * (table[i] - voltage_mv)) / (table[i] - table[i - 1]);
+        }
+    }
+    return 100;
+}
+
+// Reads data from connected sensors (DS18B20, INA226) and internal ESP32 metrics (CPU temp, RAM).
+// Used in: Both Operation and Dev modes
+void readSensors()
+{
+    // Read DS18B20 temperature
+    sensors.requestTemperatures();
+    sensorData.temperature = sensors.getTempCByIndex(0);
+
+    // Read INA226 data
+    sensorData.batteryVoltage = ina226.getBusVoltage_V();
+    sensorData.batteryCurrent = ina226.getCurrent_mA();
+    sensorData.batteryPower = ina226.getBusPower();
+    sensorData.batteryPercent = getBatteryPercentage(sensorData.batteryVoltage);
+
+    // Read ESP32 internals
+    sensorData.cpuTemp = temperatureRead();
+    sensorData.freeRam = ESP.getFreeHeap() / 1024;
+
+    // Set timestamp (placeholder - would get from gateway)
+    sensorData.timestamp = millis();
+    sensorData.configVersion = config.configVersion;
+
+    if (devMode) {
+        Serial.printf("Temp: %.2f C, Volt: %.2f V, Curr: %.2f mA, Power: %.2f mW, CPUTemp: %.1f C, RAM: %u KB\n",
+                      sensorData.temperature, sensorData.batteryVoltage,
+                      sensorData.batteryCurrent, sensorData.batteryPower,
+                      sensorData.cpuTemp, sensorData.freeRam);
+    }
+}
+
+// Constructs the telemetry payload string and transmits it via the LoRa radio.
+// Used in: Both Operation and Dev modes
+void transmitData()
+{
+    // Prepare payload (includes unique device ID and message counter)
+    uint32_t msgCount = ++counter;
+    payload = "ID:" + deviceId + ",T:" +
+              String(sensorData.temperature, 1) + ",V:" +
+              String(sensorData.batteryVoltage, 2) + ",I:" +
+              String(sensorData.batteryCurrent, 1) + ",P:" +
+              String(sensorData.batteryPower, 1) + ",B%:" +
+              String(sensorData.batteryPercent) + ",S:" +
+              String(sensorData.configVersion) + ",CNT:" +
+              String(msgCount) + ",CT:" +
+              String(sensorData.cpuTemp, 1) + ",RAM:" +
+              String(sensorData.freeRam) + ",TXP:" +
+              String(CONFIG_RADIO_OUTPUT_POWER) + ",SNR:" +
+              String(sensorData.lastSNR, 2) + ",RSSI:" +
+              String(sensorData.lastRSSI, 2);
+
+    // Turn LED on during transmission
+    digitalWrite(BOARD_LED, LED_ON);
+
+    transmissionState = radio.startTransmit(payload.c_str());
+
+    if (devMode) {
+        Serial.print("Transmitting: ");
+        Serial.println(payload);
+    }
+
+    // Wait for transmission to complete
+    while (!transmittedFlag) {
+        delay(10);
+    }
+    transmittedFlag = false;
+
+    // Turn LED off after transmission
+    digitalWrite(BOARD_LED, !LED_ON);
+
+    if (devMode) {
+        Serial.println("Transmission complete");
+    }
+}
+
+// Handles sleep timing, conditionally triggering the configuration listener, and deep sleeping the ESP32.
+// Used in: Both Operation and Dev modes (skips actual esp_deep_sleep_start in Dev mode)
+void enterDeepSleep()
+{
+    // Listen briefly for config (every 10 cycles)
+    static uint8_t cycleCount = 0;
+    cycleCount++;
+    if (cycleCount >= 10) {
+        cycleCount = 0;
+        listenForConfig();
+    }
+
+    if (devMode) {
+        Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
+        delay(1000); // Allow serial to finish
+        return; // Exit deep sleep function
+    }
+
+    // Configure wake up timer
+    esp_sleep_enable_timer_wakeup(config.sleepInterval * 1000000ULL); // microseconds
+
+    // Enter deep sleep
+    esp_deep_sleep_start();
+}
+
+// Listens for incoming LoRa configuration packets from the Gateway for 5 seconds.
+// Used in: Both Operation and Dev modes
+void listenForConfig()
+{
+    radio.startReceive();
+    unsigned long startTime = millis();
+    while (millis() - startTime < 5000) { // Listen for 5 seconds
+        if (radio.available()) {
+            String received = "";
+            int state = radio.readData(received);
+            if (state == RADIOLIB_ERR_NONE) {
+                // Grab the signal strength of the received packet
+                sensorData.lastSNR = radio.getSNR();
+                sensorData.lastRSSI = radio.getRSSI();
+                
+                if (received.startsWith("CONFIG:")) {
+                    // Parse config: CONFIG:sleepInterval,version[,isDevMode]
+                    int commaIndex = received.indexOf(',');
+                    if (commaIndex > 0) {
+                        config.sleepInterval = received.substring(7, commaIndex).toInt();
+                        
+                        int secondCommaIndex = received.indexOf(',', commaIndex + 1);
+                        if (secondCommaIndex > 0) {
+                            config.configVersion = received.substring(commaIndex + 1, secondCommaIndex).toInt();
+                            config.isDevMode = (received.substring(secondCommaIndex + 1).toInt() > 0);
+                        } else {
+                            config.configVersion = received.substring(commaIndex + 1).toInt();
+                        }
+                        
+                        rtcConfig = config; // Save to RTC
+                        
+                        bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
+                        if (devMode != cfgMode) {
+                            Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
+                            delay(1000);
+                            ESP.restart(); // Soft reset to cleanly initialize/de-initialize hardware
+                        } else if (devMode) {
+                            Serial.printf("Config updated: sleep=%d, version=%d, devMode=%d\n",
+                                          config.sleepInterval, config.configVersion, config.isDevMode);
+                        }
+                    }
+                }
+            }
+        }
+        delay(10);
+    }
+    radio.standby();
+}
+
+// Renders telemetry and device data to the OLED display. Cycles through 4 different informational screens.
+// Used in: ONLY Dev mode
+void drawMain()
+{
+    if (devMode) {
+        Serial.println("drawMain called");
+        if (disp) {
+            Serial.println("disp is not null, drawing...");
+        } else {
+            Serial.println("disp is null, cannot draw");
+        }
+    }
+    if (devMode && disp) {
+        screenNum = (screenNum + 1) % 4; // Cycle through 4 screens
+        disp->clearBuffer();
+        disp->drawRFrame(0, 0, 128, 64, 5);
+        disp->setFont(u8g2_font_pxplusibmvga8_mr);
+
+        switch (screenNum) {
+            case 0: // Primary Sensors
+                disp->setCursor(5, 15);
+                disp->printf("TSense: %.1fC", sensorData.temperature);
+                disp->setCursor(5, 30);
+                disp->printf("TCPU: %.1fC", sensorData.cpuTemp);
+                disp->setCursor(5, 45);
+                disp->printf("VCC: %.2fV", sensorData.batteryVoltage);
+                disp->setCursor(5, 60);
+                disp->printf("Batt: %d%%", sensorData.batteryPercent);
+                break;
+
+            case 1: // Power Details
+                disp->setCursor(5, 15);
+                if (sensorData.batteryCurrent < 0) {
+                    disp->printf("Chg: %.0fmA", sensorData.batteryCurrent);
+                } else {
+                    disp->printf("Curr: %.0fmA", sensorData.batteryCurrent);
+                }
+                disp->setCursor(5, 30);
+                disp->printf("Power: %.0fmW", sensorData.batteryPower);
+                disp->setCursor(5, 45);
+                disp->printf("RAM: %u KB", sensorData.freeRam);
+                break;
+
+            case 2: // LoRa & System
+                disp->setCursor(5, 15);
+                disp->printf("SNR:%.1f R:%.0f", sensorData.lastSNR, sensorData.lastRSSI);
+                disp->setCursor(5, 30);
+                disp->printf("TX Pwr: %ddBm", CONFIG_RADIO_OUTPUT_POWER);
+                disp->setCursor(5, 45);
+                disp->printf("Count: %u", counter);
+                disp->setCursor(5, 60);
+                disp->printf("Sleep: %d s", config.sleepInterval);
+                break;
+
+            case 3: // IDs & Payload
+                disp->setCursor(5, 15);
+                disp->printf("ID: %.12s...", deviceId.c_str());
+                disp->setCursor(5, 30);
+                disp->printf("Cfg Ver: %d", config.configVersion);
+                
+                // Scrolling payload preview
+                if (payload.length() > 18) { // Approx 18 chars fit
+                    msgOffset = (msgOffset + 1) % (payload.length() - 18);
+                } else {
+                    msgOffset = 0;
+                }
+                disp->setCursor(0, 60);
+                disp->printf(">%.18s", payload.c_str() + msgOffset);
+                break;
+        }
+        disp->sendBuffer();
+    }
+}
