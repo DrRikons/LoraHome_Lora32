@@ -14,11 +14,19 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <INA226_WE.h>
+#include <sys/time.h>
+#include <time.h>
 
 // Pin definitions
 #define DS18B20_PIN 4  // GPIO4 for DS18B20
 // Use a non-strapping pin to avoid boot issues (GPIO0/2/4/12/15 are strapping pins)
 #define DEV_MODE_PIN 13 // GPIO13 for dev mode toggle (pull low to enable)
+
+// Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
+#define CUSTOM_EPOCH 1704067200UL
+
+// Magic word to validate RTC memory integrity
+#define RTC_MAGIC_WORD 0xA1B2C3D4
 
 // Dev mode flag
 bool devMode = true;
@@ -52,10 +60,12 @@ struct SensorData {
 
 // Configuration structure
 struct Config {
+  uint32_t magicWord;
   uint32_t sleepInterval; // seconds
   uint8_t configVersion;
-  bool isDevMode; // Remote dev mode flag #10
-} config = {20, 1, false}; // Default 20 seconds
+  bool isDevMode; // Remote dev mode flag
+  uint32_t epochTime; // Unix timestamp
+} config = {RTC_MAGIC_WORD, 20, 1, false, CUSTOM_EPOCH}; // Default 20 seconds, base time Jan 1, 2024
 
 // RTC memory for config persistence
 RTC_DATA_ATTR Config rtcConfig;
@@ -216,11 +226,14 @@ void setup()
 {
     // Load config from RTC memory first to evaluate remote dev mode
     config = rtcConfig;
-    if (config.sleepInterval < 10 || config.sleepInterval > 86400) {
-        // Protect against invalid or uninitialized RTC values
+    
+    // Validate RTC memory using the magic word and basic bounds checking
+    if (config.magicWord != RTC_MAGIC_WORD || config.sleepInterval < 10 || config.sleepInterval > 86400) {
+        config.magicWord = RTC_MAGIC_WORD;
         config.sleepInterval = 60;
         config.configVersion = 1;
         config.isDevMode = false;
+        config.epochTime = CUSTOM_EPOCH;
     }
 
     // Check dev mode (hardware pin OR remote config)
@@ -389,8 +402,10 @@ void readSensors()
     sensorData.cpuTemp = temperatureRead();
     sensorData.freeRam = ESP.getFreeHeap() / 1024;
 
-    // Set timestamp (placeholder - would get from gateway)
-    sensorData.timestamp = millis();
+    // Get current time (ESP32 RTC survives deep sleep, drift is fixed on config update)
+    time_t now;
+    time(&now);
+    sensorData.timestamp = (uint32_t)now;
     sensorData.configVersion = config.configVersion;
 
     if (devMode) {
@@ -474,47 +489,53 @@ void enterDeepSleep()
 // Used in: Both Operation and Dev modes
 void listenForConfig()
 {
-    radio.startReceive();
     unsigned long startTime = millis();
     while (millis() - startTime < 5000) { // Listen for 5 seconds
-        if (radio.available()) {
-            String received = "";
-            int state = radio.readData(received);
-            if (state == RADIOLIB_ERR_NONE) {
-                // Grab the signal strength of the received packet
-                sensorData.lastSNR = radio.getSNR();
-                sensorData.lastRSSI = radio.getRSSI();
-                
-                if (received.startsWith("CONFIG:")) {
-                    // Parse config: CONFIG:sleepInterval,version[,isDevMode]
-                    int commaIndex = received.indexOf(',');
-                    if (commaIndex > 0) {
-                        config.sleepInterval = received.substring(7, commaIndex).toInt();
-                        
-                        int secondCommaIndex = received.indexOf(',', commaIndex + 1);
-                        if (secondCommaIndex > 0) {
-                            config.configVersion = received.substring(commaIndex + 1, secondCommaIndex).toInt();
-                            config.isDevMode = (received.substring(secondCommaIndex + 1).toInt() > 0);
-                        } else {
-                            config.configVersion = received.substring(commaIndex + 1).toInt();
+        String received = "";
+        // Use RadioLib's blocking receive with a 1-second timeout instead of available()
+        int state = radio.receive(received, 1000); 
+        
+        if (state == RADIOLIB_ERR_NONE) {
+            // Grab the signal strength of the received packet
+            sensorData.lastSNR = radio.getSNR();
+            sensorData.lastRSSI = radio.getRSSI();
+            
+            if (received.startsWith("CONFIG:")) {
+                // Parse config: CONFIG:sleepInterval,version[,isDevMode[,epochTime]]
+                int part = 0;
+                int lastIdx = 7;
+                for (int i = 7; i <= received.length(); i++) {
+                    if (i == received.length() || received.charAt(i) == ',') {
+                        String val = received.substring(lastIdx, i);
+                        if (part == 0) config.sleepInterval = val.toInt();
+                        else if (part == 1) config.configVersion = val.toInt();
+                        else if (part == 2) config.isDevMode = (val.toInt() > 0);
+                        else if (part == 3) {
+                            config.epochTime = strtoul(val.c_str(), NULL, 10) + CUSTOM_EPOCH;
+                            // Sync the internal ESP32 RTC to fix time drift
+                            struct timeval tv;
+                            tv.tv_sec = config.epochTime;
+                            tv.tv_usec = 0;
+                            settimeofday(&tv, NULL);
                         }
-                        
-                        rtcConfig = config; // Save to RTC
-                        
-                        bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
-                        if (devMode != cfgMode) {
-                            Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
-                            delay(1000);
-                            ESP.restart(); // Soft reset to cleanly initialize/de-initialize hardware
-                        } else if (devMode) {
-                            Serial.printf("Config updated: sleep=%d, version=%d, devMode=%d\n",
-                                          config.sleepInterval, config.configVersion, config.isDevMode);
-                        }
+                        lastIdx = i + 1;
+                        part++;
                     }
+                }
+                
+                rtcConfig = config; // Save to RTC
+                
+                bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
+                if (devMode != cfgMode) {
+                    Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
+                    delay(1000);
+                    ESP.restart(); // Soft reset to cleanly initialize/de-initialize hardware
+                } else if (devMode) {
+                    Serial.printf("Config updated: sleep=%d, version=%d, devMode=%d\n",
+                                  config.sleepInterval, config.configVersion, config.isDevMode);
                 }
             }
         }
-        delay(10);
     }
     radio.standby();
 }
