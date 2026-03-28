@@ -327,7 +327,7 @@ void loop()
     // In operation mode, we don't loop - we transmit and sleep
     // In dev mode, we can add debug functionality here
     if (devMode) {
-        Serial.println("\n[DEV] --- Wake ---");
+        Serial.println("\n[DEV] --- Wake, Read Sensors ---");
         readSensors();
         
         Serial.println("[DEV] --- Transmit ---");
@@ -344,6 +344,10 @@ void loop()
         }
         
         Serial.println("[DEV] --- Sleep ---");
+        if (disp) {
+            disp->clearBuffer();
+            disp->sendBuffer();
+        }
         delay(4000); // Simulated sleep duration
     }
     // Otherwise, loop does nothing as we sleep after setup

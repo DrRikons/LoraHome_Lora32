@@ -15,8 +15,6 @@ The configuration string must follow this format:
 -   `<version>`: A version number for the configuration. This must be an integer value.
 -   `<devMode>`: *(Optional)* 1 to enable developer mode continuously without deep sleeping, 0 to disable.
 
-*Note: Changing the mode remotely will trigger a soft reset of the ESP32 to cleanly initialize/de-initialize power-heavy peripherals. If the physical `DEV_MODE_PIN` (GPIO13) is pulled LOW, it acts as a hard hardware override and the device will ignore any remote commands to enter Operation Mode.*
-
 **Examples:**
 
 - Set sleep interval to 300 seconds, version 2: `CONFIG:300,2`
@@ -39,8 +37,11 @@ The sensor node transmits telemetry data in the following comma-separated string
 
 *Note: SNR and RSSI metrics represent the signal quality of the last received configuration packet from the gateway.*
 
+## Automation
+This repository includes a GitHub Action (`issue-commenter.yml`) that automatically posts a comment to any GitHub Issue referenced in a commit message (e.g., `#123`).
+
 ## Development
-When running in `devMode` (GPIO13 pulled LOW), the sensor will continuously simulate its full operational cycle without deep sleeping: Wake -> Transmit -> Receive -> Display (cycling through all OLED screens) -> Simulated Sleep.
+When running in `devMode` (GPIO13 pulled LOW), the sensor will continuously simulate its full operational cycle without deep sleeping: Wake -> Transmit -> Receive -> Display (cycling through all OLED screens) -> Simulated Sleep (OLED clears).
 
 An `.aiexclude` file is included to prevent AI coding assistants from indexing large third-party libraries in the `lib/` folder and build artifacts in the `.pio/` folder, preserving context space.
 

@@ -14,8 +14,9 @@ A LoRa-based remote sensor and gateway system for boiler temperature monitoring 
 - **Core Logic**: Located in `modes/Sensor/main.cpp`.
 - **Telemetry Payload Format**: `ID:<MAC>,T:<Temp>,V:<Volt>,I:<Curr>,P:<Power>,B%:<BattPercent>,S:<ConfigVer>,CNT:<MsgCount>,CT:<CpuTemp>,RAM:<RamKB>,TXP:<TxPower>,SNR:<SNR>,RSSI:<RSSI>`
 - **Remote Configuration**: Devices listen for a `CONFIG:<sleepInterval>,<version>[,<devMode>]` packet every 10 sleep cycles to update deep sleep intervals and mode via RTC memory.
-- **Development Mode**: Triggered via GPIO13 (low) or remotely via config (hardware pin overrides remote config). Mode switches trigger a soft reset. Simulates the full lifecycle (Wake -> Transmit -> Receive -> Multi-screen Display -> Sleep) continuously without entering actual ESP32 deep sleep.
+- **Development Mode**: Triggered via GPIO13 (low) or remotely via config (hardware pin overrides remote config). Mode switches trigger a soft reset. Simulates the full lifecycle (Wake -> Transmit -> Receive -> Multi-screen Display -> Simulated Sleep with display off) continuously without entering actual ESP32 deep sleep.
 - **Code Documentation**: Functions in `main.cpp` contain inline comments denoting their usage scope (Operation mode vs Dev mode).
+- **CI/CD Actions**: Includes `.github/workflows/issue-commenter.yml` for auto-commenting on issues referenced in git commits.
 
 ## Current Dependencies (platformio.ini)
 - milesburton/DallasTemperature
