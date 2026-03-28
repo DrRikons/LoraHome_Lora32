@@ -1,0 +1,8 @@
+# PlatformIO build directories and downloaded packages
+.pio/
+
+# Third-party libraries to save AI context space
+lib/
+
+# IDE related files
+.vscode/
