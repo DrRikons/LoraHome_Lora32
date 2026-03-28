@@ -1,7 +1,29 @@
-#include "Sensor.h"
+/*
+   LoRa Remote Sensor Example
+
+   This device acts as a remote sensor:
+   - Reads temperature from DS18B20
+   - Reads battery voltage/current/capacity from INA226
+   - Transmits data via LoRa
+   - Enters deep sleep to conserve energy
+   - Supports dev mode for debugging
+   - Supports remote configuration (perhaps OTA updates?)
+*/
+
+#include "LoRaBoards.h"
+#include <RadioLib.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <INA226_WE.h>
+
+// Pin definitions
+#define DS18B20_PIN 4  // GPIO4 for DS18B20
+
+// dev mode toggle (pull low to enable) Use a non-strapping pin to avoid boot issues (GPIO0/2/4/12/15 are strapping pins)
+#define DEV_MODE_PIN 13 // GPIO13
 
 // Dev mode flag
-bool devMode = true;
+bool devMode = false;
 
 // Sensor objects
 OneWire oneWire(DS18B20_PIN);
@@ -9,7 +31,15 @@ DallasTemperature sensors(&oneWire);
 INA226_WE ina226 = INA226_WE(0x40); // INA226 at default I2C address 0x40
 
 // Data structure for transmission
-SensorData sensorData;
+struct SensorData {
+  float temperature;
+  float batteryVoltage;
+  float batteryCurrent;
+  float batteryPower;
+  uint8_t batteryPercent;
+  uint32_t timestamp; // perhaps overkill
+  uint8_t configVersion;
+} sensorData;
 
 // Configuration structure
 Config config = {20, 1}; // Default 20 seconds
@@ -17,6 +47,7 @@ Config config = {20, 1}; // Default 20 seconds
 // RTC memory for config persistence
 RTC_DATA_ATTR Config rtcConfig;
 
+// Lora radio identification
 #if     defined(USING_SX1276)
 SX1276 radio = new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN);
 #elif   defined(USING_SX1278)
@@ -64,6 +95,7 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 #endif /*USING_LR1121PA*/
 #endif /*Radio define end*/
 
+void drawMain(); //define main
 
 // save transmission state between loops
 static int transmissionState = RADIOLIB_ERR_NONE;
@@ -72,8 +104,11 @@ static volatile bool transmittedFlag = false;
 static uint32_t counter = 0;
 static String payload;
 
-// Transmission details
+// Device details
 static String deviceId;
+static String deviceName;
+
+// Display
 static int screenNum = -1;
 static int msgOffset = 0;
 
@@ -90,17 +125,13 @@ void setup()
     devMode = (digitalRead(DEV_MODE_PIN) == LOW);
 
     if (devMode) {
-        setupBoards(); // Enable all peripherals for dev mode
+        setupBoards(); // Enable all peripherals for dev mode //call to LoRaBoards.h
         Serial.println("Dev/Debug mode");
-    } else {
-        // Minimal setup for power saving
-        Serial.begin(115200);
-        delay(100);
-        Serial.println("Operation mode");
         
+    } else {       
         // Disable WiFi and Bluetooth
         WiFi.mode(WIFI_OFF);
-        btStop();
+        btStop(); // bluetooth off
         
         // Initialize I2C only for sensors
         Wire.begin(21, 22); // SDA, SCL
@@ -111,14 +142,16 @@ void setup()
         #endif
         
         // Initialize SPI for radio
-        SPI.begin(5, 19, 27);
-        
-        // Set radio pins
-        pinMode(18, OUTPUT); // RADIO_CS_PIN
-        digitalWrite(18, HIGH);
-        pinMode(23, OUTPUT); // RADIO_RST_PIN
-        digitalWrite(23, HIGH);
-        pinMode(32, INPUT); // RADIO_DIO2_PIN
+        SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN);
+
+        // Initialize radio
+        pinMode(RADIO_CS_PIN, OUTPUT);
+        digitalWrite(RADIO_CS_PIN, HIGH);
+        pinMode(RADIO_RST_PIN, OUTPUT);
+        digitalWrite(RADIO_RST_PIN, HIGH);
+        #ifdef RADIO_DIO2_PIN
+        pinMode(RADIO_DIO2_PIN, INPUT);
+        #endif
     }
     
     // Initialize LED
@@ -128,12 +161,13 @@ void setup()
     // Initialize sensors
     sensors.begin();
     ina226.init(); // Initialize INA226
-    ina226.setResistorRange(0.1, 1); // 0.1 ohm shunt, range 1
+    ina226.setResistorRange(0.1, 0.5); // 0.1 ohm shunt, range 0.5 (expected_max lower than 400mA)
+
 
     // Load config from RTC memory
     config = rtcConfig;
-    if (config.sleepInterval < 10 || config.sleepInterval > 86400) {
-        // Protect against invalid or uninitialized RTC values
+    if (config.sleepInterval < 30 || config.sleepInterval > 60) {
+        // Protect against invalid or uninitialized RTC memory values
         config.sleepInterval = 60;
         config.configVersion = 1;
     }
@@ -176,6 +210,10 @@ void setup()
         delay(2000);
         disp->clearBuffer();
         disp->sendBuffer();
+        
+        if (!devMode) {
+            disp->setPowerSave(1); // Fully turn off the OLED driver to save battery
+        }
     }
     #endif
 
@@ -204,6 +242,22 @@ void loop()
     // Otherwise, loop does nothing as we sleep after setup
 }
 
+// Converts a given voltage to an estimated percentage (0-100%) for a typical 18650 Li-Ion battery
+uint8_t getBatteryPercentage(float voltage) {
+    int voltage_mv = voltage * 1000;
+    // Voltage lookup table for 0%, 10%, 20%, ..., 100%
+    const static int table[11] = {
+        3000, 3650, 3700, 3740, 3760, 3795,
+        3840, 3910, 3980, 4070, 4150
+    };
+    if (voltage_mv < table[0]) return 0;
+    for (int i = 1; i < 11; i++) {
+        if (voltage_mv < table[i]) {
+            return i * 10 - (10 * (table[i] - voltage_mv)) / (table[i] - table[i - 1]);
+        }
+    }
+    return 100;
+}
 
 void readSensors()
 {
@@ -215,15 +269,18 @@ void readSensors()
     sensorData.batteryVoltage = ina226.getBusVoltage_V();
     sensorData.batteryCurrent = ina226.getCurrent_mA();
     sensorData.batteryPower = ina226.getBusPower();
+    sensorData.batteryPercent = getBatteryPercentage(sensorData.batteryVoltage);
 
     // Set timestamp (placeholder - would get from gateway)
     sensorData.timestamp = millis();
     sensorData.configVersion = config.configVersion;
-
+    
+    // Debug output
     if (devMode) {
-        Serial.printf("Temp: %.2f C, Volt: %.2f V, Curr: %.2f mA, Power: %.2f mW\n",
-                      sensorData.temperature, sensorData.batteryVoltage,
-                      sensorData.batteryCurrent, sensorData.batteryPower);
+        const char* chargeStatus = sensorData.batteryCurrent < 0 ? " (charging)" : "";
+        Serial.printf("Time: %lu, Cfg: %u, Temp: %.2f C, Volt: %.2f V (%d%%), Curr: %.2f mA%s, Power: %.2f mW\n",
+                      sensorData.timestamp, sensorData.configVersion, sensorData.temperature, sensorData.batteryVoltage, sensorData.batteryPercent,
+                      sensorData.batteryCurrent, chargeStatus, sensorData.batteryPower);
     }
 }
 
@@ -231,13 +288,15 @@ void transmitData()
 {
     // Prepare payload (includes unique device ID and message counter)
     uint32_t msgCount = ++counter;
-    payload = "ID:" + deviceId + ",T:" +
-              String(sensorData.temperature, 1) + ",V:" +
-              String(sensorData.batteryVoltage, 2) + ",I:" +
-              String(sensorData.batteryCurrent, 1) + ",P:" +
-              String(sensorData.batteryPower, 1) + ",S:" +
-              String(sensorData.configVersion) + ",CNT:" +
-              String(msgCount);
+    payload = "ID:"   + deviceId + 
+              ",T:"   + String(sensorData.temperature, 1) + 
+              ",V:"   + String(sensorData.batteryVoltage, 2) + 
+              ",I:"   + String(sensorData.batteryCurrent, 1) + 
+              (sensorData.batteryCurrent < 0 ? "Charging: 1" : "Charging: 0" ) +
+              ",P:"   + String(sensorData.batteryPower, 1) + 
+              ",B%:"  + String(sensorData.batteryPercent) + 
+              ",S:"   + String(sensorData.configVersion) + 
+              ",CNT:" + String(msgCount);
 
     // Turn LED on during transmission
     digitalWrite(BOARD_LED, LED_ON);
@@ -250,15 +309,24 @@ void transmitData()
     }
 
     // Wait for transmission to complete
-    while (!transmittedFlag) {
-        delay(10);
+    if (transmissionState == RADIOLIB_ERR_NONE) {
+        // Wait for transmission to complete with a 5000ms timeout
+        uint32_t startWait = millis();
+        while (!transmittedFlag && (millis() - startWait < 5000)) {
+            delay(10);
+        }
+        if (!transmittedFlag && devMode) {
+            Serial.println("Warning: Transmission timeout!");
+        }
+        transmittedFlag = false;
+    } else if (devMode) {
+        Serial.printf("Transmission failed, code: %d\n", transmissionState);
     }
-    transmittedFlag = false;
 
     // Turn LED off after transmission
     digitalWrite(BOARD_LED, !LED_ON);
 
-    if (devMode) {
+    if (devMode && transmissionState == RADIOLIB_ERR_NONE) {
         Serial.println("Transmission complete");
     }
 }
@@ -271,6 +339,7 @@ void enterDeepSleep()
     if (cycleCount >= 10) {
         cycleCount = 0;
         listenForConfig();
+        //#4 output received config in dev-mode
     }
 
     if (devMode) {
@@ -313,47 +382,50 @@ void listenForConfig()
     radio.standby();
 }
 
-void drawMain()
+void drawMain() 
 {
-    if (devMode) {
-        Serial.println("drawMain called");
-        if (disp) {
-            Serial.println("disp is not null, drawing...");
-        } else {
-            Serial.println("disp is null, cannot draw");
-        }
+    Serial.println("drawMain called");
+
+    if (!disp) {
+        Serial.println("disp is null, cannot draw");
+        return;
     }
-    if (devMode && disp) {
-        screenNum = (screenNum + 1) % 2;
-        disp->clearBuffer();
-        disp->drawRFrame(0, 0, 128, 64, 5);
-        disp->setFont(u8g2_font_pxplusibmvga8_mr);
-        if (screenNum == 0) {
-            // Sensor data screen
-            disp->setCursor(5, 15);
-            disp->printf("Temp: %.1f C", sensorData.temperature);
-            disp->setCursor(5, 30);
-            disp->printf("Volt: %.2f V", sensorData.batteryVoltage);
-            disp->setCursor(5, 45);
+    
+    Serial.println("disp is not null, drawing...");
+    
+    screenNum = (screenNum + 1) % 2;
+    disp->clearBuffer();
+    disp->drawRFrame(0, 0, 128, 64, 5);
+    disp->setFont(u8g2_font_pxplusibmvga8_mr);
+    if (screenNum == 0) {
+
+        disp->setCursor(5, 15);
+        disp->printf("Temp: %.1f C", sensorData.temperature);
+        disp->setCursor(5, 30);
+        disp->printf("Volt: %.2fV %d%%", sensorData.batteryVoltage, sensorData.batteryPercent);
+        disp->setCursor(5, 45);
+        if (sensorData.batteryCurrent < 0) {
+            disp->printf("Chg: %.0f mA", sensorData.batteryCurrent);
+        } else {
             disp->printf("Curr: %.0f mA", sensorData.batteryCurrent);
-            disp->setCursor(5, 60);
-            disp->printf("Sleep: %d s", config.sleepInterval);
-        } else {
-                // Message preview (scrolling)
-            if (payload.length() > 10) {
-                msgOffset = (msgOffset + 1) % (payload.length() - 10);
-            } else {
-                msgOffset = 0;
-            }
-            disp->setCursor(5, 15);
-            disp->printf("Msg: %.10s", payload.c_str() + msgOffset);
-            disp->setCursor(5, 30);
-            disp->printf("ID: %.6s", deviceId.c_str());
-            disp->setCursor(5, 45);
-            disp->printf("Cnt: %u", counter);
-            disp->setCursor(5, 60);
-            disp->printf("Ver: %d", config.configVersion);
         }
-        disp->sendBuffer();
+        disp->setCursor(5, 60);
+        disp->printf("Sleep: %d s", config.sleepInterval);
+    } else {
+
+        if (payload.length() > 10) {
+            msgOffset = (msgOffset + 1) % (payload.length() - 10);
+        } else {
+            msgOffset = 0;
+        }
+        disp->setCursor(5, 15);
+        disp->printf("Msg: %.10s", payload.c_str() + msgOffset);
+        disp->setCursor(5, 30);
+        disp->printf("ID: %.6s", deviceId.c_str());
+        disp->setCursor(5, 45);
+        disp->printf("Cnt: %u", counter);
+        disp->setCursor(5, 60);
+        disp->printf("Ver: %d", config.configVersion);
     }
+    disp->sendBuffer();
 }
