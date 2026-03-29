@@ -601,8 +601,8 @@ void listenForConfig()
                     
                     
                     if (devMode) {
-                        lastRxTime = radio.getTimeOnAir(sizeof(ConfigPayload)) / 1000; // Returns microseconds, convert to ms
-                        Serial.printf("Received config packet. RX Airtime: %lu ms\n", lastRxTime);
+                        uint32_t packetToA = radio.getTimeOnAir(sizeof(ConfigPayload)) / 1000; // Returns microseconds, convert to ms
+                        Serial.printf("Received config packet. Packet ToA: %lu ms\n", packetToA);
                     }
                     
                     // Verify header to ensure it's actually our config packet
@@ -656,8 +656,13 @@ void listenForConfig()
             radio.startReceive(); 
         }
         delay(10);
-}
+    }
     radio.standby();
+    
+    lastRxTime = millis() - startTime; // Record the total time the radio was consuming power in RX mode
+    if (devMode) {
+        Serial.printf("RX Window closed. Total RX power-on time: %lu ms\n", lastRxTime);
+    }
 }
 
 // Renders telemetry and device data to the OLED display. Cycles through 4 different informational screens.
@@ -709,9 +714,9 @@ void drawMain()
                 disp->setCursor(5, 30);
                 disp->printf("TX Pwr: %ddBm", CONFIG_RADIO_OUTPUT_POWER);
                 disp->setCursor(5, 45);
-                disp->printf("TX Air: %lu ms", lastTxTime);
+                disp->printf("TX Time: %lu ms", lastTxTime);
                 disp->setCursor(5, 60);
-                disp->printf("RX Air: %lu ms", lastRxTime);
+                disp->printf("RX Time: %lu ms", lastRxTime);
                 break;
 
             case 3: // IDs & Payload
