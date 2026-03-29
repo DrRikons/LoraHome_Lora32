@@ -405,8 +405,6 @@ void setup()
 // Used in: ONLY Dev mode (Simulates the device lifecycle continuously. Bypassed in Operation mode via deep sleep).
 void loop()
 {
-    // In operation mode, we don't loop - we transmit and sleep
-    // In dev mode, we can add debug functionality here
     if (devMode) {
         Serial.println("\n[DEV] --- Wake, Read Sensors ---");
         readSensors();
@@ -415,13 +413,19 @@ void loop()
         transmitData();
         
         Serial.println("[DEV] --- Receive ---");
-        listenForConfig(); // Listen for config every cycle in dev mode
+        // Accurately simulate OP mode: listen only on the 10th cycle
+        if (wakeCycleCount % 10 == 0) {
+            listenForConfig();
+        }
+        
+        // Increment for the next cycle
+        wakeCycleCount++;
         
         Serial.println("[DEV] --- Display ---");
         // Rotate through all 4 screens
         for (int i = 0; i < 4; i++) {
             drawMain();
-            delay(2000); // Show each screen for 2 seconds
+            delay(2000); // Show each screen for 2s
         }
         
         Serial.println("[DEV] --- Sleep ---");
@@ -429,9 +433,8 @@ void loop()
             disp->clearBuffer();
             disp->sendBuffer();
         }
-        delay(config.sleepInterval * 1000); // Simulated sleep duration matches configured interval
+        delay(config.sleepInterval * 1000); // Sleep for the interval (matches esp_deep_sleep timer)
     }
-    // Otherwise, loop does nothing as we sleep after setup
 }
 
 // Converts a given voltage to an estimated percentage (0-100%) for a typical 18650 Li-Ion battery #6
