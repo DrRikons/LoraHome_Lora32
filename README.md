@@ -62,7 +62,7 @@ struct __attribute__((packed)) TelemetryPayload {
 *Note: SNR and RSSI metrics represent the signal quality of the last received configuration packet from the gateway.*
 
 ## Development
-When running in `devMode` (GPIO13 pulled LOW), the sensor will continuously simulate its full operational cycle without deep sleeping: Wake -> Transmit -> Receive -> Display (cycling through all OLED screens) -> Simulated Sleep.
+When running in `devMode` (GPIO13 pulled LOW), the sensor will continuously simulate its full operational cycle without deep sleeping: Wake -> Transmit -> Receive -> Display (cycling through all OLED screens, including TX/RX Time-on-Air) -> Simulated Sleep.
 
 *Note: The code ensures robust parsing and loop execution by matching curly braces cleanly during devMode config testing.*
 

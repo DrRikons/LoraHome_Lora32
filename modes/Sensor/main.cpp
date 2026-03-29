@@ -247,6 +247,8 @@ static int transmissionState = RADIOLIB_ERR_NONE;
 static volatile bool operationDone = false;
 RTC_DATA_ATTR static uint16_t counter = 0;
 static String payload;
+static uint32_t lastTxTime = 0;
+static uint32_t lastRxTime = 0;
 
 // Transmission details
 static String deviceId;
@@ -451,10 +453,16 @@ void readSensors()
     sensorData.configVersion = config.configVersion;
 
     if (devMode) {
-        Serial.printf("Temp: %.2f C, Volt: %.2f V, Curr: %.2f mA, Power: %.2f mW, CPUTemp: %.1f C, RAM: %u KB\n",
-                      sensorData.temperature, sensorData.batteryVoltage,
-                      sensorData.batteryCurrent, sensorData.batteryPower,
-                      sensorData.cpuTemp, sensorData.freeRam);
+        // Convert timestamp to human-readable UTC string
+        char timeStr[20];
+        time_t ts = sensorData.timestamp;
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", gmtime(&ts));
+
+        Serial.printf("T:%.1fC V:%.2fV(%d%%) I:%.1fmA P:%.1fmW | CPU:%.1fC RAM:%uKB | SNR:%.1f RSSI:%.0f | TS:%s Cfg:%u\n",
+                      sensorData.temperature, sensorData.batteryVoltage, sensorData.batteryPercent,
+                      sensorData.batteryCurrent, sensorData.batteryPower, sensorData.cpuTemp,
+                      sensorData.freeRam, sensorData.lastSNR, sensorData.lastRSSI,
+                      timeStr, sensorData.configVersion);
     }
 }
 
@@ -532,6 +540,7 @@ void transmitData()
     while (!operationDone && (millis() - startWait < 5000)) {
         delay(10);
     }
+    lastTxTime = millis() - startWait;
     if (!operationDone && devMode) {
         Serial.println("Warning: TX timeout!");
     }
@@ -541,7 +550,7 @@ void transmitData()
     digitalWrite(BOARD_LED, !LED_ON);
 
     if (devMode) {
-        Serial.println("Transmission complete");
+        Serial.printf("Transmission complete. Airtime: %lu ms\n", lastTxTime);
     }
 }
 
@@ -589,6 +598,12 @@ void listenForConfig()
                 if (state == RADIOLIB_ERR_NONE) {
                     sensorData.lastSNR = radio.getSNR();
                     sensorData.lastRSSI = radio.getRSSI();
+                    
+                    
+                    if (devMode) {
+                        lastRxTime = radio.getTimeOnAir(sizeof(ConfigPayload)) / 1000; // Returns microseconds, convert to ms
+                        Serial.printf("Received config packet. RX Airtime: %lu ms\n", lastRxTime);
+                    }
                     
                     // Verify header to ensure it's actually our config packet
                     if (rxConfig.header[0] == 'C' && rxConfig.header[1] == 'F') {
@@ -694,16 +709,18 @@ void drawMain()
                 disp->setCursor(5, 30);
                 disp->printf("TX Pwr: %ddBm", CONFIG_RADIO_OUTPUT_POWER);
                 disp->setCursor(5, 45);
-                disp->printf("Count: %u", counter);
+                disp->printf("TX Air: %lu ms", lastTxTime);
                 disp->setCursor(5, 60);
-                disp->printf("Sleep: %d s", config.sleepInterval);
+                disp->printf("RX Air: %lu ms", lastRxTime);
                 break;
 
             case 3: // IDs & Payload
                 disp->setCursor(5, 15);
-                disp->printf("ID: %.12s...", deviceId.c_str());
+                disp->printf("ID: %.10s", deviceId.c_str());
                 disp->setCursor(5, 30);
-                disp->printf("Cfg Ver: %d", config.configVersion);
+                disp->printf("Cnt:%u Cfg:%d", counter, config.configVersion);
+                disp->setCursor(5, 45);
+                disp->printf("Sleep: %d s", config.sleepInterval);
                 
                 // Scrolling payload preview
                 if (payload.length() > 18) { // Approx 18 chars fit
