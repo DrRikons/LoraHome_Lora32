@@ -34,12 +34,15 @@ The main application file for the sensor node is `modes/Sensor/main.cpp`.
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*
 
 ## Telemetry Payload Format
-To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The size dynamically depends on the operating mode (14 bytes in normal mode, 25 bytes in Dev Mode).
+To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The size dynamically depends on the operating mode (14 bytes in normal mode, 25 bytes in Dev Mode). The payload is secured using AES-128-CTR encryption.
 
 ```cpp
 struct __attribute__((packed)) TelemetryPayload {
+  // --- Plaintext Header (8 bytes) ---
   uint8_t  mac;       // 6 bytes: Raw MAC address
-  uint16_t msgCount;     // 2 bytes: Message counter (cycles at 65535)
+  uint16_t msgCount;     // 2 bytes: Message counter (Used as AES IV)
+
+  // --- AES-128-CTR Encrypted Data ---
   int16_t  temperature;  // 2 bytes: External Temp (x 100)
   uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
   uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)

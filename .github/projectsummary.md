@@ -12,7 +12,7 @@ A LoRa-based remote sensor and gateway system for boiler temperature monitoring 
 ## Software Architecture
 - **Framework**: Arduino via PlatformIO
 - **Core Logic**: Located in `modes/Sensor/main.cpp`.
-- **Telemetry Payload Format**: Packed binary C++ struct. Dynamically shifts between 14 bytes (core logic) in Operation Mode and 25 bytes (extended logic) in Dev Mode to maximize battery life.
+- **Telemetry Payload Format**: Packed binary C++ struct. Dynamically shifts between 14 bytes (core logic) in Operation Mode and 25 bytes (extended logic) in Dev Mode to maximize battery life. Secured using AES-128-CTR.
 - **Remote Configuration Format**: 12-byte packed binary C++ `struct` (ConfigPayload) with a 2-byte "CF" header. Devices listen for it every 10 sleep cycles to update deep sleep intervals, mode, and sync the ESP32 RTC clock.
 - **Development Mode**: Triggered via GPIO13 (low) or remotely via config (hardware pin overrides remote config). Mode switches trigger a soft reset. Simulates the full lifecycle (Wake -> Transmit -> Receive -> Multi-screen Display -> Simulated Sleep with display off) continuously without entering actual ESP32 deep sleep. RTC memory is validated across deep sleeps using a Magic Word. Base timestamp defaults to Jan 1 2024 before any remote sync.
 - **Code Documentation**: Functions in `main.cpp` contain inline comments denoting their usage scope (Operation mode vs Dev mode).

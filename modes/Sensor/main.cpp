@@ -16,6 +16,7 @@
 #include <INA226_WE.h>
 #include <sys/time.h>
 #include <time.h>
+#include <mbedtls/aes.h>
 
 // Pin definitions
 #define DS18B20_PIN 4  // GPIO4 for DS18B20
@@ -27,6 +28,15 @@
 
 // Magic word to validate RTC memory integrity
 #define RTC_MAGIC_WORD 0xA1B2C3D4
+
+// Shared secret key for Gateway-to-Sensor config authentication
+#define NETWORK_KEY 0x3FA4B2C1
+
+// 16-Byte Shared secret key for AES-128 encryption
+const uint8_t AES_NETWORK_KEY[16] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
 
 // Dev mode flag
 bool devMode = true;
@@ -78,9 +88,11 @@ struct __attribute__((packed)) TelemetryPayload {
   int16_t  lastRSSI;     // 2 bytes: Last received RSSI
 };
 
-// Packed binary structure for received configuration payloads (12 bytes)
+// Packed binary structure for received configuration payloads (22 bytes)
 struct __attribute__((packed)) ConfigPayload {
   char     header[2];      // 2 bytes: "CF" identifier to reject noise
+  uint8_t  targetMac[6];   // 6 bytes: Target MAC address (or FF:FF:FF:FF:FF:FF for broadcast)
+  uint32_t networkKey;     // 4 bytes: Shared secret key to prevent unauthorized spoofing
   uint32_t sleepInterval;  // 4 bytes: Sleep interval in seconds
   uint8_t  configVersion;  // 1 byte:  Configuration version
   uint8_t  isDevMode;      // 1 byte:  0 = OP Mode, 1 = Dev Mode
@@ -446,6 +458,23 @@ void readSensors()
     }
 }
 
+// Encrypts or decrypts a payload in place using AES-128-CTR
+void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
+    
+    uint8_t iv[16] = {0};
+    // Seed the IV with the message counter to ensure a unique key stream per packet
+    iv[14] = (msgCount >> 8) & 0xFF;
+    iv[15] = msgCount & 0xFF;
+    
+    uint8_t stream_block[16] = {0};
+    size_t nc_off = 0;
+    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, iv, stream_block, data, data);
+    mbedtls_aes_free(&aes);
+}
+
 // Constructs the telemetry payload string and transmits it via the LoRa radio.
 // Used in: Both Operation and Dev modes
 void transmitData()
@@ -471,7 +500,7 @@ void transmitData()
         txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
         txSize = sizeof(TelemetryPayload); // 25 bytes full size
         
-        // Generate Hex string purely for local OLED preview and Serial debugging
+        // We generate the debug string before encryption so you can still read it on the OLED
         payload = "";
         uint8_t* ptr = (uint8_t*)&txPayload;
         for(size_t i = 0; i < txSize; i++) {
@@ -480,6 +509,11 @@ void transmitData()
             payload += buf;
         }
     }
+
+    // ENCRYPT the data portion (skip 8 bytes of MAC and msgCount, which act as the public IV)
+    size_t encryptedLength = txSize - 8;
+    uint8_t* dataPtr = ((uint8_t*)&txPayload) + 8;
+    cryptPayload(dataPtr, encryptedLength, txPayload.msgCount);
 
     // Turn LED on during transmission
     digitalWrite(BOARD_LED, LED_ON);
@@ -559,6 +593,20 @@ void listenForConfig()
                     // Verify header to ensure it's actually our config packet
                     if (rxConfig.header[0] == 'C' && rxConfig.header[1] == 'F') {
                         
+                        // Verify this config packet is meant for this specific device
+                        uint8_t myMac[6];
+                        esp_efuse_mac_get_default(myMac);
+                        uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                        
+                        if (memcmp(rxConfig.targetMac, myMac, 6) != 0 && memcmp(rxConfig.targetMac, broadcastMac, 6) != 0) {
+                            continue; // Not meant for us, ignore it
+                        }
+
+                        // Verify network key to prevent spoofing attacks
+                        if (rxConfig.networkKey != NETWORK_KEY) {
+                            continue; // Invalid key, ignore packet
+                        }
+
                         config.sleepInterval = rxConfig.sleepInterval;
                         config.configVersion = rxConfig.configVersion;
                         config.isDevMode = (rxConfig.isDevMode > 0);
