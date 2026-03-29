@@ -75,6 +75,15 @@ struct __attribute__((packed)) TelemetryPayload {
   uint8_t  configVer;    // 1 byte:  Config version
 };
 
+// Packed binary structure for received configuration payloads (12 bytes)
+struct __attribute__((packed)) ConfigPayload {
+  char     header[2];      // 2 bytes: "CF" identifier to reject noise
+  uint32_t sleepInterval;  // 4 bytes: Sleep interval in seconds
+  uint8_t  configVersion;  // 1 byte:  Configuration version
+  uint8_t  isDevMode;      // 1 byte:  0 = OP Mode, 1 = Dev Mode
+  uint32_t timeOffset;     // 4 bytes: Seconds since CUSTOM_EPOCH
+};
+
 // Configuration structure
 struct Config {
   uint32_t magicWord;
@@ -219,8 +228,8 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 
 // save transmission state between loops
 static int transmissionState = RADIOLIB_ERR_NONE;
-// flag to indicate that a packet was sent
-static volatile bool transmittedFlag = false;
+// flag to indicate that a packet was sent or received
+static volatile bool operationDone = false;
 static uint32_t counter = 0;
 static String payload;
 
@@ -229,12 +238,12 @@ static String deviceId;
 static int screenNum = -1;
 static int msgOffset = 0;
 
-// Callback function for LoRa transmission completion.
+// Callback function for LoRa hardware interrupts.
 // IMPORTANT: This function MUST be 'void' type and MUST NOT have any arguments!
 void setFlag(void)
 {
-    // we sent a packet, set the flag
-    transmittedFlag = true;
+    // we sent or received a packet, set the flag
+    operationDone = true;
 }
 
 // Standard Arduino setup function. Initializes hardware, sensors, and radio.
@@ -315,8 +324,9 @@ void setup()
     radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER);
     radio.setCRC(false);
 
-    // Set packet sent callback
+    // Set hardware interrupt callbacks for both RX and TX
     radio.setPacketSentAction(setFlag);
+    radio.setPacketReceivedAction(setFlag);
 
     // Display mode message
     #ifdef HAS_DISPLAY
@@ -329,7 +339,7 @@ void setup()
 
         const char *modeText = devMode ? "DEV MODE" : "OP MODE";
         disp->clearBuffer();
-        disp->setFont(u8g2_font_fur11_tf);
+        disp->setFont(u8g2_font_pxplusibmvga9_mr);
         int16_t x = (disp->getDisplayWidth() - disp->getUTF8Width(modeText)) / 2;
         disp->drawStr(x, 30, modeText);
         disp->sendBuffer();
@@ -465,6 +475,8 @@ void transmitData()
     // Turn LED on during transmission
     digitalWrite(BOARD_LED, LED_ON);
 
+    operationDone = false; // clear flag before TX
+
     // Transmit the raw binary struct directly
     transmissionState = radio.startTransmit(ptr, sizeof(TelemetryPayload));
 
@@ -472,11 +484,15 @@ void transmitData()
         Serial.printf("Transmitting binary payload (%d bytes): %s\n", sizeof(TelemetryPayload), payload.c_str());
     }
 
-    // Wait for transmission to complete
-    while (!transmittedFlag) {
+    // Wait for transmission to complete (with 5 second timeout to prevent hangs)
+    uint32_t startWait = millis();
+    while (!operationDone && (millis() - startWait < 5000)) {
         delay(10);
     }
-    transmittedFlag = false;
+    if (!operationDone && devMode) {
+        Serial.println("Warning: TX timeout!");
+    }
+    operationDone = false;
 
     // Turn LED off after transmission
     digitalWrite(BOARD_LED, !LED_ON);
@@ -515,54 +531,60 @@ void enterDeepSleep()
 // Used in: Both Operation and Dev modes
 void listenForConfig()
 {
+    operationDone = false;
+    radio.startReceive(); // Start non-blocking background reception
     unsigned long startTime = millis();
     while (millis() - startTime < 5000) { // Listen for 5 seconds
-        String received = "";
-        // Use RadioLib's blocking receive with a 1-second timeout instead of available()
-        int state = radio.receive(received, 1000); 
-        
-        if (state == RADIOLIB_ERR_NONE) {
-            // Grab the signal strength of the received packet
-            sensorData.lastSNR = radio.getSNR();
-            sensorData.lastRSSI = radio.getRSSI();
+        if (operationDone) {
+            operationDone = false;
             
-            if (received.startsWith("CONFIG:")) {
-                // Parse config: CONFIG:sleepInterval,version[,isDevMode[,epochTime]]
-                int part = 0;
-                int lastIdx = 7;
-                for (int i = 7; i <= received.length(); i++) {
-                    if (i == received.length() || received.charAt(i) == ',') {
-                        String val = received.substring(lastIdx, i);
-                        if (part == 0) config.sleepInterval = val.toInt();
-                        else if (part == 1) config.configVersion = val.toInt();
-                        else if (part == 2) config.isDevMode = (val.toInt() > 0);
-                        else if (part == 3) {
-                            config.epochTime = strtoul(val.c_str(), NULL, 10) + CUSTOM_EPOCH;
-                            // Sync the internal ESP32 RTC to fix time drift
-                            struct timeval tv;
-                            tv.tv_sec = config.epochTime;
-                            tv.tv_usec = 0;
-                            settimeofday(&tv, NULL);
+            // Verify packet length matches our expected Config struct size
+            if (radio.getPacketLength() == sizeof(ConfigPayload)) {
+                ConfigPayload rxConfig;
+                int state = radio.readData((uint8_t*)&rxConfig, sizeof(ConfigPayload));
+                
+                if (state == RADIOLIB_ERR_NONE) {
+                    sensorData.lastSNR = radio.getSNR();
+                    sensorData.lastRSSI = radio.getRSSI();
+                    
+                    // Verify header to ensure it's actually our config packet
+                    if (rxConfig.header[0] == 'C' && rxConfig.header[1] == 'F') {
+                        
+                        config.sleepInterval = rxConfig.sleepInterval;
+                        config.configVersion = rxConfig.configVersion;
+                        config.isDevMode = (rxConfig.isDevMode > 0);
+                        
+                        config.epochTime = rxConfig.timeOffset + CUSTOM_EPOCH;
+                        // Sync the internal ESP32 RTC to fix time drift
+                        struct timeval tv;
+                        tv.tv_sec = config.epochTime;
+                        tv.tv_usec = 0;
+                        settimeofday(&tv, NULL);
+                        
+                        rtcConfig = config; // Save to RTC
+                        
+                        bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
+                        if (devMode != cfgMode) {
+                            Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
+                            delay(1000);
+                            ESP.restart(); // Soft reset
+                        } else if (devMode) {
+                            Serial.printf("Config updated: sleep=%u, version=%u, devMode=%d\n",
+                                          config.sleepInterval, config.configVersion, config.isDevMode);
                         }
-                        lastIdx = i + 1;
-                        part++;
                     }
                 }
-                
-                rtcConfig = config; // Save to RTC
-                
-                bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
-                if (devMode != cfgMode) {
-                    Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
-                    delay(1000);
-                    ESP.restart(); // Soft reset to cleanly initialize/de-initialize hardware
-                } else if (devMode) {
-                    Serial.printf("Config updated: sleep=%d, version=%d, devMode=%d\n",
-                                  config.sleepInterval, config.configVersion, config.isDevMode);
-                }
+            } else {
+                // Not a config packet or wrong size, flush the RX buffer
+                String dummy;
+                radio.readData(dummy);
             }
+
+            // Resume listening in the background for the remainder of the 5 seconds
+            radio.startReceive(); 
         }
-    }
+        delay(10);
+}
     radio.standby();
 }
 
