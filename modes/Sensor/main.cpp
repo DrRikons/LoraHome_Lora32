@@ -58,21 +58,24 @@ struct SensorData {
   uint8_t configVersion;
 } sensorData;
 
-// Packed binary structure for highly efficient LoRa transmission (27 bytes total)
+// Packed binary structure for highly efficient LoRa transmission (up to 25 bytes)
 struct __attribute__((packed)) TelemetryPayload {
+  // --- Core variables (14 bytes, always sent) ---
   uint8_t  mac[6];       // 6 bytes: Raw MAC address
-  uint32_t msgCount;     // 4 bytes: Message counter
+  uint16_t msgCount;     // 2 bytes: Message counter (cycles at 65535)
   int16_t  temperature;  // 2 bytes: External Temp (x 100)
   uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
+  uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
+  uint8_t  configVer;    // 1 byte:  Config version
+
+  // --- Dev mode variables (11 bytes, conditionally sent) ---
   int16_t  battCurrent;  // 2 bytes: Battery Current in mA
   int16_t  battPower;    // 2 bytes: Battery Power in mW
-  uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
   uint16_t freeRam;      // 2 bytes: Free RAM in KB
   int8_t   cpuTemp;      // 1 byte:  CPU Temp in C
   int8_t   txPower;      // 1 byte:  TX Power in dBm
   int8_t   lastSNR;      // 1 byte:  Last received SNR
   int16_t  lastRSSI;     // 2 bytes: Last received RSSI
-  uint8_t  configVer;    // 1 byte:  Config version
 };
 
 // Packed binary structure for received configuration payloads (12 bytes)
@@ -230,7 +233,7 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 static int transmissionState = RADIOLIB_ERR_NONE;
 // flag to indicate that a packet was sent or received
 static volatile bool operationDone = false;
-static uint32_t counter = 0;
+RTC_DATA_ATTR static uint16_t counter = 0;
 static String payload;
 
 // Transmission details
@@ -451,25 +454,31 @@ void transmitData()
     TelemetryPayload txPayload;
     esp_efuse_mac_get_default(txPayload.mac);
     txPayload.msgCount = ++counter;
-    txPayload.temperature = (int16_t)(sensorData.temperature * 100);
+    txPayload.temperature = (int16_t)(sensorData.temperature * 100); 
     txPayload.battVoltage = (uint16_t)(sensorData.batteryVoltage * 1000);
-    txPayload.battCurrent = (int16_t)sensorData.batteryCurrent;
-    txPayload.battPower = (int16_t)sensorData.batteryPower;
     txPayload.battPercent = sensorData.batteryPercent;
-    txPayload.freeRam = (uint16_t)sensorData.freeRam;
-    txPayload.cpuTemp = (int8_t)sensorData.cpuTemp;
-    txPayload.txPower = (int8_t)CONFIG_RADIO_OUTPUT_POWER;
-    txPayload.lastSNR = (int8_t)sensorData.lastSNR;
-    txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
     txPayload.configVer = sensorData.configVersion;
 
-    // Generate Hex string purely for local OLED preview and Serial debugging
-    payload = "";
-    uint8_t* ptr = (uint8_t*)&txPayload;
-    for(size_t i = 0; i < sizeof(TelemetryPayload); i++) {
-        char buf[3];
-        sprintf(buf, "%02X", ptr[i]);
-        payload += buf;
+    size_t txSize = 14; // Core payload size
+
+    if (devMode) {
+        txPayload.battCurrent = (int16_t)sensorData.batteryCurrent;
+        txPayload.battPower = (int16_t)sensorData.batteryPower;
+        txPayload.freeRam = (uint16_t)sensorData.freeRam;
+        txPayload.cpuTemp = (int8_t)sensorData.cpuTemp;
+        txPayload.txPower = (int8_t)CONFIG_RADIO_OUTPUT_POWER;
+        txPayload.lastSNR = (int8_t)sensorData.lastSNR;
+        txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
+        txSize = sizeof(TelemetryPayload); // 25 bytes full size
+        
+        // Generate Hex string purely for local OLED preview and Serial debugging
+        payload = "";
+        uint8_t* ptr = (uint8_t*)&txPayload;
+        for(size_t i = 0; i < txSize; i++) {
+            char buf[3];
+            sprintf(buf, "%02X", ptr[i]);
+            payload += buf;
+        }
     }
 
     // Turn LED on during transmission
@@ -478,10 +487,10 @@ void transmitData()
     operationDone = false; // clear flag before TX
 
     // Transmit the raw binary struct directly
-    transmissionState = radio.startTransmit(ptr, sizeof(TelemetryPayload));
+    transmissionState = radio.startTransmit((uint8_t*)&txPayload, txSize);
 
     if (devMode) {
-        Serial.printf("Transmitting binary payload (%d bytes): %s\n", sizeof(TelemetryPayload), payload.c_str());
+        Serial.printf("Transmitting binary payload (%d bytes): %s\n", txSize, payload.c_str());
     }
 
     // Wait for transmission to complete (with 5 second timeout to prevent hangs)
