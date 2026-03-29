@@ -39,7 +39,7 @@ const uint8_t AES_NETWORK_KEY[16] = {
 };
 
 // Dev mode flag
-bool devMode = true;
+bool devMode = false;
 
 // Function Prototypes
 void readSensors();
@@ -105,12 +105,12 @@ struct Config {
   uint32_t magicWord;
   uint32_t sleepInterval; // seconds
   uint8_t configVersion;
-  bool isDevMode; // Remote dev mode flag
+  uint8_t isDevMode; // Remote dev mode flag (0=false, 1=true)
   uint32_t epochTime; // Unix timestamp
-} config = {RTC_MAGIC_WORD, 20, 1, false, CUSTOM_EPOCH}; // Default 20 seconds, base time Jan 1, 2024
+} config = {RTC_MAGIC_WORD, 20, 1, 0, CUSTOM_EPOCH}; // Default 20 seconds, base time Jan 1, 2024
 
 // RTC memory for config persistence
-RTC_DATA_ATTR Config rtcConfig;
+RTC_NOINIT_ATTR Config rtcConfig; // NOINIT ensures it survives SW_CPU_RESET (ESP.restart)
 
 #if     defined(USING_SX1276)
 #ifndef CONFIG_RADIO_FREQ
@@ -247,6 +247,7 @@ static int transmissionState = RADIOLIB_ERR_NONE;
 // flag to indicate that a packet was sent or received
 static volatile bool operationDone = false;
 RTC_DATA_ATTR static uint16_t counter = 0;
+RTC_DATA_ATTR static uint8_t wakeCycleCount = 0;
 static String payload;
 static uint32_t lastTxTime = 0;
 static uint32_t lastRxTime = 0;
@@ -268,21 +269,33 @@ void setFlag(void)
 // Used in: Both Operation and Dev modes
 void setup()
 {
+    Serial.begin(115200); //temp for debug
+    Serial.println("Operation mode");//temp for debug
+
     // Load config from RTC memory first to evaluate remote dev mode
     config = rtcConfig;
+
+    Serial.printf("Boot rtcconfig : %u sleep=%u, version=%u, devMode=%d\n",
+                                         rtcConfig.magicWord,rtcConfig.sleepInterval,rtcConfig.configVersion, rtcConfig.isDevMode);
+    Serial.printf("Boot config : %u sleep=%u, version=%u, devMode=%d\n",
+                                         config.magicWord,config.sleepInterval,config.configVersion,config.isDevMode);                    
     
     // Validate RTC memory using the magic word and basic bounds checking
     if (config.magicWord != RTC_MAGIC_WORD || config.sleepInterval < 10 || config.sleepInterval > 86400) {
         config.magicWord = RTC_MAGIC_WORD;
         config.sleepInterval = 60;
         config.configVersion = 1;
-        config.isDevMode = false;
+        config.isDevMode = 0;
         config.epochTime = CUSTOM_EPOCH;
+        rtcConfig = config; // Initialize RTC memory with defaults on cold boot
     }
+
+    Serial.printf("validated config : %u sleep=%u, version=%u, devMode=%d\n",
+                                         rtcConfig.magicWord,rtcConfig.sleepInterval,rtcConfig.configVersion, rtcConfig.isDevMode); 
 
     // Check dev mode (hardware pin OR remote config)
     pinMode(DEV_MODE_PIN, INPUT_PULLUP);
-    devMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
+    devMode = (digitalRead(DEV_MODE_PIN) == LOW) || (config.isDevMode != 0);
 
     if (devMode) {
         setupBoards(); // Initialize all peripherals for dev mode
@@ -364,6 +377,12 @@ void setup()
         drawMain();
     }
     transmitData();
+    
+    // Listen for config on startup and every 10 sleep cycles to save battery
+    if (devMode || wakeCycleCount % 10 == 0) {
+        listenForConfig();
+    }
+    wakeCycleCount++;
 
     // deep sleep, prevents from entering loop
     enterDeepSleep();
@@ -531,7 +550,7 @@ void transmitData()
     // Wait for transmission to complete (with 5 second timeout to prevent hangs)
     uint32_t startWait = millis();
     while (!operationDone && (millis() - startWait < 5000)) {
-        delay(10);
+        delay(1); // Reduce delay to switch to RX mode as fast as possible
     }
     lastTxTime = millis() - startWait;
     if (!operationDone && devMode) {
@@ -551,14 +570,6 @@ void transmitData()
 // Used in: Both Operation and Dev modes (skips actual esp_deep_sleep_start in Dev mode)
 void enterDeepSleep()
 {
-    // Listen briefly for config (every 10 cycles)
-    static uint8_t cycleCount = 0;
-    cycleCount++;
-    if (cycleCount >= 10) {
-        cycleCount = 0;
-        listenForConfig();
-    }
-
     if (devMode) {
         Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
         delay(1000); // Allow serial to finish
@@ -615,6 +626,7 @@ void listenForConfig()
                             continue; // Invalid key, ignore packet
                         }
 
+                        config.magicWord = RTC_MAGIC_WORD;
                         config.sleepInterval = rxConfig.sleepInterval;
                         config.configVersion = rxConfig.configVersion;
                         config.isDevMode = (rxConfig.isDevMode > 0);
@@ -625,18 +637,22 @@ void listenForConfig()
                         tv.tv_sec = config.epochTime;
                         tv.tv_usec = 0;
                         settimeofday(&tv, NULL);
-                        
+                        Serial.printf("Current config : sleep=%u, version=%u, devMode=%d\n",
+                                          rtcConfig.sleepInterval,rtcConfig.configVersion, rtcConfig.isDevMode);
+                        Serial.printf("received config: sleep=%u, version=%u, devMode=%d\n",
+                                          config.sleepInterval, config.configVersion, config.isDevMode);                  
                         rtcConfig = config; // Save to RTC
                         
-                        bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
+                        bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || (config.isDevMode != 0);
                         if (devMode != cfgMode) {
                             Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
                             delay(1000);
                             ESP.restart(); // Soft reset
-                        } else if (devMode) {
+                        } else  {
                             Serial.printf("Config updated: sleep=%u, version=%u, devMode=%d\n",
                                           config.sleepInterval, config.configVersion, config.isDevMode);
                         }
+                        break; // Successfully received and applied config, exit 5s RX window early
                     }
                 }
             } else {
@@ -648,7 +664,7 @@ void listenForConfig()
             // Resume listening in the background for the remainder of the 5 seconds
             radio.startReceive(); 
         }
-        delay(10);
+        delay(1);
     }
     radio.standby();
     
