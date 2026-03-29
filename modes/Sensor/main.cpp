@@ -58,6 +58,23 @@ struct SensorData {
   uint8_t configVersion;
 } sensorData;
 
+// Packed binary structure for highly efficient LoRa transmission (27 bytes total)
+struct __attribute__((packed)) TelemetryPayload {
+  uint8_t  mac[6];       // 6 bytes: Raw MAC address
+  uint32_t msgCount;     // 4 bytes: Message counter
+  int16_t  temperature;  // 2 bytes: External Temp (x 100)
+  uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
+  int16_t  battCurrent;  // 2 bytes: Battery Current in mA
+  int16_t  battPower;    // 2 bytes: Battery Power in mW
+  uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
+  uint16_t freeRam;      // 2 bytes: Free RAM in KB
+  int8_t   cpuTemp;      // 1 byte:  CPU Temp in C
+  int8_t   txPower;      // 1 byte:  TX Power in dBm
+  int8_t   lastSNR;      // 1 byte:  Last received SNR
+  int16_t  lastRSSI;     // 2 bytes: Last received RSSI
+  uint8_t  configVer;    // 1 byte:  Config version
+};
+
 // Configuration structure
 struct Config {
   uint32_t magicWord;
@@ -420,30 +437,39 @@ void readSensors()
 // Used in: Both Operation and Dev modes
 void transmitData()
 {
-    // Prepare payload (includes unique device ID and message counter)
-    uint32_t msgCount = ++counter;
-    payload = "ID:" + deviceId + ",T:" +
-              String(sensorData.temperature, 1) + ",V:" +
-              String(sensorData.batteryVoltage, 2) + ",I:" +
-              String(sensorData.batteryCurrent, 1) + ",P:" +
-              String(sensorData.batteryPower, 1) + ",B%:" +
-              String(sensorData.batteryPercent) + ",S:" +
-              String(sensorData.configVersion) + ",CNT:" +
-              String(msgCount) + ",CT:" +
-              String(sensorData.cpuTemp, 1) + ",RAM:" +
-              String(sensorData.freeRam) + ",TXP:" +
-              String(CONFIG_RADIO_OUTPUT_POWER) + ",SNR:" +
-              String(sensorData.lastSNR, 2) + ",RSSI:" +
-              String(sensorData.lastRSSI, 2);
+    // Prepare binary payload
+    TelemetryPayload txPayload;
+    esp_efuse_mac_get_default(txPayload.mac);
+    txPayload.msgCount = ++counter;
+    txPayload.temperature = (int16_t)(sensorData.temperature * 100);
+    txPayload.battVoltage = (uint16_t)(sensorData.batteryVoltage * 1000);
+    txPayload.battCurrent = (int16_t)sensorData.batteryCurrent;
+    txPayload.battPower = (int16_t)sensorData.batteryPower;
+    txPayload.battPercent = sensorData.batteryPercent;
+    txPayload.freeRam = (uint16_t)sensorData.freeRam;
+    txPayload.cpuTemp = (int8_t)sensorData.cpuTemp;
+    txPayload.txPower = (int8_t)CONFIG_RADIO_OUTPUT_POWER;
+    txPayload.lastSNR = (int8_t)sensorData.lastSNR;
+    txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
+    txPayload.configVer = sensorData.configVersion;
+
+    // Generate Hex string purely for local OLED preview and Serial debugging
+    payload = "";
+    uint8_t* ptr = (uint8_t*)&txPayload;
+    for(size_t i = 0; i < sizeof(TelemetryPayload); i++) {
+        char buf[3];
+        sprintf(buf, "%02X", ptr[i]);
+        payload += buf;
+    }
 
     // Turn LED on during transmission
     digitalWrite(BOARD_LED, LED_ON);
 
-    transmissionState = radio.startTransmit(payload.c_str());
+    // Transmit the raw binary struct directly
+    transmissionState = radio.startTransmit(ptr, sizeof(TelemetryPayload));
 
     if (devMode) {
-        Serial.print("Transmitting: ");
-        Serial.println(payload);
+        Serial.printf("Transmitting binary payload (%d bytes): %s\n", sizeof(TelemetryPayload), payload.c_str());
     }
 
     // Wait for transmission to complete

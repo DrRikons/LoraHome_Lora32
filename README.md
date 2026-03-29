@@ -8,23 +8,17 @@ The sensor node can be configured remotely by sending a specific string over LoR
 
 The configuration string must follow this format:
 
-`CONFIG:<sleepInterval>,<version>[,<devMode>[,<timeOffset>]]`
+`CONFIG:<sleepInterval>,<version>[,<devMode>]`
 
 -   `CONFIG:`: A required prefix.
 -   `<sleepInterval>`: The time in seconds that the device will deep sleep between sensor readings. This must be an integer value.
 -   `<version>`: A version number for the configuration. This must be an integer value.
 -   `<devMode>`: *(Optional)* 1 to enable developer mode continuously without deep sleeping, 0 to disable.
--   `<timeOffset>`: *(Optional)* Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC.
-
-    *(Note: Uninitialized sensors will default their base time to this epoch before their first synchronization. A Magic Word is used to validate RTC memory integrity across deep sleep cycles).*
-
-*Note: Changing the mode remotely will trigger a soft reset of the ESP32 to cleanly initialize/de-initialize power-heavy peripherals. If the physical `DEV_MODE_PIN` (GPIO13) is pulled LOW, it acts as a hard hardware override and the device will ignore any remote commands to enter Operation Mode.*
 
 **Examples:**
 
 - Set sleep interval to 300 seconds, version 2: `CONFIG:300,2`
 - Turn on continuous Dev Mode for debugging: `CONFIG:60,3,1`
-- Sync time to March 22 2024 (7000000 seconds offset): `CONFIG:60,3,1,7000000`
 
 ## Project Structure
 
@@ -38,15 +32,34 @@ The main application file for the sensor node is `modes/Sensor/main.cpp`.
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*
 
 ## Telemetry Payload Format
-The sensor node transmits telemetry data in the following comma-separated string format:
-`ID:<MAC>,T:<Temp>,V:<Volt>,I:<Curr>,P:<Power>,B%:<BattPercent>,S:<ConfigVer>,CNT:<MsgCount>,CT:<CpuTemp>,RAM:<RamKB>,TXP:<TxPwr>,SNR:<SNR>,RSSI:<RSSI>`
+To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed, 27-byte binary C++ `struct`. The gateway must decode this binary format using the identical struct blueprint.
+
+```cpp
+struct __attribute__((packed)) TelemetryPayload {
+  uint8_t  mac;       // 6 bytes: Raw MAC address
+  uint32_t msgCount;     // 4 bytes: Message counter
+  int16_t  temperature;  // 2 bytes: External Temp (x 100)
+  uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
+  int16_t  battCurrent;  // 2 bytes: Battery Current in mA
+  int16_t  battPower;    // 2 bytes: Battery Power in mW
+  uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
+  uint16_t freeRam;      // 2 bytes: Free RAM in KB
+  int8_t   cpuTemp;      // 1 byte:  CPU Temp in C
+  int8_t   txPower;      // 1 byte:  TX Power in dBm
+  int8_t   lastSNR;      // 1 byte:  Last received SNR
+  int16_t  lastRSSI;     // 2 bytes: Last received RSSI
+  uint8_t  configVer;    // 1 byte:  Config version
+};
+```
+*(Note: Any floating point values like temperature are multiplied by 100 before transmission. The Gateway should divide them by 100.0 upon receipt to restore the decimal values).*
 
 *Note: SNR and RSSI metrics represent the signal quality of the last received configuration packet from the gateway.*
 
-## Development
-When running in `devMode` (GPIO13 pulled LOW), the sensor will continuously simulate its full operational cycle without deep sleeping: Wake -> Transmit -> Receive -> Display (cycling through all OLED screens) -> Simulated Sleep.
+## Automation
+This repository includes a GitHub Action (`issue-commenter.yml`) that automatically posts a comment to any GitHub Issue referenced in a commit message (e.g., `#123`).
 
-*Note: The code ensures robust parsing and loop execution by matching curly braces cleanly during devMode config testing.*
+## Development
+When running in `devMode` (GPIO13 pulled LOW), the sensor will continuously simulate its full operational cycle without deep sleeping: Wake -> Transmit -> Receive -> Display (cycling through all OLED screens) -> Simulated Sleep (OLED clears).
 
 An `.aiexclude` file is included to prevent AI coding assistants from indexing large third-party libraries in the `lib/` folder and build artifacts in the `.pio/` folder, preserving context space.
 
