@@ -429,7 +429,7 @@ void loop()
             disp->clearBuffer();
             disp->sendBuffer();
         }
-        delay(4000); // Simulated sleep duration
+        delay(config.sleepInterval * 1000); // Simulated sleep duration matches configured interval
     }
     // Otherwise, loop does nothing as we sleep after setup
 }
