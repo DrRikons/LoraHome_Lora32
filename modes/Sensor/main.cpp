@@ -68,16 +68,17 @@ struct SensorData {
   uint8_t configVersion;
 } sensorData;
 
-// Packed binary structure for highly efficient LoRa transmission (up to 25 bytes)
+// Packed binary structure for highly efficient LoRa transmission (up to 26 bytes)
 struct __attribute__((packed)) TelemetryPayload {
-  // --- Core variables (14 bytes, always sent) ---
+  // --- Core variables (15 bytes, always sent) ---
   uint8_t  mac[6];       // 6 bytes: Raw MAC address
   uint16_t msgCount;     // 2 bytes: Message counter (cycles at 65535)
   int16_t  temperature;  // 2 bytes: External Temp (x 100)
   uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
   uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
   uint8_t  configVer;    // 1 byte:  Config version
-
+  uint8_t  opMode;       // 1 byte:  0=Op, 1=Dev
+  
   // --- Dev mode variables (11 bytes, conditionally sent) ---
   int16_t  battCurrent;  // 2 bytes: Battery Current in mA
   int16_t  battPower;    // 2 bytes: Battery Power in mW
@@ -284,28 +285,19 @@ void setup()
     devMode = (digitalRead(DEV_MODE_PIN) == LOW) || config.isDevMode;
 
     if (devMode) {
-        setupBoards(); // Enable all peripherals for dev mode
+        setupBoards(); // Initialize all peripherals for dev mode
         Serial.println("Dev/Debug mode");
     } else {
-        // Minimal setup for power saving
-        Serial.begin(115200);
-        delay(100);
-        Serial.println("Operation mode");
-        
+        // In OP mode, disable all non-essential peripherals for max power saving
         // Disable WiFi and Bluetooth
         WiFi.mode(WIFI_OFF);
         btStop();
         
         // Initialize I2C only for sensors
         Wire.begin(21, 22); // SDA, SCL
-        
-        // Initialize display if available
-        #ifdef HAS_DISPLAY
-        beginDisplay();
-        #endif
-        
+
         // Initialize SPI for radio
-        SPI.begin(5, 19, 27);
+        SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN);
         
         // Set radio pins
         pinMode(18, OUTPUT); // RADIO_CS_PIN
@@ -335,11 +327,11 @@ void setup()
     // Set radio parameters (same as before)
     radio.setFrequency(CONFIG_RADIO_FREQ);
     radio.setBandwidth(CONFIG_RADIO_BW);
-    radio.setSpreadingFactor(12);
-    radio.setCodingRate(6);
+    radio.setSpreadingFactor(9);  // SF9 is a good balance of range and speed
+    radio.setCodingRate(5);       // CR 4/5 is standard
     radio.setSyncWord(0xAB);
     radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER);
-    radio.setCRC(false);
+    radio.setCRC(true);           // Enable CRC for data integrity
 
     // Set hardware interrupt callbacks for both RX and TX
     radio.setPacketSentAction(setFlag);
@@ -347,7 +339,7 @@ void setup()
 
     // Display mode message
     #ifdef HAS_DISPLAY
-    if (disp) {
+    if (devMode && disp) { // Only show startup screen in dev mode
         // Unique device identity (use MAC)
         uint64_t mac = ESP.getEfuseMac();
         char idBuf[17];
@@ -495,8 +487,9 @@ void transmitData()
     txPayload.battVoltage = (uint16_t)(sensorData.batteryVoltage * 1000);
     txPayload.battPercent = sensorData.batteryPercent;
     txPayload.configVer = sensorData.configVersion;
+    txPayload.opMode = (uint8_t)devMode;
 
-    size_t txSize = 14; // Core payload size
+    size_t txSize = 15; // Core payload size
 
     if (devMode) {
         txPayload.battCurrent = (int16_t)sensorData.batteryCurrent;
@@ -506,7 +499,7 @@ void transmitData()
         txPayload.txPower = (int8_t)CONFIG_RADIO_OUTPUT_POWER;
         txPayload.lastSNR = (int8_t)sensorData.lastSNR;
         txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
-        txSize = sizeof(TelemetryPayload); // 25 bytes full size
+        txSize = sizeof(TelemetryPayload); // 26 bytes full size
         
         // We generate the debug string before encryption so you can still read it on the OLED
         payload = "";
@@ -672,9 +665,9 @@ void drawMain()
     if (devMode) {
         Serial.println("drawMain called");
         if (disp) {
-            Serial.println("disp is not null, drawing...");
+            Serial.println("disp found, drawing...");
         } else {
-            Serial.println("disp is null, cannot draw");
+            Serial.println("disp not found, cannot draw");
         }
     }
     if (devMode && disp) {

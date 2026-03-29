@@ -13,7 +13,9 @@ A LoRa-based remote sensor and gateway system for boiler temperature monitoring 
 - **Framework**: Arduino via PlatformIO
 - **Core Logic**: Located in `modes/Sensor/main.cpp`.
 - **Telemetry Payload Format**: Packed binary C++ struct. Dynamically shifts between 14 bytes (core logic) in Operation Mode and 25 bytes (extended logic) in Dev Mode to maximize battery life. Secured using AES-128-CTR.
-- **Remote Configuration Format**: 12-byte packed binary C++ `struct` (ConfigPayload) with a 2-byte "CF" header. Devices listen for it every 10 sleep cycles to update deep sleep intervals, mode, and sync the ESP32 RTC clock.
+- **Telemetry Payload Format**: Packed binary C++ struct. Dynamically shifts between 15 bytes (core logic) in Operation Mode and 26 bytes (extended logic) in Dev Mode to maximize battery life. Secured using AES-128-CTR.
+- **Remote Configuration Format**: 22-byte packed binary C++ `struct` (ConfigPayload) with a 2-byte "CF" header, 6-byte target MAC address, and a 4-byte Network Key for authentication. Devices listen for it every 10 sleep cycles to update deep sleep intervals, mode, and sync the ESP32 RTC clock.
+- **Radio Parameters**: Optimized for efficiency (SF9, BW 125kHz, CR 4/5) to significantly reduce power consumption.
 - **Development Mode**: Triggered via GPIO13 (low) or remotely via config (hardware pin overrides remote config). Mode switches trigger a soft reset. Simulates the full lifecycle (Wake -> Transmit -> Receive -> Multi-screen Display (including total TX/RX power-on time tracking) -> Simulated Sleep with display off) continuously without entering actual ESP32 deep sleep. RTC memory is validated across deep sleeps using a Magic Word. Base timestamp defaults to Jan 1 2024 before any remote sync.
 - **Debugging**: Serial output in Dev Mode provides a comprehensive, single-line summary of all sensor readings, including a human-readable UTC timestamp.
 - **Code Documentation**: Functions in `main.cpp` contain inline comments denoting their usage scope (Operation mode vs Dev mode).
