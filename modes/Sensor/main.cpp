@@ -40,6 +40,8 @@ const uint8_t AES_NETWORK_KEY[16] = {
 
 // Dev mode flag
 bool devMode = false;
+// Manual flag to enable serial output in Operation mode for testing. Requires reflash.
+bool serialEnabled = false; 
 
 // Function Prototypes
 void readSensors();
@@ -269,16 +271,23 @@ void setFlag(void)
 // Used in: Both Operation and Dev modes
 void setup()
 {
-    Serial.begin(115200); //temp for debug
-    Serial.println("Operation mode");//temp for debug
+    // Early evaluate devMode to enable serial immediately if needed
+    pinMode(DEV_MODE_PIN, INPUT_PULLUP);
+    if (digitalRead(DEV_MODE_PIN) == LOW || rtcConfig.isDevMode != 0) {
+        serialEnabled = true;
+    }
+
+    if (serialEnabled) {
+        Serial.begin(115200);
+    }
 
     // Load config from RTC memory first to evaluate remote dev mode
     config = rtcConfig;
 
-    Serial.printf("Boot rtcconfig : %u sleep=%u, version=%u, devMode=%d\n",
-                                         rtcConfig.magicWord,rtcConfig.sleepInterval,rtcConfig.configVersion, rtcConfig.isDevMode);
-    Serial.printf("Boot config : %u sleep=%u, version=%u, devMode=%d\n",
-                                         config.magicWord,config.sleepInterval,config.configVersion,config.isDevMode);                    
+    if (serialEnabled) {
+        Serial.printf("Boot rtcConfig : %u sleep=%u, version=%u, devMode=%d\n",
+                      rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.configVersion, rtcConfig.isDevMode);
+    }
     
     // Validate RTC memory using the magic word and basic bounds checking
     if (config.magicWord != RTC_MAGIC_WORD || config.sleepInterval < 10 || config.sleepInterval > 86400) {
@@ -290,17 +299,19 @@ void setup()
         rtcConfig = config; // Initialize RTC memory with defaults on cold boot
     }
 
-    Serial.printf("validated config : %u sleep=%u, version=%u, devMode=%d\n",
-                                         rtcConfig.magicWord,rtcConfig.sleepInterval,rtcConfig.configVersion, rtcConfig.isDevMode); 
+    if (serialEnabled) {
+        Serial.printf("validated rtcConfig : %u sleep=%u, version=%u, devMode=%d\n",
+                      rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.configVersion, rtcConfig.isDevMode); 
+    }
 
     // Check dev mode (hardware pin OR remote config)
-    pinMode(DEV_MODE_PIN, INPUT_PULLUP);
     devMode = (digitalRead(DEV_MODE_PIN) == LOW) || (config.isDevMode != 0);
 
     if (devMode) {
         setupBoards(); // Initialize all peripherals for dev mode
-        Serial.println("Dev/Debug mode");
+        if (serialEnabled) Serial.println("Dev/Debug mode");
     } else {
+        if (serialEnabled) Serial.println("Operation mode");
         // In OP mode, disable all non-essential peripherals for max power saving
         // Disable WiFi and Bluetooth
         WiFi.mode(WIFI_OFF);
@@ -332,8 +343,10 @@ void setup()
     // Radio setup (same as before, but only if not sleeping)
     int state = radio.begin();
     if (state != RADIOLIB_ERR_NONE) {
-        Serial.print(F("Radio init failed: "));
-        Serial.println(state);
+        if (serialEnabled) {
+            Serial.print(F("Radio init failed: "));
+            Serial.println(state);
+        }
         return;
     }
 
@@ -463,7 +476,7 @@ void readSensors()
     sensorData.timestamp = (uint32_t)now;
     sensorData.configVersion = config.configVersion;
 
-    if (devMode) {
+    if (serialEnabled) {
         // Convert timestamp to human-readable UTC string
         char timeStr[20];
         time_t ts = sensorData.timestamp;
@@ -519,7 +532,9 @@ void transmitData()
         txPayload.lastSNR = (int8_t)sensorData.lastSNR;
         txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
         txSize = sizeof(TelemetryPayload); // 26 bytes full size
-        
+    }
+
+    if (serialEnabled) {
         // We generate the debug string before encryption so you can still read it on the OLED
         payload = "";
         uint8_t* ptr = (uint8_t*)&txPayload;
@@ -543,7 +558,7 @@ void transmitData()
     // Transmit the raw binary struct directly
     transmissionState = radio.startTransmit((uint8_t*)&txPayload, txSize);
 
-    if (devMode) {
+    if (serialEnabled) {
         Serial.printf("Transmitting binary payload (%d bytes): %s\n", txSize, payload.c_str());
     }
 
@@ -553,7 +568,7 @@ void transmitData()
         delay(1); // Reduce delay to switch to RX mode as fast as possible
     }
     lastTxTime = millis() - startWait;
-    if (!operationDone && devMode) {
+    if (!operationDone && serialEnabled) {
         Serial.println("Warning: TX timeout!");
     }
     operationDone = false;
@@ -561,18 +576,21 @@ void transmitData()
     // Turn LED off after transmission
     digitalWrite(BOARD_LED, !LED_ON);
 
-    if (devMode) {
+    if (serialEnabled) {
         Serial.printf("Transmission complete. Airtime: %lu ms\n", lastTxTime);
     }
+    
 }
 
 // Handles sleep timing, conditionally triggering the configuration listener, and deep sleeping the ESP32.
 // Used in: Both Operation and Dev modes (skips actual esp_deep_sleep_start in Dev mode)
 void enterDeepSleep()
 {
-    if (devMode) {
+    if (serialEnabled) {
         Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
         delay(1000); // Allow serial to finish
+    }
+    if (devMode) {
         return; // Exit deep sleep function
     }
 
@@ -604,7 +622,7 @@ void listenForConfig()
                     sensorData.lastRSSI = radio.getRSSI();
                     
                     
-                    if (devMode) {
+                    if (serialEnabled) {
                         uint32_t packetToA = radio.getTimeOnAir(sizeof(ConfigPayload)) / 1000; // Returns microseconds, convert to ms
                         Serial.printf("Received config packet. Packet ToA: %lu ms\n", packetToA);
                     }
@@ -637,20 +655,26 @@ void listenForConfig()
                         tv.tv_sec = config.epochTime;
                         tv.tv_usec = 0;
                         settimeofday(&tv, NULL);
-                        Serial.printf("Current config : sleep=%u, version=%u, devMode=%d\n",
-                                          rtcConfig.sleepInterval,rtcConfig.configVersion, rtcConfig.isDevMode);
-                        Serial.printf("received config: sleep=%u, version=%u, devMode=%d\n",
-                                          config.sleepInterval, config.configVersion, config.isDevMode);                  
+
+                        if (serialEnabled) {
+                            Serial.printf("received config: sleep=%u, version=%u, devMode=%d\n",
+                                              config.sleepInterval, config.configVersion, config.isDevMode);  
+                        }
+
                         rtcConfig = config; // Save to RTC
                         
                         bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || (config.isDevMode != 0);
                         if (devMode != cfgMode) {
-                            Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
+                            if (serialEnabled) {
+                                Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
+                            }
                             delay(1000);
                             ESP.restart(); // Soft reset
                         } else  {
-                            Serial.printf("Config updated: sleep=%u, version=%u, devMode=%d\n",
-                                          config.sleepInterval, config.configVersion, config.isDevMode);
+                            if (serialEnabled) {
+                                Serial.printf("Config updated: sleep=%u, version=%u, devMode=%d\n",
+                                              config.sleepInterval, config.configVersion, config.isDevMode);
+                            }
                         }
                         break; // Successfully received and applied config, exit 5s RX window early
                     }
@@ -669,7 +693,7 @@ void listenForConfig()
     radio.standby();
     
     lastRxTime = millis() - startTime; // Record the total time the radio was consuming power in RX mode
-    if (devMode) {
+    if (serialEnabled) {
         Serial.printf("RX Window closed. Total RX power-on time: %lu ms\n", lastRxTime);
     }
 }
