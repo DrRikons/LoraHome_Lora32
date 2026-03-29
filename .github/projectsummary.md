@@ -12,7 +12,7 @@ A LoRa-based remote sensor and gateway system for boiler temperature monitoring 
 ## Software Architecture
 - **Framework**: Arduino via PlatformIO
 - **Core Logic**: Located in `modes/Sensor/main.cpp`.
-- **Telemetry Payload Format**: Packed binary C++ struct. Dynamically shifts between 14 bytes (core logic) in Operation Mode and 25 bytes (extended logic) in Dev Mode to maximize battery life. Secured using AES-128-CTR.
+- **Gateway Logic**: Located in `modes/GateWay/GateWay.ino`. Decrypts the sensor payload on the fly using `msgCount` as the AES Initialization Vector and displays parsed metrics locally.
 - **Telemetry Payload Format**: Packed binary C++ struct. Dynamically shifts between 15 bytes (core logic) in Operation Mode and 26 bytes (extended logic) in Dev Mode to maximize battery life. Secured using AES-128-CTR.
 - **Remote Configuration Format**: 22-byte packed binary C++ `struct` (ConfigPayload) with a 2-byte "CF" header, 6-byte target MAC address, and a 4-byte Network Key for authentication. Devices listen for it every 10 sleep cycles to update deep sleep intervals, mode, and sync the ESP32 RTC clock.
 - **Radio Parameters**: Optimized for efficiency (SF9, BW 125kHz, CR 4/5) to significantly reduce power consumption.
@@ -26,5 +26,5 @@ A LoRa-based remote sensor and gateway system for boiler temperature monitoring 
 - milesburton/DallasTemperature
 - wollewald/INA226_WE
 - olikraus/U8g2
-- paulstoffregen/OneWire
+- paulstoffregen/OneWire (Pinned to exactly 2.3.7 to prevent syntax warnings introduced in 2.3.8)
 - jgromes/RadioLib

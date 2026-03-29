@@ -1,34 +1,27 @@
 # lora32_boiler_control
-
+Based on https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t3_v161_sx1276/t3_v161_sx1276_hw.md
 ## Configuration
 
-The sensor node can be configured remotely by sending a specific string over LoRa. The device listens for this configuration message for 5 seconds on startup (and every 10 sleep cycles).
+The sensor node can be configured remotely by sending a specific packed binary payload over LoRa. The device listens for this configuration message for 5 seconds on startup (and every 10 sleep cycles).
 
-### Configuration String Format
+### Configuration Payload Format
 
-The configuration string must follow this format:
-
-`CONFIG:<sleepInterval>,<version>[,<devMode>[,<timeOffset>]]`
-
--   `CONFIG:`: A required prefix.
--   `<sleepInterval>`: The time in seconds that the device will deep sleep between sensor readings. This must be an integer value.
--   `<version>`: A version number for the configuration. This must be an integer value.
--   `<devMode>`: *(Optional)* 1 to enable developer mode continuously without deep sleeping, 0 to disable.
--   `<timeOffset>`: *(Optional)* Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC.
+The configuration payload is a 22-byte binary structure (`ConfigPayload`):
+-   `header`: 2 bytes (`"CF"`) to reject noise.
+-   `targetMac`: 6 bytes. Target MAC address (or `FF:FF:FF:FF:FF:FF` for broadcast).
+-   `networkKey`: 4 bytes. Shared secret key (`NETWORK_KEY`) to prevent unauthorized spoofing.
+-   `sleepInterval`: 4 bytes. Time in seconds that the device will deep sleep.
+-   `configVersion`: 1 byte. Version number for the configuration.
+-   `isDevMode`: 1 byte. `1` to enable developer mode continuously without deep sleeping, `0` to disable.
+-   `timeOffset`: 4 bytes. Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC.
 
 *Note: Changing the mode remotely will trigger a soft reset of the ESP32 to cleanly initialize/de-initialize power-heavy peripherals. If the physical `DEV_MODE_PIN` (GPIO13) is pulled LOW, it acts as a hard hardware override and the device will ignore any remote commands to enter Operation Mode.*
-
-**Examples:**
-
-- Set sleep interval to 300 seconds, version 2: `CONFIG:300,2`
-- Turn on continuous Dev Mode for debugging: `CONFIG:60,3,1`
-- Sync time to March 22 2024 (7000000 seconds offset): `CONFIG:60,3,1,7000000`
 
 ## Project Structure
 
 The project is divided into two main modes:
 
--   `GateWay`: The gateway node that receives data from the sensor nodes.
+-   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR), parses, and displays data from the sensor nodes.
 -   `Sensor`: The sensor node that reads the boiler temperature and sends it to the gateway.
 
 The main application file for the sensor node is `modes/Sensor/main.cpp`.
@@ -36,8 +29,7 @@ The main application file for the sensor node is `modes/Sensor/main.cpp`.
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*
 
 ## Telemetry Payload Format
-To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The size dynamically depends on the operating mode (14 bytes in normal mode, 25 bytes in Dev Mode). The payload is secured using AES-128-CTR encryption.
-The size dynamically depends on the operating mode (15 bytes in normal mode, 26 bytes in Dev Mode). The payload is secured using AES-128-CTR encryption.
+To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The size dynamically depends on the operating mode (15 bytes in normal mode, 26 bytes in Dev Mode). The payload is secured using AES-128-CTR encryption.
 
 ```cpp
 struct __attribute__((packed)) TelemetryPayload {

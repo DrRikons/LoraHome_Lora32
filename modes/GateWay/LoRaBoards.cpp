@@ -466,13 +466,13 @@ bool beginDisplay()
         disp->begin();
         disp->clearBuffer();
         disp->setFont(u8g2_font_inb19_mr);
-        disp->drawStr(0, 30, "LilyGo");
-        disp->drawHLine(2, 35, 47);
-        disp->drawHLine(3, 36, 47);
-        disp->drawVLine(45, 32, 12);
-        disp->drawVLine(46, 33, 12);
+        disp->drawStr(0, 30, "LoRa");
+        disp->drawHLine(2, 35, 120);  // Extended for longer text
+        disp->drawHLine(3, 36, 120);
+        // disp->drawVLine(65, 32, 40);  // Adjusted position
+        // disp->drawVLine(66, 33, 40);
         disp->setFont(u8g2_font_inb19_mf);
-        disp->drawStr(58, 60, "LoRa");
+        disp->drawStr(58, 62, "Home");  
         disp->sendBuffer();
         disp->setFont(u8g2_font_fur11_tf);
         delay(3000);

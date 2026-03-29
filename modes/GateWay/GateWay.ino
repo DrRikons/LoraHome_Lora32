@@ -18,6 +18,7 @@
 
 #include <RadioLib.h>
 #include "LoRaBoards.h"
+#include <mbedtls/aes.h>
 
 #if     defined(USING_SX1276)
 #ifndef CONFIG_RADIO_FREQ
@@ -149,11 +150,60 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 #endif /*USING_LR1121PA*/
 #endif /*Radio define end*/
 
+// 16-Byte Shared secret key for AES-128 encryption
+const uint8_t AES_NETWORK_KEY[16] = {
+    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
+};
+
+// Packed binary structure for highly efficient LoRa transmission (up to 26 bytes)
+struct __attribute__((packed)) TelemetryPayload {
+  // --- Core variables (15 bytes, always sent) ---
+  uint8_t  mac[6];       // 6 bytes: Raw MAC address
+  uint16_t msgCount;     // 2 bytes: Message counter (cycles at 65535)
+  int16_t  temperature;  // 2 bytes: External Temp (x 100)
+  uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
+  uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
+  uint8_t  configVer;    // 1 byte:  Config version
+  uint8_t  opMode;       // 1 byte:  0=Op, 1=Dev
+  
+  // --- Dev mode variables (11 bytes, conditionally sent) ---
+  int16_t  battCurrent;  // 2 bytes: Battery Current in mA
+  int16_t  battPower;    // 2 bytes: Battery Power in mW
+  uint16_t freeRam;      // 2 bytes: Free RAM in KB
+  int8_t   cpuTemp;      // 1 byte:  CPU Temp in C
+  int8_t   txPower;      // 1 byte:  TX Power in dBm
+  int8_t   lastSNR;      // 1 byte:  Last received SNR
+  int16_t  lastRSSI;     // 2 bytes: Last received RSSI
+};
+
 // flag to indicate that a packet was received
 static volatile bool receivedFlag = false;
 static String rssi = "0dBm";
 static String snr = "0dB";
-static String payload = "0";
+
+// Display variables
+static float lastTemp = 0.0;
+static float lastVcc = 0.0;
+static uint8_t lastBatt = 0;
+static String lastMac = "Wait...";
+static uint16_t msgCount = 0;
+
+void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
+    
+    uint8_t iv[16] = {0};
+    // Seed the IV with the message counter to ensure a unique key stream per packet
+    iv[14] = (msgCount >> 8) & 0xFF;
+    iv[15] = msgCount & 0xFF;
+    
+    uint8_t stream_block[16] = {0};
+    size_t nc_off = 0;
+    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, iv, stream_block, data, data);
+    mbedtls_aes_free(&aes);
+}
 
 // this function is called when a complete packet
 // is received by the module
@@ -229,7 +279,7 @@ void setup()
     * SX1280        :  Allowed values range from 5 to 12.
     * LR1121        :  Allowed values range from 5 to 12.
     * * * */
-    if (radio.setSpreadingFactor(12) == RADIOLIB_ERR_INVALID_SPREADING_FACTOR) {
+    if (radio.setSpreadingFactor(9) == RADIOLIB_ERR_INVALID_SPREADING_FACTOR) {
         Serial.println(F("Selected spreading factor is invalid for this module!"));
         while (true);
     }
@@ -240,7 +290,7 @@ void setup()
     * SX1280        :  Allowed values range from 5 to 8.
     * LR1121        :  Allowed values range from 5 to 8.
     * * * */
-    if (radio.setCodingRate(6) == RADIOLIB_ERR_INVALID_CODING_RATE) {
+    if (radio.setCodingRate(5) == RADIOLIB_ERR_INVALID_CODING_RATE) {
         Serial.println(F("Selected coding rate is invalid for this module!"));
         while (true);
     }
@@ -287,13 +337,14 @@ void setup()
     * SX1280        : Allowed values range from 1 to 65535. preamble length is multiple of 4
     * LR1121        : Allowed values range from 1 to 65535.
     * * */
-    if (radio.setPreambleLength(16) == RADIOLIB_ERR_INVALID_PREAMBLE_LENGTH) {
+    // Removed preamble override to let it use default (8) matching the sensor code.
+    /*if (radio.setPreambleLength(16) == RADIOLIB_ERR_INVALID_PREAMBLE_LENGTH) {
         Serial.println(F("Selected preamble length is invalid for this module!"));
         while (true);
-    }
+    }*/
 
     // Enables or disables CRC check of received packets.
-    if (radio.setCRC(false) == RADIOLIB_ERR_INVALID_CRC_CONFIGURATION) {
+    if (radio.setCRC(true) == RADIOLIB_ERR_INVALID_CRC_CONFIGURATION) {
         Serial.println(F("Selected CRC is invalid for this module!"));
         while (true);
     }
@@ -397,14 +448,9 @@ void loop()
         // reset flag
         receivedFlag = false;
 
-        // you can read received data as an Arduino String
-        int state = radio.readData(payload);
-
-        // you can also read received data as byte array
-        /*
-          byte byteArr[8];
-          int state = radio.readData(byteArr, 8);
-        */
+        int numBytes = radio.getPacketLength();
+        byte byteArr[256];
+        int state = radio.readData(byteArr, numBytes);
 
         flashLed();
 
@@ -413,22 +459,37 @@ void loop()
             rssi = String(radio.getRSSI()) + "dBm";
             snr = String(radio.getSNR()) + "dB";
 
+            if (numBytes == 15 || numBytes == sizeof(TelemetryPayload)) {
+                TelemetryPayload rxPayload;
+                memcpy(&rxPayload, byteArr, numBytes);
+                
+                size_t encryptedLength = numBytes - 8;
+                uint8_t* dataPtr = ((uint8_t*)&rxPayload) + 8;
+                cryptPayload(dataPtr, encryptedLength, rxPayload.msgCount);
+                
+                lastTemp = rxPayload.temperature / 100.0f;
+                lastVcc = rxPayload.battVoltage / 1000.0f;
+                lastBatt = rxPayload.battPercent;
+                msgCount = rxPayload.msgCount;
+                
+                char macStr[18];
+                sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", 
+                        rxPayload.mac[0], rxPayload.mac[1], rxPayload.mac[2],
+                        rxPayload.mac[3], rxPayload.mac[4], rxPayload.mac[5]);
+                lastMac = String(macStr);
+                
+                Serial.println(F("Radio Received packet!"));
+                Serial.printf("MAC: %s | Msg: %u\n", macStr, msgCount);
+                Serial.printf("Temp: %.1fC | VCC: %.2fV | Batt: %d%%\n", lastTemp, lastVcc, lastBatt);
+                if (numBytes == sizeof(TelemetryPayload)) {
+                    Serial.printf("DEV Mode -> CPU Temp: %dC | RAM: %uKB | Pow: %dmW\n", 
+                                  rxPayload.cpuTemp, rxPayload.freeRam, rxPayload.battPower);
+                }
+            } else {
+                Serial.printf("Received unknown packet of %d bytes\n", numBytes);
+            }
+
             drawMain();
-
-            // packet was successfully received
-            Serial.println(F("Radio Received packet!"));
-
-            // print data of the packet
-            Serial.print(F("Radio Data:\t\t"));
-            Serial.println(payload);
-
-            // print RSSI (Received Signal Strength Indicator)
-            Serial.print(F("Radio RSSI:\t\t"));
-            Serial.println(rssi);
-
-            // print SNR (Signal-to-Noise Ratio)
-            Serial.print(F("Radio SNR:\t\t"));
-            Serial.println(snr);
 
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
             // packet was received, but is malformed
@@ -451,20 +512,21 @@ void drawMain()
         disp->clearBuffer();
         disp->drawRFrame(0, 0, 128, 64, 5);
         disp->setFont(u8g2_font_pxplusibmvga8_mr);
-        disp->setCursor(15, 20);
-        disp->print("RX:");
-        disp->setCursor(15, 35);
-        disp->print("SNR:");
-        disp->setCursor(15, 50);
-        disp->print("RSSI:");
-
-        disp->setFont(u8g2_font_crox1h_tr);
-        disp->setCursor( U8G2_HOR_ALIGN_RIGHT(payload.c_str()) - 21, 20 );
-        disp->print(payload);
-        disp->setCursor( U8G2_HOR_ALIGN_RIGHT(snr.c_str()) - 21, 35 );
-        disp->print(snr);
-        disp->setCursor( U8G2_HOR_ALIGN_RIGHT(rssi.c_str()) - 21, 50 );
-        disp->print(rssi);
+        
+        disp->setCursor(5, 15);
+        disp->print("MAC:");
+        disp->setCursor(35, 15);
+        disp->print(lastMac);
+        
+        disp->setCursor(5, 30);
+        disp->printf("Temp: %.1f C", lastTemp);
+        
+        disp->setCursor(5, 45);
+        disp->printf("Bat: %.2fV (%d%%)", lastVcc, lastBatt);
+        
+        disp->setCursor(5, 60);
+        disp->printf("S: %s R: %s", snr.c_str(), rssi.c_str());
+        
         disp->sendBuffer();
     }
 }
