@@ -150,6 +150,12 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 #endif /*USING_LR1121PA*/
 #endif /*Radio define end*/
 
+// Shared secret key for Gateway-to-Sensor config authentication
+#define NETWORK_KEY 0x3FA4B2C1
+
+// Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
+#define CUSTOM_EPOCH 1704067200UL
+
 // 16-Byte Shared secret key for AES-128 encryption
 const uint8_t AES_NETWORK_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
@@ -175,6 +181,17 @@ struct __attribute__((packed)) TelemetryPayload {
   int8_t   txPower;      // 1 byte:  TX Power in dBm
   int8_t   lastSNR;      // 1 byte:  Last received SNR
   int16_t  lastRSSI;     // 2 bytes: Last received RSSI
+};
+
+// Packed binary structure for received configuration payloads (22 bytes)
+struct __attribute__((packed)) ConfigPayload {
+  char     header[2];      // 2 bytes: "CF" identifier to reject noise
+  uint8_t  targetMac[6];   // 6 bytes: Target MAC address (or FF:FF:FF:FF:FF:FF for broadcast)
+  uint32_t networkKey;     // 4 bytes: Shared secret key to prevent unauthorized spoofing
+  uint32_t sleepInterval;  // 4 bytes: Sleep interval in seconds
+  uint8_t  configVersion;  // 1 byte:  Configuration version
+  uint8_t  isDevMode;      // 1 byte:  0 = OP Mode, 1 = Dev Mode
+  uint32_t timeOffset;     // 4 bytes: Seconds since CUSTOM_EPOCH
 };
 
 // flag to indicate that a packet was received
@@ -485,6 +502,35 @@ void loop()
                     Serial.printf("DEV Mode -> CPU Temp: %dC | RAM: %uKB | Pow: %dmW\n", 
                                   rxPayload.cpuTemp, rxPayload.freeRam, rxPayload.battPower);
                 }
+
+                // Transmit configuration reply back to the sensor
+                ConfigPayload txConfig;
+                txConfig.header[0] = 'C';
+                txConfig.header[1] = 'F';
+                memcpy(txConfig.targetMac, rxPayload.mac, 6);
+                txConfig.networkKey = NETWORK_KEY;
+                txConfig.sleepInterval = 20; // Default sleep interval of 60 seconds
+                txConfig.configVersion = rxPayload.configVer; // Mirror version, change to force update
+                txConfig.isDevMode = 0;      // 0 = OP Mode
+                txConfig.timeOffset = 1;     // Optional NTP sync
+
+                // Delay briefly to ensure the sensor has finished its TX routine 
+                // and fully switched into RX mode to catch our preamble.
+                delay(100);
+
+                radio.standby();
+                int txState = radio.transmit((uint8_t*)&txConfig, sizeof(ConfigPayload));
+                if (txState == RADIOLIB_ERR_NONE) {
+                    Serial.println(F("Configuration reply transmitted successfully!"));
+                    Serial.printf("Config Sent -> Sleep: %lu | Ver: %u | DevMode: %u | TimeOffset: %lu\n",
+                                  (unsigned long)txConfig.sleepInterval, txConfig.configVersion, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
+                } else {
+                    Serial.printf("Configuration reply failed, code %d\n", txState);
+                }
+                
+                // radio.transmit() is blocking and triggers the hardware interrupt upon completion.
+                // This causes our ISR to set receivedFlag = true. We must clear it to avoid a TX-RX infinite loop.
+                receivedFlag = false;
             } else {
                 Serial.printf("Received unknown packet of %d bytes\n", numBytes);
             }

@@ -15,13 +15,13 @@ The configuration payload is a 22-byte binary structure (`ConfigPayload`):
 -   `isDevMode`: 1 byte. `1` to enable developer mode continuously without deep sleeping, `0` to disable.
 -   `timeOffset`: 4 bytes. Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC.
 
-*Note: Changing the mode remotely will trigger a soft reset of the ESP32 to cleanly initialize/de-initialize power-heavy peripherals. If the physical `DEV_MODE_PIN` (GPIO13) is pulled LOW, it acts as a hard hardware override and the device will ignore any remote commands to enter Operation Mode.*
+*Note: Changing the mode remotely will trigger a soft reset of the ESP32 to cleanly initialize/de-initialize power-heavy peripherals. Configuration values survive this reset by utilizing the ESP32's RTC_NOINIT_ATTR memory section. If the physical `DEV_MODE_PIN` (GPIO13) is pulled LOW, it acts as a hard hardware override and the device will ignore any remote commands to enter Operation Mode.*
 
 ## Project Structure
 
 The project is divided into two main modes:
 
--   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR), parses, and displays data from the sensor nodes.
+-   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR), parses, displays data from the sensor nodes, and transmits remote configuration payloads back (with a brief turnaround delay to prevent preamble clipping, and TX interrupt suppression to avoid feedback loops).
 -   `Sensor`: The sensor node that reads the boiler temperature and sends it to the gateway.
 
 The main application file for the sensor node is `modes/Sensor/main.cpp`.
@@ -62,7 +62,7 @@ This repository includes a GitHub Action (`issue-commenter.yml`) that automatica
 ## Development
 When running in `devMode` (GPIO13 pulled LOW), the sensor will continuously simulate its full operational cycle without deep sleeping: Wake -> Transmit -> Receive -> Display (cycling through all OLED screens, including total TX/RX power-on times) -> Simulated Sleep (OLED clears).
 
-*Note: The codebase uses hardware interrupt-driven, asynchronous RX/TX routines to prevent blocking loops and hangs.*
+*Note: The codebase uses hardware interrupt-driven, asynchronous RX/TX routines to prevent blocking loops and hangs. Serial output (115200 baud) is active in both Dev and Operation modes for debugging.*
 
 An `.aiexclude` file is included to prevent AI coding assistants from indexing large third-party libraries in the `lib/` folder and build artifacts in the `.pio/` folder, preserving context space.
 
