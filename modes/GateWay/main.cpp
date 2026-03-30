@@ -21,13 +21,18 @@
 #include "LoRaBoards.h"
 #include <mbedtls/aes.h>
 #include <WiFi.h>
+#include <ezTime.h>
+#include <sys/time.h>
 #include <time.h>
+#include <math.h>
 
 // WiFi and NTP Configuration
 #define WIFI_SSID "SSID"
 #define WIFI_PASSWORD "***password***"
 #define WIFI_HOSTNAME "LoRaGateway"
-#define NTP_SERVER "pool.ntp.org"
+#define TZ_INFO "EET-2EEST,M3.5.0/3,M10.5.0/4" // Europe/Athens
+// Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
+#define CUSTOM_EPOCH 1704067200UL
 
 // Forward declarations
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount);
@@ -35,6 +40,20 @@ void setFlag(void);
 void setup();
 void loop();
 void drawMain();
+time_t getLocalTimeFromUtc(time_t utcTime);
+bool isClockValid(time_t currentTime);
+bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
+
+// ezTime object
+Timezone myTZ;
+
+bool isClockValid(time_t currentTime) {
+    return currentTime > (time_t)CUSTOM_EPOCH;
+}
+
+bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
+    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
+}
 
 #if     defined(USING_SX1276)
 #ifndef CONFIG_RADIO_FREQ
@@ -169,8 +188,7 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 // Shared secret key for Gateway-to-Sensor config authentication
 #define NETWORK_KEY 0x3FA4B2C1
 
-// Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
-#define CUSTOM_EPOCH 1704067200UL
+
 
 // 16-Byte Shared secret key for AES-128 encryption
 const uint8_t AES_NETWORK_KEY[16] = {
@@ -180,7 +198,7 @@ const uint8_t AES_NETWORK_KEY[16] = {
 
 // Packed binary structure for highly efficient LoRa transmission (up to 26 bytes)
 struct __attribute__((packed)) TelemetryPayload {
-  // --- Core variables (15 bytes, always sent) ---
+  // --- Core variables (16 bytes, always sent) ---
   uint8_t  mac[6];       // 6 bytes: Raw MAC address
   uint16_t msgCount;     // 2 bytes: Message counter (cycles at 65535)
   int16_t  temperature;  // 2 bytes: External Temp (x 100)
@@ -188,6 +206,7 @@ struct __attribute__((packed)) TelemetryPayload {
   uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
   uint8_t  configVer;    // 1 byte:  Config version
   uint8_t  opMode;       // 1 byte:  0=Op, 1=Dev
+  uint8_t  needsTimeSync; // 1 byte:  0=clock OK, 1=clock unset/needs sync
   
   // --- Dev mode variables (11 bytes, conditionally sent) ---
   int16_t  battCurrent;  // 2 bytes: Battery Current in mA
@@ -221,8 +240,20 @@ static float lastVcc = 0.0;
 static uint8_t lastBatt = 0;
 static String lastMac = "Wait...";
 static uint16_t msgCount = 0;
+static uint8_t lastConfigVer = 0;
+static uint8_t lastOpMode = 0;
+static bool lastSensorNeedsTimeSync = false;
+static bool lastHasDevTelemetry = false;
+static int16_t lastBattCurrent = 0;
+static int16_t lastBattPower = 0;
+static uint16_t lastFreeRam = 0;
+static int8_t lastCpuTemp = 0;
+static int8_t lastTxPower = 0;
+static int8_t lastSensorSNR = 0;
+static int16_t lastSensorRSSI = 0;
 static uint32_t lastDisplayUpdate = 0;
 static uint8_t screenNum = 0;
+static bool hasValidRtcTime = false;
 
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_context aes;
@@ -238,6 +269,10 @@ void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     size_t nc_off = 0;
     mbedtls_aes_crypt_ctr(&aes, length, &nc_off, iv, stream_block, data, data);
     mbedtls_aes_free(&aes);
+}
+
+time_t getLocalTimeFromUtc(time_t utcTime) {
+    return myTZ.tzTime(utcTime, UTC_TIME);
 }
 
 // this function is called when a complete packet
@@ -258,7 +293,18 @@ void setup()
     WiFi.setHostname(WIFI_HOSTNAME);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    configTime(0, 0, NTP_SERVER); // Timezone 0 ensures UTC offsets match CUSTOM_EPOCH
+
+    // Set timezone using POSIX string to avoid HTTP lookup race conditions at boot
+    myTZ.setPosix(TZ_INFO);
+    
+    // Attempt to recover time from ESP32's hardware RTC (survives software resets)
+    time_t sysTime;
+    time(&sysTime);
+    if (isClockValid(sysTime)) {
+        hasValidRtcTime = true;
+        setTime(sysTime);
+        Serial.println(F("Recovered time from internal ESP32 RTC after soft reset."));
+    }
 
     // When the power is turned on, a delay is required.
     delay(1500);
@@ -483,6 +529,8 @@ void setup()
 
 void loop()
 {
+    events(); // Required by ezTime to process background NTP syncs
+
     // check if the flag is set
     if (receivedFlag) {
 
@@ -500,7 +548,7 @@ void loop()
             rssi = String(radio.getRSSI()) + "dBm";
             snr = String(radio.getSNR()) + "dB";
 
-            if (numBytes == 15 || numBytes == sizeof(TelemetryPayload)) {
+            if (numBytes == 16 || numBytes == sizeof(TelemetryPayload)) {
                 TelemetryPayload rxPayload;
                 memcpy(&rxPayload, byteArr, numBytes);
                 
@@ -512,6 +560,10 @@ void loop()
                 lastVcc = rxPayload.battVoltage / 1000.0f;
                 lastBatt = rxPayload.battPercent;
                 msgCount = rxPayload.msgCount;
+                lastConfigVer = rxPayload.configVer;
+                lastOpMode = rxPayload.opMode;
+                lastSensorNeedsTimeSync = (rxPayload.needsTimeSync != 0);
+                lastHasDevTelemetry = false;
                 
                 char macStr[18];
                 sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", 
@@ -521,13 +573,22 @@ void loop()
                 
                 Serial.println(F("Radio Received packet!"));
                 Serial.printf("MAC: %s | Msg: %u\n", macStr, msgCount);
-                Serial.printf("Temp: %.1fC | VCC: %.2fV | Batt: %d%%\n", lastTemp, lastVcc, lastBatt);
+                Serial.printf("Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Cfg: %u | Mode: %u | NeedsTimeSync: %s\n",
+                              lastTemp, lastVcc, lastBatt, lastConfigVer, lastOpMode, lastSensorNeedsTimeSync ? "yes" : "no");
                 if (numBytes == sizeof(TelemetryPayload)) {
-                    Serial.printf("DEV Mode -> CPU Temp: %dC | RAM: %uKB | Pow: %dmW\n", 
-                                  rxPayload.cpuTemp, rxPayload.freeRam, rxPayload.battPower);
+                    lastHasDevTelemetry = true;
+                    lastBattCurrent = rxPayload.battCurrent;
+                    lastBattPower = rxPayload.battPower;
+                    lastFreeRam = rxPayload.freeRam;
+                    lastCpuTemp = rxPayload.cpuTemp;
+                    lastTxPower = rxPayload.txPower;
+                    lastSensorSNR = rxPayload.lastSNR;
+                    lastSensorRSSI = rxPayload.lastRSSI;
+                    Serial.printf("DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm\n", 
+                                  lastCpuTemp, lastFreeRam, lastBattCurrent, lastBattPower, lastTxPower, lastSensorSNR, lastSensorRSSI);
                 }
 
-                // Transmit configuration reply back to the sensor
+                // prepare Config payload
                 ConfigPayload txConfig;
                 txConfig.header[0] = 'C';
                 txConfig.header[1] = 'F';
@@ -537,28 +598,55 @@ void loop()
                 txConfig.configVersion = rxPayload.configVer; // Mirror version, change to force update
                 txConfig.isDevMode = 0;      // 0 = OP Mode
                 
-                // Get current time from NTP to sync the sensor
-                time_t now;
-                time(&now);
-                if (now > CUSTOM_EPOCH) {
-                    txConfig.timeOffset = (uint32_t)(now - CUSTOM_EPOCH);
+                // Sync internal RTC from NTP if ezTime has a valid time and drift is detected
+                if (timeStatus() != timeNotSet) {
+                    time_t now_utc = UTC.now();
+                    time_t sysTime;
+                    time(&sysTime);
+                    if (!isClockValid(sysTime) || hasClockDrift(sysTime, now_utc, 2.0)) {
+                        struct timeval tv;
+                        tv.tv_sec = now_utc;
+                        tv.tv_usec = 0;
+                        settimeofday(&tv, NULL);
+                        hasValidRtcTime = true;
+                        Serial.println(F("Internal RTC drifted, synced with NTP time."));
+                    }
+                }
+
+                // ALWAYS use the internal RTC as the source of truth for the sensor
+                time_t currentSysTime;
+                time(&currentSysTime);
+                if (hasValidRtcTime && isClockValid(currentSysTime)) {
+                    time_t localSysTime = getLocalTimeFromUtc(currentSysTime);
+                    txConfig.timeOffset = (uint32_t)(localSysTime - CUSTOM_EPOCH);
                 } else {
-                    txConfig.timeOffset = 0; // 0 = NTP not synced yet
+                    txConfig.timeOffset = 0; // 0 = Gateway RTC was not valid at boot
                 }
 
                 // Delay briefly to ensure the sensor has finished its TX routine 
                 // and fully switched into RX mode to catch our preamble.
                 delay(100);
-
+                
+                // Transmit configuration payload to the sensor
                 radio.standby();
-                int txState = radio.transmit((uint8_t*)&txConfig, sizeof(ConfigPayload));
-                if (txState == RADIOLIB_ERR_NONE) {
-                    Serial.println(F("Configuration reply transmitted successfully!"));
-                    Serial.printf("Config Sent -> Sleep: %lu | Ver: %u | DevMode: %u | TimeOffset: %lu\n",
-                                  (unsigned long)txConfig.sleepInterval, txConfig.configVersion, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
+                // Allow a 5-second margin for transmission delay to avoid infinite sync loops.
+                // Sync when the sensor clock is unset or drifts more than 5 seconds.
+                bool sensorNeedsTimeSync = (txConfig.timeOffset > 0) && lastSensorNeedsTimeSync;
+                if (rxPayload.configVer != txConfig.configVersion || sensorNeedsTimeSync) {
+                    int txState = radio.transmit((uint8_t*)&txConfig, sizeof(ConfigPayload));
+                    if (txState == RADIOLIB_ERR_NONE) {
+                        Serial.println(F("Configuration transmitted successfully!"));
+                        Serial.printf("Config Sent -> Sleep: %lu | Ver: %u | DevMode: %u | TimeOffset: %lu\n",
+                                      (unsigned long)txConfig.sleepInterval, txConfig.configVersion, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
+                    } else {
+                        Serial.printf("Configuration transmission failed, code %d\n", txState);
+                    }
+                } else if (txConfig.timeOffset == 0) {
+                    Serial.println(F("Gateway RTC was bad at boot and is still not trusted. Never syncing sensors in this state."));
                 } else {
-                    Serial.printf("Configuration reply failed, code %d\n", txState);
+                    Serial.printf("No Config update or time sync needed");
                 }
+
                 
                 // radio.transmit() is blocking and triggers the hardware interrupt upon completion.
                 // This causes our ISR to set receivedFlag = true. We must clear it to avoid a TX-RX infinite loop.
@@ -626,11 +714,14 @@ void drawMain()
             }
             
             disp->setCursor(5, 45);
-            time_t now;
-            time(&now);
-            if (now > CUSTOM_EPOCH) {
+            time_t sysTime;
+            time(&sysTime);
+            if (isClockValid(sysTime)) {
+                time_t localSysTime = getLocalTimeFromUtc(sysTime);
+                struct tm timeinfo;
+                gmtime_r(&localSysTime, &timeinfo);
                 char timeStr[20];
-                strftime(timeStr, sizeof(timeStr), "%y-%m-%d %H:%M", localtime(&now));
+                strftime(timeStr, sizeof(timeStr), "%y-%m-%d %H:%M", &timeinfo);
                 disp->print(timeStr);
             } else {
                 disp->print("Time: Syncing...");
