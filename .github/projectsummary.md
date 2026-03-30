@@ -10,9 +10,9 @@ A LoRa-based remote sensor and gateway system for boiler temperature monitoring 
 - **Display**: OLED (controlled via U8g2)
 
 ## Software Architecture
-- **Framework**: Arduino via PlatformIO
+- **Framework**: Arduino via PlatformIO (Multi-environment setup allows building Gateway and Sensor simultaneously).
 - **Core Logic**: Located in `modes/Sensor/main.cpp`.
-- **Gateway Logic**: Located in `modes/GateWay/main.cpp` (legacy `GateWay.ino` retained). Decrypts the sensor payload on the fly using the MAC address and `msgCount` as the AES Initialization Vector, displays parsed metrics locally, and transmits a configuration payload back to the sensor (with a 100ms turnaround delay to prevent preamble clipping). Clears hardware interrupt flags post-transmission to prevent TX-triggered infinite receive loops.
+- **Gateway Logic**: Located in `modes/GateWay/main.cpp` (legacy `GateWay.ino` retained). Connects to WiFi (hostname: `LoRa-Gateway`) to fetch accurate NTP time. Decrypts the sensor payload on the fly using the MAC address and `msgCount` as the AES Initialization Vector. Cycles the local OLED display to show parsed telemetry and gateway status. Transmits a configuration payload back to the sensor (with a 100ms turnaround delay to prevent preamble clipping), and clears hardware interrupt flags post-transmission to prevent TX-triggered infinite receive loops.
 - **Telemetry Payload Format**: Packed binary C++ struct. Dynamically shifts between 17 bytes (core logic) in Operation Mode and 28 bytes (extended logic) in Dev Mode to maximize battery life. Secured using AES-128-CTR.
 - **Remote Configuration Format**: 22-byte packed binary C++ `struct` (ConfigPayload) with a 2-byte "CF" header, 6-byte target MAC address, and a 4-byte Network Key for authentication. Devices listen for it every 10 sleep cycles to update deep sleep intervals, mode, and sync the ESP32 RTC clock (offset `0` ignores time sync).
 - **Radio Parameters**: Optimized for efficiency (SF9, BW 125kHz, CR 4/5) to significantly reduce power consumption.
