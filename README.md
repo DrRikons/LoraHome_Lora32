@@ -21,7 +21,7 @@ The configuration payload is a 22-byte binary structure (`ConfigPayload`):
 
 The project is divided into two main modes:
 
--   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR), parses, and displays data from the sensor nodes. It connects to WiFi (hostname: `LoRa-Gateway`) and uses the `ezTime` library to fetch NTP time. The primary source of truth for the gateway's time is the internal hardware RTC, allowing it to drive sensors and displays seamlessly even after a router failure. The gateway checks for drift against NTP and corrects the internal RTC before generating synchronization payloads. It calculates local time with DST shifts and transmits timezone-aware configuration payloads back to the sensors. The local OLED display cycles between live sensor telemetry and gateway status.
+-   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR using the message counter as the IV), parses, and displays data from the sensor nodes. It connects to WiFi (hostname: `LoRa-Gateway`) and uses the `ezTime` library to fetch NTP time. The primary source of truth for the gateway's time is the internal hardware RTC, allowing it to drive sensors and displays seamlessly even after a router failure. The gateway checks for drift against NTP and corrects the internal RTC before generating synchronization payloads. It calculates local time with DST shifts and transmits timezone-aware configuration payloads back to the sensors. The local OLED display cycles between live sensor telemetry and gateway status. Received sensor data is published securely over TLS as a JSON payload to an MQTT topic (`lora_gateway/<sensor_mac>/telemetry`).
 -   `Sensor`: The sensor node that reads the boiler temperature and sends it to the gateway.
 
 The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/main.cpp` (a legacy `GateWay.ino` is also retained for Arduino IDE compatibility).
@@ -29,31 +29,9 @@ The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/m
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*
 
 ## Telemetry Payload Format
-To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The size dynamically depends on the operating mode (19 bytes in normal mode, 30 bytes in Dev Mode). The payload is secured using AES-128-CTR encryption.
+To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The `TelemetryPayload` struct is defined in `payloads.h` and its size dynamically depends on the operating mode (16 bytes in normal mode, 27 bytes in Dev Mode). The payload is secured using AES-128-CTR encryption.
 
-```cpp
-struct __attribute__((packed)) TelemetryPayload {
-  // --- Core variables (19 bytes, always sent) ---
-  uint8_t  mac;       // 6 bytes: Raw MAC address
-  uint16_t msgCount;     // 2 bytes: Message counter (Used as AES IV)
-  int16_t  temperature;  // 2 bytes: External Temp (x 100)
-  uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
-  uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
-  uint8_t  configVer;    // 1 byte:  Config version
-  uint8_t  opMode;       // 1 byte:  0=Op, 1=Dev
-  uint32_t timeOffset;   // 4 bytes: Current time offset from CUSTOM_EPOCH
-  
-  // --- The following fields are ONLY sent in Dev Mode (length == 30) ---
-  int16_t  battCurrent;  // 2 bytes: Battery Current in mA
-  int16_t  battPower;    // 2 bytes: Battery Power in mW
-  uint16_t freeRam;      // 2 bytes: Free RAM in KB
-  int8_t   cpuTemp;      // 1 byte:  CPU Temp in C
-  int8_t   txPower;      // 1 byte:  TX Power in dBm
-  int8_t   lastSNR;      // 1 byte:  Last received SNR
-  int16_t  lastRSSI;     // 2 bytes: Last received RSSI
-};
-```
-*(Note: Any floating point values like temperature are multiplied before transmission. The Gateway should divide them upon receipt to restore the decimal values).*
+*(Note: The `TelemetryPayload` and `ConfigPayload` structs are defined in `payloads.h` for reusability across Gateway and Sensor modes. Any floating point values like temperature are multiplied before transmission. The Gateway divides them upon receipt to restore the decimal values).*
 
 *Note: SNR and RSSI metrics represent the signal quality of the last received configuration packet from the gateway.*
 
