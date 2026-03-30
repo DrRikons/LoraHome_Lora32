@@ -18,19 +18,30 @@
 
 #include <Arduino.h>
 #include <RadioLib.h>
-#include "LoRaBoards.h"
+#include <LoRaBoards.h>
 #include <mbedtls/aes.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include <ezTime.h>
 #include <sys/time.h>
 #include <time.h>
 #include <math.h>
+#include <payloads.h>
 
 // WiFi and NTP Configuration
 #define WIFI_SSID "SSID"
 #define WIFI_PASSWORD "***passwd***"
 #define WIFI_HOSTNAME "LoRaGateway"
 #define TZ_INFO "EET-2EEST,M3.5.0/3,M10.5.0/4" // Europe/Athens
+
+// MQTT Configuration
+#define MQTT_BROKER "broker_IP" // IMPORTANT: Replace with your MQTT broker IP
+#define MQTT_PORT 8883              // Default port for MQTT over TLS
+#define MQTT_USER "LoRa" // Optional
+#define MQTT_PASSWORD "Password" // Optional
+#define MQTT_TOPIC_PREFIX "lora_gateway"
 // Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
 #define CUSTOM_EPOCH 1704067200UL
 
@@ -43,9 +54,14 @@ void drawMain();
 time_t getLocalTimeFromUtc(time_t utcTime);
 bool isClockValid(time_t currentTime);
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
+void reconnectMqtt();
+void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem);
 
 // ezTime object
 Timezone myTZ;
+
+WiFiClientSecure espClient; // Use secure client for TLS
+PubSubClient mqttClient(espClient);
 
 bool isClockValid(time_t currentTime) {
     return currentTime > (time_t)CUSTOM_EPOCH;
@@ -196,39 +212,6 @@ const uint8_t AES_NETWORK_KEY[16] = {
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
 
-// Packed binary structure for highly efficient LoRa transmission (up to 26 bytes)
-struct __attribute__((packed)) TelemetryPayload {
-  // --- Core variables (16 bytes, always sent) ---
-  uint8_t  mac[6];       // 6 bytes: Raw MAC address
-  uint16_t msgCount;     // 2 bytes: Message counter (cycles at 65535)
-  int16_t  temperature;  // 2 bytes: External Temp (x 100)
-  uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
-  uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
-  uint8_t  configVer;    // 1 byte:  Config version
-  uint8_t  opMode;       // 1 byte:  0=Op, 1=Dev
-  uint8_t  needsTimeSync; // 1 byte:  0=clock OK, 1=clock unset/needs sync
-  
-  // --- Dev mode variables (11 bytes, conditionally sent) ---
-  int16_t  battCurrent;  // 2 bytes: Battery Current in mA
-  int16_t  battPower;    // 2 bytes: Battery Power in mW
-  uint16_t freeRam;      // 2 bytes: Free RAM in KB
-  int8_t   cpuTemp;      // 1 byte:  CPU Temp in C
-  int8_t   txPower;      // 1 byte:  TX Power in dBm
-  int8_t   lastSNR;      // 1 byte:  Last received SNR
-  int16_t  lastRSSI;     // 2 bytes: Last received RSSI
-};
-
-// Packed binary structure for received configuration payloads (22 bytes)
-struct __attribute__((packed)) ConfigPayload {
-  char     header[2];      // 2 bytes: "CF" identifier to reject noise
-  uint8_t  targetMac[6];   // 6 bytes: Target MAC address (or FF:FF:FF:FF:FF:FF for broadcast)
-  uint32_t networkKey;     // 4 bytes: Shared secret key to prevent unauthorized spoofing
-  uint32_t sleepInterval;  // 4 bytes: Sleep interval in seconds
-  uint8_t  configVersion;  // 1 byte:  Configuration version
-  uint8_t  isDevMode;      // 1 byte:  0 = OP Mode, 1 = Dev Mode
-  uint32_t timeOffset;     // 4 bytes: Seconds since CUSTOM_EPOCH
-};
-
 // flag to indicate that a packet was received
 static volatile bool receivedFlag = false;
 static String rssi = "0dBm";
@@ -254,6 +237,7 @@ static int16_t lastSensorRSSI = 0;
 static uint32_t lastDisplayUpdate = 0;
 static uint8_t screenNum = 0;
 static bool hasValidRtcTime = false;
+static long lastMqttReconnectAttempt = 0;
 
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_context aes;
@@ -293,6 +277,13 @@ void setup()
     WiFi.setHostname(WIFI_HOSTNAME);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    // Setup TLS client (use setInsecure for testing without CA cert, 
+    // or provide CA cert using espClient.setCACert(root_ca) for production)
+    espClient.setInsecure();
+
+    // Setup MQTT
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
 
     // Set timezone using POSIX string to avoid HTTP lookup race conditions at boot
     myTZ.setPosix(TZ_INFO);
@@ -531,6 +522,13 @@ void loop()
 {
     events(); // Required by ezTime to process background NTP syncs
 
+    if (WiFi.isConnected()) {
+        if (!mqttClient.connected()) {
+            reconnectMqtt();
+        }
+        mqttClient.loop();
+    }
+
     // check if the flag is set
     if (receivedFlag) {
 
@@ -586,6 +584,11 @@ void loop()
                     lastSensorRSSI = rxPayload.lastRSSI;
                     Serial.printf("DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm\n", 
                                   lastCpuTemp, lastFreeRam, lastBattCurrent, lastBattPower, lastTxPower, lastSensorSNR, lastSensorRSSI);
+                }
+
+                // Publish to MQTT if connected
+                if (mqttClient.connected()) {
+                    publishMqtt(rxPayload, lastMac, lastHasDevTelemetry);
                 }
 
                 // prepare Config payload
@@ -681,6 +684,64 @@ void loop()
     }
 }
 
+void reconnectMqtt() {
+    if (!mqttClient.connected()) {
+        long now = millis();
+        if (now - lastMqttReconnectAttempt > 5000) {
+            lastMqttReconnectAttempt = now;
+            // Attempt to reconnect
+            Serial.print("Attempting MQTT connection...");
+            String clientId = WIFI_HOSTNAME;
+            clientId += String(random(0xffff), HEX);
+            if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+                Serial.println("connected");
+            } else {
+                Serial.print("failed, rc=");
+                Serial.print(mqttClient.state());
+                Serial.println(" try again in 5 seconds");
+            }
+        }
+    }
+}
+
+void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
+    StaticJsonDocument<512> doc;
+
+    doc["mac"] = macStr;
+    doc["msgCount"] = payload.msgCount;
+    doc["temperature"] = payload.temperature / 100.0f;
+    doc["vcc"] = payload.battVoltage / 1000.0f;
+    doc["battery"] = payload.battPercent;
+    doc["configVersion"] = payload.configVer;
+    doc["opMode"] = payload.opMode;
+    doc["needsTimeSync"] = (payload.needsTimeSync != 0);
+    doc["gatewayRssi"] = radio.getRSSI();
+    doc["gatewaySnr"] = radio.getSNR();
+
+    if (hasDevTelem) {
+        doc["battCurrent"] = payload.battCurrent;
+        doc["battPower"] = payload.battPower;
+        doc["freeRam"] = payload.freeRam;
+        doc["cpuTemp"] = payload.cpuTemp;
+        doc["txPower"] = payload.txPower;
+        doc["sensorSnr"] = payload.lastSNR;
+        doc["sensorRssi"] = payload.lastRSSI;
+    }
+
+    char jsonBuffer[512];
+    serializeJson(doc, jsonBuffer);
+
+    // The MQTT topic is generated dynamically here using the configured prefix and the sensor's MAC address.
+    // Format: lora_gateway/<sensor_mac_address>/telemetry
+    String topic = String(MQTT_TOPIC_PREFIX) + "/" + macStr + "/telemetry";
+    
+    if (mqttClient.publish(topic.c_str(), jsonBuffer)) {
+        Serial.println("MQTT message published successfully.");
+    } else {
+        Serial.println("MQTT publish failed.");
+    }
+}
+
 void drawMain()
 {
     if (disp) {
@@ -701,7 +762,8 @@ void drawMain()
             disp->printf("Bat: %.2fV (%d%%)", lastVcc, lastBatt);
             
             disp->setCursor(5, 60);
-            disp->printf("S:%s R:%s W:%s", snr.c_str(), rssi.c_str(), WiFi.isConnected() ? "OK" : "NC");
+            disp->printf("Msg Cnt: %u", msgCount);
+            
         } else {
             disp->setCursor(5, 15);
             disp->print("-- GW Status --");
@@ -728,7 +790,7 @@ void drawMain()
             }
             
             disp->setCursor(5, 60);
-            disp->printf("Msg Cnt: %u", msgCount);
+            disp->printf("S:%s R:%s", snr.c_str(), rssi.c_str());
         }
         
         disp->sendBuffer();
