@@ -20,6 +20,14 @@
 #include <RadioLib.h>
 #include "LoRaBoards.h"
 #include <mbedtls/aes.h>
+#include <WiFi.h>
+#include <time.h>
+
+// WiFi and NTP Configuration
+#define WIFI_SSID "SSID"
+#define WIFI_PASSWORD "***passwd***"
+#define WIFI_HOSTNAME "LoRaGateway"
+#define NTP_SERVER "pool.ntp.org"
 
 // Forward declarations
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount);
@@ -213,6 +221,8 @@ static float lastVcc = 0.0;
 static uint8_t lastBatt = 0;
 static String lastMac = "Wait...";
 static uint16_t msgCount = 0;
+static uint32_t lastDisplayUpdate = 0;
+static uint8_t screenNum = 0;
 
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_context aes;
@@ -243,6 +253,12 @@ void setFlag(void)
 void setup()
 {
     setupBoards();
+
+    // Initialize WiFi and NTP in the background (non-blocking)
+    WiFi.setHostname(WIFI_HOSTNAME);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    configTime(0, 0, NTP_SERVER); // Timezone 0 ensures UTC offsets match CUSTOM_EPOCH
 
     // When the power is turned on, a delay is required.
     delay(1500);
@@ -520,7 +536,15 @@ void loop()
                 txConfig.sleepInterval = 20; // Default sleep interval of 60 seconds
                 txConfig.configVersion = rxPayload.configVer; // Mirror version, change to force update
                 txConfig.isDevMode = 0;      // 0 = OP Mode
-                txConfig.timeOffset = 0;     // 0 = Do not sync time (requires NTP implementation)
+                
+                // Get current time from NTP to sync the sensor
+                time_t now;
+                time(&now);
+                if (now > CUSTOM_EPOCH) {
+                    txConfig.timeOffset = (uint32_t)(now - CUSTOM_EPOCH);
+                } else {
+                    txConfig.timeOffset = 0; // 0 = NTP not synced yet
+                }
 
                 // Delay briefly to ensure the sensor has finished its TX routine 
                 // and fully switched into RX mode to catch our preamble.
@@ -543,6 +567,8 @@ void loop()
                 Serial.printf("Received unknown packet of %d bytes\n", numBytes);
             }
 
+            screenNum = 0; // Force switch to data screen on new packet
+            lastDisplayUpdate = millis();
             drawMain();
 
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
@@ -558,6 +584,13 @@ void loop()
         radio.startReceive();
 
     }
+
+    // Rotate screen every 5 seconds
+    if (millis() - lastDisplayUpdate > 5000) {
+        screenNum = (screenNum + 1) % 2;
+        lastDisplayUpdate = millis();
+        drawMain();
+    }
 }
 
 void drawMain()
@@ -567,19 +600,45 @@ void drawMain()
         disp->drawRFrame(0, 0, 128, 64, 5);
         disp->setFont(u8g2_font_pxplusibmvga8_mr);
         
-        disp->setCursor(5, 15);
-        disp->print("MAC:");
-        disp->setCursor(35, 15);
-        disp->print(lastMac);
-        
-        disp->setCursor(5, 30);
-        disp->printf("Temp: %.1f C", lastTemp);
-        
-        disp->setCursor(5, 45);
-        disp->printf("Bat: %.2fV (%d%%)", lastVcc, lastBatt);
-        
-        disp->setCursor(5, 60);
-        disp->printf("S: %s R: %s", snr.c_str(), rssi.c_str());
+        if (screenNum == 0) {
+            disp->setCursor(5, 15);
+            disp->print("MAC:");
+            disp->setCursor(35, 15);
+            disp->print(lastMac);
+            
+            disp->setCursor(5, 30);
+            disp->printf("Temp: %.1f C", lastTemp);
+            
+            disp->setCursor(5, 45);
+            disp->printf("Bat: %.2fV (%d%%)", lastVcc, lastBatt);
+            
+            disp->setCursor(5, 60);
+            disp->printf("S:%s R:%s W:%s", snr.c_str(), rssi.c_str(), WiFi.isConnected() ? "OK" : "NC");
+        } else {
+            disp->setCursor(5, 15);
+            disp->print("-- GW Status --");
+            
+            disp->setCursor(5, 30);
+            if (WiFi.isConnected()) {
+                disp->print(WiFi.localIP().toString());
+            } else {
+                disp->print("WiFi: NC");
+            }
+            
+            disp->setCursor(5, 45);
+            time_t now;
+            time(&now);
+            if (now > CUSTOM_EPOCH) {
+                char timeStr[20];
+                strftime(timeStr, sizeof(timeStr), "%y-%m-%d %H:%M", localtime(&now));
+                disp->print(timeStr);
+            } else {
+                disp->print("Time: Syncing...");
+            }
+            
+            disp->setCursor(5, 60);
+            disp->printf("Msg Cnt: %u", msgCount);
+        }
         
         disp->sendBuffer();
     }
