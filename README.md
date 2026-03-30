@@ -13,7 +13,7 @@ The configuration payload is a 22-byte binary structure (`ConfigPayload`):
 -   `sleepInterval`: 4 bytes. Time in seconds that the device will deep sleep.
 -   `configVersion`: 1 byte. Version number for the configuration.
 -   `isDevMode`: 1 byte. `1` to enable developer mode continuously without deep sleeping, `0` to disable.
--   `timeOffset`: 4 bytes. Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC. A value of `0` ignores synchronization.
+-   `timeOffset`: 4 bytes. Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC. The gateway automatically applies timezone and DST shifts to this value so sensors operate in local time. A value of `0` ignores synchronization.
 
 *Note: Changing the mode remotely will trigger a soft reset of the ESP32 to cleanly initialize/de-initialize power-heavy peripherals. Configuration values survive this reset by utilizing the ESP32's RTC_NOINIT_ATTR memory section. If the physical `DEV_MODE_PIN` (GPIO13) is pulled LOW, it acts as a hard hardware override and the device will ignore any remote commands to enter Operation Mode.*
 
@@ -21,7 +21,7 @@ The configuration payload is a 22-byte binary structure (`ConfigPayload`):
 
 The project is divided into two main modes:
 
--   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR), parses, displays data from the sensor nodes, and transmits remote configuration payloads back (with a brief turnaround delay to prevent preamble clipping, and TX interrupt suppression to avoid feedback loops). Connects to WiFi (hostname: `LoRa-Gateway`) to fetch real NTP time for accurate sensor clock synchronization. The local OLED display cycles between live sensor telemetry and gateway status (IP, clock, message count).
+-   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR), parses, and displays data from the sensor nodes. It connects to WiFi (hostname: `LoRa-Gateway`) and uses the `ezTime` library to fetch NTP time. The primary source of truth for the gateway's time is the internal hardware RTC, allowing it to drive sensors and displays seamlessly even after a router failure. The gateway checks for drift against NTP and corrects the internal RTC before generating synchronization payloads. It calculates local time with DST shifts and transmits timezone-aware configuration payloads back to the sensors. The local OLED display cycles between live sensor telemetry and gateway status.
 -   `Sensor`: The sensor node that reads the boiler temperature and sends it to the gateway.
 
 The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/main.cpp` (a legacy `GateWay.ino` is also retained for Arduino IDE compatibility).
@@ -29,11 +29,11 @@ The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/m
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*
 
 ## Telemetry Payload Format
-To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The size dynamically depends on the operating mode (15 bytes in normal mode, 26 bytes in Dev Mode). The payload is secured using AES-128-CTR encryption.
+To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The size dynamically depends on the operating mode (19 bytes in normal mode, 30 bytes in Dev Mode). The payload is secured using AES-128-CTR encryption.
 
 ```cpp
 struct __attribute__((packed)) TelemetryPayload {
-  // --- Core variables (15 bytes, always sent) ---
+  // --- Core variables (19 bytes, always sent) ---
   uint8_t  mac;       // 6 bytes: Raw MAC address
   uint16_t msgCount;     // 2 bytes: Message counter (Used as AES IV)
   int16_t  temperature;  // 2 bytes: External Temp (x 100)
@@ -41,8 +41,9 @@ struct __attribute__((packed)) TelemetryPayload {
   uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
   uint8_t  configVer;    // 1 byte:  Config version
   uint8_t  opMode;       // 1 byte:  0=Op, 1=Dev
+  uint32_t timeOffset;   // 4 bytes: Current time offset from CUSTOM_EPOCH
   
-  // --- The following fields are ONLY sent in Dev Mode (length == 26) ---
+  // --- The following fields are ONLY sent in Dev Mode (length == 30) ---
   int16_t  battCurrent;  // 2 bytes: Battery Current in mA
   int16_t  battPower;    // 2 bytes: Battery Power in mW
   uint16_t freeRam;      // 2 bytes: Free RAM in KB

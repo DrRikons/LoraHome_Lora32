@@ -16,6 +16,7 @@
 #include <INA226_WE.h>
 #include <sys/time.h>
 #include <time.h>
+#include <math.h>
 #include <mbedtls/aes.h>
 
 // Pin definitions
@@ -43,12 +44,30 @@ bool devMode = false;
 // Manual flag to enable serial output in Operation mode for testing. Requires reflash.
 bool serialEnabled = false; 
 
+bool isClockValid(time_t currentTime) {
+    return currentTime > (time_t)CUSTOM_EPOCH;
+}
+
+bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
+    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
+}
+
+void flushSerialOutput() {
+    if (!serialEnabled) {
+        return;
+    }
+
+    Serial.flush();
+    delay(20);
+}
+
 // Function Prototypes
 void readSensors();
 void transmitData();
 void enterDeepSleep();
 void listenForConfig();
 void drawMain();
+void flushSerialOutput();
 
 // Sensor objects
 OneWire oneWire(DS18B20_PIN);
@@ -72,7 +91,7 @@ struct SensorData {
 
 // Packed binary structure for highly efficient LoRa transmission (up to 26 bytes)
 struct __attribute__((packed)) TelemetryPayload {
-  // --- Core variables (15 bytes, always sent) ---
+  // --- Core variables (16 bytes, always sent) ---
   uint8_t  mac[6];       // 6 bytes: Raw MAC address
   uint16_t msgCount;     // 2 bytes: Message counter (cycles at 65535)
   int16_t  temperature;  // 2 bytes: External Temp (x 100)
@@ -80,6 +99,7 @@ struct __attribute__((packed)) TelemetryPayload {
   uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
   uint8_t  configVer;    // 1 byte:  Config version
   uint8_t  opMode;       // 1 byte:  0=Op, 1=Dev
+  uint8_t  needsTimeSync; // 1 byte:  0=clock OK, 1=clock unset/needs sync
   
   // --- Dev mode variables (11 bytes, conditionally sent) ---
   int16_t  battCurrent;  // 2 bytes: Battery Current in mA
@@ -108,8 +128,7 @@ struct Config {
   uint32_t sleepInterval; // seconds
   uint8_t configVersion;
   uint8_t isDevMode; // Remote dev mode flag (0=false, 1=true)
-  uint32_t epochTime; // Unix timestamp
-} config = {RTC_MAGIC_WORD, 20, 1, 0, CUSTOM_EPOCH}; // Default 20 seconds, base time Jan 1, 2024
+} config = {RTC_MAGIC_WORD, 20, 1, 0}; // Default 20 seconds
 
 // RTC memory for config persistence
 RTC_NOINIT_ATTR Config rtcConfig; // NOINIT ensures it survives SW_CPU_RESET (ESP.restart)
@@ -295,7 +314,6 @@ void setup()
         config.sleepInterval = 60;
         config.configVersion = 1;
         config.isDevMode = 0;
-        config.epochTime = CUSTOM_EPOCH;
         rtcConfig = config; // Initialize RTC memory with defaults on cold boot
     }
 
@@ -393,6 +411,7 @@ void setup()
     
     // Listen for config on startup and every 10 sleep cycles to save battery
     if (devMode || wakeCycleCount % 10 == 0) {
+        
         listenForConfig();
     }
     wakeCycleCount++;
@@ -480,10 +499,14 @@ void readSensors()
     sensorData.configVersion = config.configVersion;
 
     if (serialEnabled) {
-        // Convert timestamp to human-readable UTC string
         char timeStr[20];
         time_t ts = sensorData.timestamp;
-        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", gmtime(&ts));
+        if (isClockValid(ts)) {
+            strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", gmtime(&ts));
+        } else {
+            strncpy(timeStr, "UNSYNCED", sizeof(timeStr));
+            timeStr[sizeof(timeStr) - 1] = '\0';
+        }
 
         Serial.printf("T:%.1fC V:%.2fV(%d%%) I:%.1fmA P:%.1fmW | CPU:%.1fC RAM:%uKB | SNR:%.1f RSSI:%.0f | TS:%s Cfg:%u\n",
                       sensorData.temperature, sensorData.batteryVoltage, sensorData.batteryPercent,
@@ -523,8 +546,9 @@ void transmitData()
     txPayload.battPercent = sensorData.batteryPercent;
     txPayload.configVer = sensorData.configVersion;
     txPayload.opMode = (uint8_t)devMode;
+    txPayload.needsTimeSync = isClockValid((time_t)sensorData.timestamp) ? 0 : 1;
 
-    size_t txSize = 15; // Core payload size
+    size_t txSize = 16; // Core payload size
 
     if (devMode) {
         txPayload.battCurrent = (int16_t)sensorData.batteryCurrent;
@@ -534,7 +558,7 @@ void transmitData()
         txPayload.txPower = (int8_t)CONFIG_RADIO_OUTPUT_POWER;
         txPayload.lastSNR = (int8_t)sensorData.lastSNR;
         txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
-        txSize = sizeof(TelemetryPayload); // 26 bytes full size
+        txSize = sizeof(TelemetryPayload); // 27 bytes full size
     }
 
     if (serialEnabled) {
@@ -591,7 +615,7 @@ void enterDeepSleep()
 {
     if (serialEnabled) {
         Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
-        delay(1000); // Allow serial to finish
+        flushSerialOutput();
     }
     if (devMode) {
         return; // Exit deep sleep function
@@ -657,15 +681,14 @@ void listenForConfig()
                             time_t now;
                             time(&now);
                             
-                            // Only sync if the local RTC has drifted by more than 2 seconds
-                            if (abs((int32_t)now - (int32_t)newTime) > 2) {
-                                if (serialEnabled) {
-                                    Serial.print( "Time drift detected, syncing from received config");
-                                }    
-                                config.epochTime = newTime;
+                            // Sync if the local RTC is unset or has drifted by more than 2 seconds.
+                            if (!isClockValid(now) || hasClockDrift(now, (time_t)newTime, 2.0)) {
+                                if (serialEnabled) {    
+                                    Serial.printf("Time drift detected! Old: %lu, New: %lu. Syncing...\n", (unsigned long)now, (unsigned long)newTime);
+                                }
                                 // Sync the internal ESP32 RTC to fix time drift
                                 struct timeval tv;
-                                tv.tv_sec = config.epochTime;
+                                tv.tv_sec = newTime;
                                 tv.tv_usec = 0;
                                 settimeofday(&tv, NULL);
                             }
@@ -683,7 +706,7 @@ void listenForConfig()
                             if (serialEnabled) {
                                 Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
                             }
-                            delay(1000);
+                            flushSerialOutput();
                             ESP.restart(); // Soft reset
                         } else  {
                             if (serialEnabled) {
