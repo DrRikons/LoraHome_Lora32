@@ -13,7 +13,7 @@ The configuration payload is a 22-byte binary structure (`ConfigPayload`):
 -   `sleepInterval`: 4 bytes. Time in seconds that the device will deep sleep.
 -   `configVersion`: 1 byte. Version number for the configuration.
 -   `isDevMode`: 1 byte. `1` to enable developer mode continuously without deep sleeping, `0` to disable.
--   `timeOffset`: 4 bytes. Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC.
+-   `timeOffset`: 4 bytes. Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC. A value of `0` ignores synchronization.
 
 *Note: Changing the mode remotely will trigger a soft reset of the ESP32 to cleanly initialize/de-initialize power-heavy peripherals. Configuration values survive this reset by utilizing the ESP32's RTC_NOINIT_ATTR memory section. If the physical `DEV_MODE_PIN` (GPIO13) is pulled LOW, it acts as a hard hardware override and the device will ignore any remote commands to enter Operation Mode.*
 
@@ -24,7 +24,7 @@ The project is divided into two main modes:
 -   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR), parses, displays data from the sensor nodes, and transmits remote configuration payloads back (with a brief turnaround delay to prevent preamble clipping, and TX interrupt suppression to avoid feedback loops).
 -   `Sensor`: The sensor node that reads the boiler temperature and sends it to the gateway.
 
-The main application file for the sensor node is `modes/Sensor/main.cpp`.
+The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/main.cpp` (a legacy `GateWay.ino` is also retained for Arduino IDE compatibility).
 
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*
 

@@ -652,12 +652,24 @@ void listenForConfig()
                         config.configVersion = rxConfig.configVersion;
                         config.isDevMode = (rxConfig.isDevMode > 0);
                         
-                        config.epochTime = rxConfig.timeOffset + CUSTOM_EPOCH;
-                        // Sync the internal ESP32 RTC to fix time drift
-                        struct timeval tv;
-                        tv.tv_sec = config.epochTime;
-                        tv.tv_usec = 0;
-                        settimeofday(&tv, NULL);
+                        if (rxConfig.timeOffset > 0) {
+                            uint32_t newTime = rxConfig.timeOffset + CUSTOM_EPOCH;
+                            time_t now;
+                            time(&now);
+                            
+                            // Only sync if the local RTC has drifted by more than 2 seconds
+                            if (abs((int32_t)now - (int32_t)newTime) > 2) {
+                                if (serialEnabled) {
+                                    Serial.print( "Time drift detected, syncing from received config");
+                                }    
+                                config.epochTime = newTime;
+                                // Sync the internal ESP32 RTC to fix time drift
+                                struct timeval tv;
+                                tv.tv_sec = config.epochTime;
+                                tv.tv_usec = 0;
+                                settimeofday(&tv, NULL);
+                            }
+                        }
 
                         if (serialEnabled) {
                             Serial.printf("received config: sleep=%u, version=%u, devMode=%d\n",
