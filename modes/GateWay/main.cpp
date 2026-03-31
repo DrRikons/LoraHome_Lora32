@@ -24,10 +24,10 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <ezTime.h>
 #include <sys/time.h>
 #include <time.h>
 #include <math.h>
+#include <stdlib.h>
 #include <payloads.h>
 
 // WiFi and NTP Configuration
@@ -51,14 +51,13 @@ void setFlag(void);
 void setup();
 void loop();
 void drawMain();
-time_t getLocalTimeFromUtc(time_t utcTime);
+void configureSystemTime();
+bool refreshRtcTrustFromSystemClock();
+void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format);
 bool isClockValid(time_t currentTime);
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
 void reconnectMqtt();
 void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem);
-
-// ezTime object
-Timezone myTZ;
 
 WiFiClientSecure espClient; // Use secure client for TLS
 PubSubClient mqttClient(espClient);
@@ -255,8 +254,23 @@ void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_free(&aes);
 }
 
-time_t getLocalTimeFromUtc(time_t utcTime) {
-    return myTZ.tzTime(utcTime, UTC_TIME);
+void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format) {
+    struct tm localTimeInfo;
+    localtime_r(&utcTime, &localTimeInfo);
+    strftime(buffer, bufferSize, format, &localTimeInfo);
+}
+
+void configureSystemTime() {
+    configTzTime(TZ_INFO, "pool.ntp.org", "time.nist.gov", "time.google.com");
+}
+
+bool refreshRtcTrustFromSystemClock() {
+    time_t currentTime;
+    time(&currentTime);
+    if (isClockValid(currentTime)) {
+        hasValidRtcTime = true;
+    }
+    return hasValidRtcTime;
 }
 
 // this function is called when a complete packet
@@ -285,15 +299,14 @@ void setup()
     // Setup MQTT
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
 
-    // Set timezone using POSIX string to avoid HTTP lookup race conditions at boot
-    myTZ.setPosix(TZ_INFO);
+    // Start ESP32 SNTP with a POSIX timezone string so localtime() includes DST.
+    configureSystemTime();
     
     // Attempt to recover time from ESP32's hardware RTC (survives software resets)
     time_t sysTime;
     time(&sysTime);
     if (isClockValid(sysTime)) {
         hasValidRtcTime = true;
-        setTime(sysTime);
         Serial.println(F("Recovered time from internal ESP32 RTC after soft reset."));
     }
 
@@ -520,8 +533,6 @@ void setup()
 
 void loop()
 {
-    events(); // Required by ezTime to process background NTP syncs
-
     if (WiFi.isConnected()) {
         if (!mqttClient.connected()) {
             reconnectMqtt();
@@ -601,27 +612,17 @@ void loop()
                 txConfig.configVersion = rxPayload.configVer; // Mirror version, change to force update
                 txConfig.isDevMode = 0;      // 0 = OP Mode
                 
-                // Sync internal RTC from NTP if ezTime has a valid time and drift is detected
-                if (timeStatus() != timeNotSet) {
-                    time_t now_utc = UTC.now();
-                    time_t sysTime;
-                    time(&sysTime);
-                    if (!isClockValid(sysTime) || hasClockDrift(sysTime, now_utc, 2.0)) {
-                        struct timeval tv;
-                        tv.tv_sec = now_utc;
-                        tv.tv_usec = 0;
-                        settimeofday(&tv, NULL);
-                        hasValidRtcTime = true;
-                        Serial.println(F("Internal RTC drifted, synced with NTP time."));
-                    }
+                // ESP32 SNTP updates the system clock in the background.
+                // Once the standard clock becomes valid, treat it as trusted RTC time.
+                if (!hasValidRtcTime && refreshRtcTrustFromSystemClock()) {
+                    Serial.println(F("Gateway RTC is now trusted after SNTP synchronization."));
                 }
 
-                // ALWAYS use the internal RTC as the source of truth for the sensor
+                // Keep sensor clocks in UTC. Local timezone and DST are gateway-only concerns.
                 time_t currentSysTime;
                 time(&currentSysTime);
                 if (hasValidRtcTime && isClockValid(currentSysTime)) {
-                    time_t localSysTime = getLocalTimeFromUtc(currentSysTime);
-                    txConfig.timeOffset = (uint32_t)(localSysTime - CUSTOM_EPOCH);
+                    txConfig.timeOffset = (uint32_t)(currentSysTime - CUSTOM_EPOCH);
                 } else {
                     txConfig.timeOffset = 0; // 0 = Gateway RTC was not valid at boot
                 }
@@ -779,11 +780,8 @@ void drawMain()
             time_t sysTime;
             time(&sysTime);
             if (isClockValid(sysTime)) {
-                time_t localSysTime = getLocalTimeFromUtc(sysTime);
-                struct tm timeinfo;
-                gmtime_r(&localSysTime, &timeinfo);
                 char timeStr[20];
-                strftime(timeStr, sizeof(timeStr), "%y-%m-%d %H:%M", &timeinfo);
+                formatLocalTime(sysTime, timeStr, sizeof(timeStr), "%y-%m-%d %H:%M");
                 disp->print(timeStr);
             } else {
                 disp->print("Time: Syncing...");

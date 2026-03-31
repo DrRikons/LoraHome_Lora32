@@ -13,7 +13,7 @@ The configuration payload is a 22-byte binary structure (`ConfigPayload`):
 -   `sleepInterval`: 4 bytes. Time in seconds that the device will deep sleep.
 -   `configVersion`: 1 byte. Version number for the configuration.
 -   `isDevMode`: 1 byte. `1` to enable developer mode continuously without deep sleeping, `0` to disable.
--   `timeOffset`: 4 bytes. Seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC. The gateway automatically applies timezone and DST shifts to this value so sensors operate in local time. A value of `0` ignores synchronization.
+-   `timeOffset`: 4 bytes. UTC seconds elapsed since Jan 1, 2024 (1704067200) to synchronize the device's internal RTC. A value of `0` ignores synchronization.
 
 *Note: Changing the mode remotely will trigger a soft reset of the ESP32 to cleanly initialize/de-initialize power-heavy peripherals. Configuration values survive this reset by utilizing the ESP32's RTC_NOINIT_ATTR memory section. If the physical `DEV_MODE_PIN` (GPIO13) is pulled LOW, it acts as a hard hardware override and the device will ignore any remote commands to enter Operation Mode.*
 
@@ -21,7 +21,7 @@ The configuration payload is a 22-byte binary structure (`ConfigPayload`):
 
 The project is divided into two main modes:
 
--   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR using the message counter as the IV), parses, and displays data from the sensor nodes. It connects to WiFi (hostname: `LoRa-Gateway`) and uses the `ezTime` library to fetch NTP time. The primary source of truth for the gateway's time is the internal hardware RTC, allowing it to drive sensors and displays seamlessly even after a router failure. The gateway checks for drift against NTP and corrects the internal RTC before generating synchronization payloads. It calculates local time with DST shifts and transmits timezone-aware configuration payloads back to the sensors. The local OLED display cycles between live sensor telemetry and gateway status. Received sensor data is published securely over TLS as a JSON payload to an MQTT topic (`lora_gateway/<sensor_mac>/telemetry`).
+-   `GateWay`: The gateway node that receives, decrypts (via AES-128-CTR using the message counter as the IV), parses, and displays data from the sensor nodes. It connects to WiFi (hostname: `LoRa-Gateway`) and uses the ESP32 built-in SNTP/timezone support to keep its RTC synchronized in UTC. The primary source of truth for the gateway's time is the internal hardware RTC, allowing it to drive sensors and displays seamlessly even after a router failure. Sensors remain timezone-agnostic and are synchronized in UTC only. The gateway converts UTC to local time with DST shifts only for display, logging, and downstream processing. The local OLED display cycles between live sensor telemetry and gateway status. Received sensor data is published securely over TLS as a JSON payload to an MQTT topic (`lora_gateway/<sensor_mac>/telemetry`).
 -   `Sensor`: The sensor node that reads the boiler temperature and sends it to the gateway.
 
 The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/main.cpp` (a legacy `GateWay.ino` is also retained for Arduino IDE compatibility).
