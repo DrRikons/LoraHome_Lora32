@@ -12,9 +12,9 @@ void test_gateway_parses_core_payload_fields() {
     payload.temperature = 2390;
     payload.battVoltage = 4140;
     payload.battPercent = 99;
-    payload.configVer = 1;
-    payload.opMode = 1;
+    payload.isDevMode = 1;
     payload.needsTimeSync = 1;
+    payload.sleepInterval = 300;
 
     GatewayTelemetryState parsed = parseTelemetryPayload(payload, TELEMETRY_CORE_SIZE);
 
@@ -24,6 +24,7 @@ void test_gateway_parses_core_payload_fields() {
     TEST_ASSERT_FLOAT_WITHIN(0.01f, 4.14f, parsed.batteryVoltageV);
     TEST_ASSERT_EQUAL_UINT8(99, parsed.batteryPercent);
     TEST_ASSERT_TRUE(parsed.needsTimeSync);
+    TEST_ASSERT_EQUAL_UINT32(300, parsed.sleepIntervalSeconds);
     TEST_ASSERT_FALSE(parsed.hasDevTelemetry);
 }
 
@@ -50,17 +51,18 @@ void test_gateway_parses_dev_payload_fields() {
     TEST_ASSERT_EQUAL_INT16(-103, parsed.lastRSSIdBm);
 }
 
-void test_gateway_config_decision_uses_version_or_sync_flag() {
-    TEST_ASSERT_TRUE(gatewayShouldSendConfig(1, 2, false, 123));
-    TEST_ASSERT_TRUE(gatewayShouldSendConfig(1, 1, true, 123));
-    TEST_ASSERT_FALSE(gatewayShouldSendConfig(1, 1, true, 0));
-    TEST_ASSERT_FALSE(gatewayShouldSendConfig(1, 1, false, 123));
+void test_gateway_config_decision_uses_state_or_sync_flag() {
+    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 120, false, false, 123));
+    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 60, true, false, 123));
+    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 60, false, true, 123));
+    TEST_ASSERT_FALSE(gatewayShouldSendConfig(60, false, 60, false, true, 0));
+    TEST_ASSERT_FALSE(gatewayShouldSendConfig(60, false, 60, false, false, 123));
 }
 
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_gateway_parses_core_payload_fields);
     RUN_TEST(test_gateway_parses_dev_payload_fields);
-    RUN_TEST(test_gateway_config_decision_uses_version_or_sync_flag);
+    RUN_TEST(test_gateway_config_decision_uses_state_or_sync_flag);
     return UNITY_END();
 }

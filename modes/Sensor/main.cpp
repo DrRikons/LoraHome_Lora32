@@ -66,9 +66,13 @@ void flushSerialOutput() {
 void readSensors();
 void transmitData();
 void enterDeepSleep();
-void listenForConfig();
+void wakeCycle();
+void checkForUpdates();
+bool waitForUpdateBeacon();
+bool listenForConfig();
 void drawMain();
 void flushSerialOutput();
+
 
 // Sensor objects
 OneWire oneWire(DS18B20_PIN);
@@ -87,7 +91,6 @@ struct SensorData {
   float lastSNR;
   float lastRSSI;
   uint32_t timestamp;
-  uint8_t configVersion;
 } sensorData;
 
 // Configuration structure
@@ -96,7 +99,7 @@ struct Config {
   uint32_t sleepInterval; // seconds
   uint8_t configVersion;
   uint8_t isDevMode; // Remote dev mode flag (0=false, 1=true)
-} config = {RTC_MAGIC_WORD, 20, 1, 0}; // Default 20 seconds
+} config = {RTC_MAGIC_WORD, 20, 0, 0}; // Default 20 seconds
 
 // RTC memory for config persistence
 RTC_NOINIT_ATTR Config rtcConfig; // NOINIT ensures it survives SW_CPU_RESET (ESP.restart)
@@ -233,13 +236,14 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 
 // save transmission state between loops
 static int transmissionState = RADIOLIB_ERR_NONE;
-// flag to indicate that a packet was sent or received
-static volatile bool operationDone = false;
+// FreeRTOS semaphore to replace the busy-wait flag
+static SemaphoreHandle_t radioSemaphore = NULL;
 RTC_DATA_ATTR static uint16_t counter = 0;
 RTC_DATA_ATTR static uint8_t wakeCycleCount = 0;
 static String payload;
 static uint32_t lastTxTime = 0;
 static uint32_t lastRxTime = 0;
+static uint32_t lastBeaconRxTime = 0;
 
 // Transmission details
 static String deviceId;
@@ -248,16 +252,27 @@ static int msgOffset = 0;
 
 // Callback function for LoRa hardware interrupts.
 // IMPORTANT: This function MUST be 'void' type and MUST NOT have any arguments!
+#if defined(ESP8266) || defined(ESP32)
+ICACHE_RAM_ATTR
+#endif
 void setFlag(void)
 {
-    // we sent or received a packet, set the flag
-    operationDone = true;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (radioSemaphore != NULL) {
+        xSemaphoreGiveFromISR(radioSemaphore, &xHigherPriorityTaskWoken);
+    }
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
 }
 
 // Standard Arduino setup function. Initializes hardware, sensors, and radio.
 // Used in: Both Operation and Dev modes
 void setup()
 {
+    // Initialize the FreeRTOS semaphore
+    radioSemaphore = xSemaphoreCreateBinary();
+
     // Early evaluate devMode to enable serial immediately if needed
     pinMode(DEV_MODE_PIN, INPUT_PULLUP);
     if (digitalRead(DEV_MODE_PIN) == LOW || rtcConfig.isDevMode != 0) {
@@ -272,22 +287,22 @@ void setup()
     config = rtcConfig;
 
     if (serialEnabled) {
-        Serial.printf("Boot rtcConfig : %u sleep=%u, version=%u, devMode=%d\n",
-                      rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.configVersion, rtcConfig.isDevMode);
+        Serial.printf("Boot rtcConfig : %u sleep=%u, devMode=%d\n",
+                      rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode);
     }
     
     // Validate RTC memory using the magic word and basic bounds checking
     if (config.magicWord != RTC_MAGIC_WORD || config.sleepInterval < 10 || config.sleepInterval > 86400) {
         config.magicWord = RTC_MAGIC_WORD;
         config.sleepInterval = 60;
-        config.configVersion = 1;
+        config.configVersion = 0;
         config.isDevMode = 0;
         rtcConfig = config; // Initialize RTC memory with defaults on cold boot
     }
 
     if (serialEnabled) {
-        Serial.printf("validated rtcConfig : %u sleep=%u, version=%u, devMode=%d\n",
-                      rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.configVersion, rtcConfig.isDevMode); 
+        Serial.printf("validated rtcConfig : %u sleep=%u, devMode=%d\n",
+                      rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode); 
     }
 
     // Check dev mode (hardware pin OR remote config)
@@ -370,22 +385,16 @@ void setup()
     }
     #endif
 
-    // Read sensors and transmit
-    readSensors();
-    if (devMode) {
-        drawMain();
-    }
-    transmitData();
-    
-    // Listen for config on startup and every 10 sleep cycles to save battery
-    if (devMode || wakeCycleCount % 10 == 0) {
-        
-        listenForConfig();
-    }
-    wakeCycleCount++;
+    // In Operation Mode, we perform one cycle and then go to sleep immediately.
+    // In Developer Mode, we perform the first cycle here, then continue with more cycles in loop().
+    wakeCycle();
 
-    // deep sleep, prevents from entering loop
-    enterDeepSleep();
+    if (devMode) {
+        drawMain(); // Show initial data on display
+    } else {
+        // In Operation Mode, loop() is never reached.
+        enterDeepSleep();
+    }
 }
 
 // Standard Arduino loop function.
@@ -393,35 +402,46 @@ void setup()
 void loop()
 {
     if (devMode) {
-        Serial.println("\n[DEV] --- Wake, Read Sensors ---");
-        readSensors();
-        
-        Serial.println("[DEV] --- Transmit ---");
-        transmitData();
-        
-        Serial.println("[DEV] --- Receive ---");
-        // Accurately simulate OP mode: listen only on the 10th cycle
-        if (wakeCycleCount % 10 == 0) {
-            listenForConfig();
+        // "Sleep" part of the simulated cycle
+        Serial.println("[DEV] --- Sleep ---");
+        Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
+
+        if (disp) {
+            disp->clearBuffer();
+            disp->sendBuffer();
         }
+        delay(config.sleepInterval * 1000); // Sleep for the interval (matches esp_deep_sleep timer)
+
+        // "Wake" part of the simulated cycle
+        wakeCycle();
         
-        // Increment for the next cycle
-        wakeCycleCount++;
-        
+        // "Display" part of the simulated cycle
         Serial.println("[DEV] --- Display ---");
         // Rotate through all 4 screens
         for (int i = 0; i < 4; i++) {
             drawMain();
             delay(2000); // Show each screen for 2s
         }
-        
-        Serial.println("[DEV] --- Sleep ---");
-        if (disp) {
-            disp->clearBuffer();
-            disp->sendBuffer();
-        }
-        delay(config.sleepInterval * 1000); // Sleep for the interval (matches esp_deep_sleep timer)
+    } else {
+        // This part is unreachable in Operation Mode because the device deep sleeps in setup().
     }
+}
+
+// Encrypts or decrypts a payload in place using AES-128-CTR
+void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
+    
+    uint8_t iv[16] = {0};
+    // Seed the IV with the message counter to ensure a unique key stream per packet
+    iv[14] = (msgCount >> 8) & 0xFF;
+    iv[15] = msgCount & 0xFF;
+    
+    uint8_t stream_block[16] = {0};
+    size_t nc_off = 0;
+    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, iv, stream_block, data, data);
+    mbedtls_aes_free(&aes);
 }
 
 // Converts a given voltage to an estimated percentage (0-100%) for a typical 18650 Li-Ion battery #6
@@ -441,6 +461,21 @@ uint8_t getBatteryPercentage(float voltage) {
     }
     return 100;
 }
+
+// Contains the logic for a single operational cycle: read, transmit, and check for updates.
+// Used in: Both Operation and Dev modes
+void wakeCycle() {
+
+    if (serialEnabled) Serial.println("\n--- Wake, Read Sensors ---");
+    readSensors();
+    
+    if (serialEnabled) Serial.println("--- Transmit ---");
+    transmitData();
+    delay(1000);
+
+    if (serialEnabled) Serial.println("--- Receive ---");
+    checkForUpdates();
+}   
 
 // Reads data from connected sensors (DS18B20, INA226) and internal ESP32 metrics (CPU temp, RAM).
 // Used in: Both Operation and Dev modes
@@ -464,8 +499,6 @@ void readSensors()
     time_t now;
     time(&now);
     sensorData.timestamp = (uint32_t)now;
-    sensorData.configVersion = config.configVersion;
-
     if (serialEnabled) {
         char timeStr[20];
         time_t ts = sensorData.timestamp;
@@ -476,29 +509,12 @@ void readSensors()
             timeStr[sizeof(timeStr) - 1] = '\0';
         }
 
-        Serial.printf("T:%.1fC V:%.2fV(%d%%) I:%.1fmA P:%.1fmW | CPU:%.1fC RAM:%uKB | SNR:%.1f RSSI:%.0f | TS:%s Cfg:%u\n",
+        Serial.printf("T:%.1fC V:%.2fV(%d%%) I:%.1fmA P:%.1fmW | CPU:%.1fC RAM:%uKB | SNR:%.1f RSSI:%.0f | TS:%s\n",
                       sensorData.temperature, sensorData.batteryVoltage, sensorData.batteryPercent,
                       sensorData.batteryCurrent, sensorData.batteryPower, sensorData.cpuTemp,
                       sensorData.freeRam, sensorData.lastSNR, sensorData.lastRSSI,
-                      timeStr, sensorData.configVersion);
+                      timeStr);
     }
-}
-
-// Encrypts or decrypts a payload in place using AES-128-CTR
-void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
-    mbedtls_aes_context aes;
-    mbedtls_aes_init(&aes);
-    mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
-    
-    uint8_t iv[16] = {0};
-    // Seed the IV with the message counter to ensure a unique key stream per packet
-    iv[14] = (msgCount >> 8) & 0xFF;
-    iv[15] = msgCount & 0xFF;
-    
-    uint8_t stream_block[16] = {0};
-    size_t nc_off = 0;
-    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, iv, stream_block, data, data);
-    mbedtls_aes_free(&aes);
 }
 
 // Constructs the telemetry payload string and transmits it via the LoRa radio.
@@ -512,9 +528,9 @@ void transmitData()
     txPayload.temperature = (int16_t)(sensorData.temperature * 100); 
     txPayload.battVoltage = (uint16_t)(sensorData.batteryVoltage * 1000);
     txPayload.battPercent = sensorData.batteryPercent;
-    txPayload.configVer = sensorData.configVersion;
-    txPayload.opMode = (uint8_t)devMode;
+    txPayload.isDevMode = (uint8_t)devMode;
     txPayload.needsTimeSync = isClockValid((time_t)sensorData.timestamp) ? 0 : 1;
+    txPayload.sleepInterval = config.sleepInterval;
 
     size_t txSize = 16; // Core payload size
 
@@ -548,7 +564,8 @@ void transmitData()
     // Turn LED on during transmission
     digitalWrite(BOARD_LED, LED_ON);
 
-    operationDone = false; // clear flag before TX
+    // Clear any pending semaphore state
+    xSemaphoreTake(radioSemaphore, 0);
 
     // Transmit the raw binary struct directly
     transmissionState = radio.startTransmit((uint8_t*)&txPayload, txSize);
@@ -557,16 +574,15 @@ void transmitData()
         Serial.printf("Transmitting binary payload (%d bytes): %s\n", txSize, payload.c_str());
     }
 
-    // Wait for transmission to complete (with 5 second timeout to prevent hangs)
+    // Wait for transmission to complete (with 5 second timeout) using FreeRTOS Block state
     uint32_t startWait = millis();
-    while (!operationDone && (millis() - startWait < 5000)) {
-        delay(1); // Reduce delay to switch to RX mode as fast as possible
+    if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        if (serialEnabled) Serial.println("Warning: TX timeout!");
     }
     lastTxTime = millis() - startWait;
-    if (!operationDone && serialEnabled) {
-        Serial.println("Warning: TX timeout!");
-    }
-    operationDone = false;
+
+    // Actively put the radio to standby after TX finishes
+    radio.standby();
 
     // Turn LED off after transmission
     digitalWrite(BOARD_LED, !LED_ON);
@@ -577,81 +593,141 @@ void transmitData()
     
 }
 
-// Handles sleep timing, conditionally triggering the configuration listener, and deep sleeping the ESP32.
-// Used in: Both Operation and Dev modes (skips actual esp_deep_sleep_start in Dev mode)
-void enterDeepSleep()
-{
+// Checks for pending gateway updates based on wake cycle count or invalid clock.
+// Used in: Both Operation and Dev modes
+void checkForUpdates() {
+    wakeCycleCount++;
     if (serialEnabled) {
-        Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
-        flushSerialOutput();
-    }
-    if (devMode) {
-        return; // Exit deep sleep function
+        Serial.printf("Wakecycle: %d\n", wakeCycleCount);
     }
 
-    // Configure wake up timer
-    esp_sleep_enable_timer_wakeup(config.sleepInterval * 1000000ULL); // microseconds
+    bool needsUpdateCheck = (wakeCycleCount >= 10) || !isClockValid(sensorData.timestamp);
+    if (needsUpdateCheck) {
+        if (serialEnabled) {
+            Serial.printf("Checking for updates. Reason: %s\n", (wakeCycleCount >= 10) ? "10 cycles passed" : "Time not synced");
+        }
+        if (waitForUpdateBeacon()) {
+            if (listenForConfig()) {
+                wakeCycleCount = 0; // Reset counter only on successful config reception
+            } else {
+                if (serialEnabled) {
+                    Serial.println("Failed to Receive Config after beacon.");
+                }
+            }
+        }
+    }
+}
 
-    // Enter deep sleep
-    esp_deep_sleep_start();
+// Briefly checks if the gateway has a pending configuration update for this wake cycle.
+// Used in: Both Operation and Dev modes
+bool waitForUpdateBeacon()
+{
+    xSemaphoreTake(radioSemaphore, 0); // Clear semaphore
+    radio.startReceive();// Start non-blocking background reception
+    unsigned long startTime = millis();
+    // Calculate the time-on-air for a 1-byte beacon packet and add a 50ms margin.
+    uint32_t beaconAirtimeMs = (radio.getTimeOnAir(1) / 1000) + 50;
+    while (millis() - startTime < beaconAirtimeMs) {
+        uint32_t elapsed = millis() - startTime;
+        uint32_t remaining = beaconAirtimeMs > elapsed ? beaconAirtimeMs - elapsed : 0;
+        if (remaining == 0) break;
+
+        if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(remaining)) == pdTRUE) {
+            int numBytes = radio.getPacketLength();
+            uint8_t rxBuffer[256];
+            int state = radio.readData(rxBuffer, numBytes);
+
+            if (state == RADIOLIB_ERR_NONE) {
+                if (numBytes == 1 && rxBuffer[0] == CONFIG_UPDATE_PENDING_FLAG) {
+                    lastBeaconRxTime = millis() - startTime;
+                    if (serialEnabled) {
+                        Serial.printf("Update beacon received after %lu ms (window: %lu ms)\n", lastBeaconRxTime, beaconAirtimeMs);
+                    }
+                    return true;
+                } else if (serialEnabled) {
+                    Serial.printf("Received %d bytes (expected 1). Retrying...\n", numBytes);
+                }
+            } else if (serialEnabled) {
+                Serial.printf("RX Error: %d. Retrying...\n", state);
+            }
+            radio.startReceive(); 
+        }
+        if (serialEnabled) {
+                    Serial.printf("timeout while trying to find beacon.");
+                }
+    }
+    radio.standby();
+    lastBeaconRxTime = millis() - startTime;
+    if (serialEnabled) {
+        Serial.printf("No update beacon found. Short RX window: %lu ms (was %lu ms)\n", lastBeaconRxTime, beaconAirtimeMs);
+    }
+    return false;
 }
 
 // Listens for incoming LoRa configuration packets from the Gateway for 5 seconds.
+// Returns true if config was successfully received and applied, false otherwise.
 // Used in: Both Operation and Dev modes
-void listenForConfig()
+bool listenForConfig()
 {
-    operationDone = false;
+    xSemaphoreTake(radioSemaphore, 0); // Clear semaphore
     radio.startReceive(); // Start non-blocking background reception
     unsigned long startTime = millis();
+    bool configReceived = false;
+    bool needsRestart = false;
+
     while (millis() - startTime < 5000) { // Listen for 5 seconds
-        if (operationDone) {
-            operationDone = false;
-            
+        uint32_t elapsed = millis() - startTime;
+        uint32_t remaining = 5000 > elapsed ? 5000 - elapsed : 0;
+        if (remaining == 0) break;
+
+        if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(remaining)) == pdTRUE) {
             // Verify packet length matches our expected Config struct size
             if (radio.getPacketLength() == sizeof(ConfigPayload)) {
                 ConfigPayload rxConfig;
                 int state = radio.readData((uint8_t*)&rxConfig, sizeof(ConfigPayload));
-                
+
                 if (state == RADIOLIB_ERR_NONE) {
                     sensorData.lastSNR = radio.getSNR();
                     sensorData.lastRSSI = radio.getRSSI();
-                    
-                    
+
                     if (serialEnabled) {
                         uint32_t packetToA = radio.getTimeOnAir(sizeof(ConfigPayload)) / 1000; // Returns microseconds, convert to ms
                         Serial.printf("Received config packet. Packet ToA: %lu ms\n", packetToA);
                     }
-                    
+
                     // Verify header to ensure it's actually our config packet
                     if (rxConfig.header[0] == 'C' && rxConfig.header[1] == 'F') {
-                        
+
                         // Verify this config packet is meant for this specific device
                         uint8_t myMac[6];
                         esp_efuse_mac_get_default(myMac);
                         uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-                        
+
                         if (memcmp(rxConfig.targetMac, myMac, 6) != 0 && memcmp(rxConfig.targetMac, broadcastMac, 6) != 0) {
-                            continue; // Not meant for us, ignore it
+                            if (serialEnabled) Serial.println("Config not for this node. Terminating RX.");
+                            break; // Not meant for this node, terminate early
                         }
 
                         // Verify network key to prevent spoofing attacks
                         if (rxConfig.networkKey != NETWORK_KEY) {
-                            continue; // Invalid key, ignore packet
+                            if (serialEnabled) Serial.println("Invalid network key. Terminating RX.");
+                            break; // Invalid key, terminate early
                         }
 
                         config.magicWord = RTC_MAGIC_WORD;
                         config.sleepInterval = rxConfig.sleepInterval;
-                        config.configVersion = rxConfig.configVersion;
+                        // Config token handling is currently disabled.
+                        // config.configVersion = rxConfig.configVersion;
                         config.isDevMode = (rxConfig.isDevMode > 0);
-                        
+
                         if (rxConfig.timeOffset > 0) {
                             uint32_t newTime = rxConfig.timeOffset + CUSTOM_EPOCH;
                             time_t now;
                             time(&now);
-                            
+
                             // Sync if the local RTC is unset or has drifted by more than 2 seconds.
                             if (!isClockValid(now) || hasClockDrift(now, (time_t)newTime, 2.0)) {
-                                if (serialEnabled) {    
+                                if (serialEnabled) {
                                     Serial.printf("Time drift detected! Old: %lu, New: %lu. Syncing...\n", (unsigned long)now, (unsigned long)newTime);
                                 }
                                 // Sync the internal ESP32 RTC to fix time drift
@@ -663,45 +739,71 @@ void listenForConfig()
                         }
 
                         if (serialEnabled) {
-                            Serial.printf("received config: sleep=%u, version=%u, devMode=%d\n",
-                                              config.sleepInterval, config.configVersion, config.isDevMode);  
+                            Serial.printf("received config: sleep=%u, devMode=%d\n",
+                                              config.sleepInterval, config.isDevMode);
                         }
 
                         rtcConfig = config; // Save to RTC
-                        
+
                         bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || (config.isDevMode != 0);
                         if (devMode != cfgMode) {
-                            if (serialEnabled) {
-                                Serial.printf("Mode switched to %s via remote config! Restarting device.. \n", cfgMode ? "Dev" : "OP");
-                            }
-                            flushSerialOutput();
-                            ESP.restart(); // Soft reset
+                            needsRestart = true;
                         } else  {
                             if (serialEnabled) {
-                                Serial.printf("Config updated: sleep=%u, version=%u, devMode=%d\n",
-                                              config.sleepInterval, config.configVersion, config.isDevMode);
+                                Serial.printf("Config updated: sleep=%u, devMode=%d\n",
+                                              config.sleepInterval, config.isDevMode);
                             }
                         }
+                        configReceived = true;
                         break; // Successfully received and applied config, exit 5s RX window early
+                    } else {
+                        if (serialEnabled) Serial.println("Invalid config header. Terminating RX.");
+                        break;
                     }
+                } else {
+                    if (serialEnabled) Serial.printf("Failed to read config packet (state %d). Terminating RX.\n", state);
+                    break;
                 }
             } else {
-                // Not a config packet or wrong size, flush the RX buffer
-                String dummy;
-                radio.readData(dummy);
+                if (serialEnabled) Serial.printf("stateReceived unexpected packet length (%d). Terminating RX.\n", sizeof(ConfigPayload));
+                break;
             }
-
-            // Resume listening in the background for the remainder of the 5 seconds
-            radio.startReceive(); 
         }
-        delay(1);
     }
     radio.standby();
-    
+
     lastRxTime = millis() - startTime; // Record the total time the radio was consuming power in RX mode
     if (serialEnabled) {
-        Serial.printf("RX Window closed. Total RX power-on time: %lu ms\n", lastRxTime);
+        Serial.printf("RX Window closed. Total RX power-on time: %lu ms. Config %s\n",
+                     lastRxTime, configReceived ? "received" : "NOT received");
     }
+
+    if (needsRestart) {
+        if (serialEnabled) {
+            Serial.println("Mode switched via remote config! Restarting device..");
+        }
+        flushSerialOutput();
+        wakeCycleCount = 0; // Reset before restart!
+        ESP.restart(); // Soft reset
+    }
+
+    return configReceived;
+}
+
+// Handles sleep timing, conditionally triggering the configuration listener, and deep sleeping the ESP32.
+// Used in: Both Operation and Dev modes (skips actual esp_deep_sleep_start in Dev mode)
+void enterDeepSleep()
+{
+    if (serialEnabled) {
+        Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
+        flushSerialOutput();
+    }
+
+    // Configure wake up timer
+    esp_sleep_enable_timer_wakeup(config.sleepInterval * 1000000ULL); // microseconds
+
+    // Enter deep sleep
+    esp_deep_sleep_start();
 }
 
 // Renders telemetry and device data to the OLED display. Cycles through 4 different informational screens.
@@ -762,7 +864,7 @@ void drawMain()
                 disp->setCursor(5, 15);
                 disp->printf("ID: %.10s", deviceId.c_str());
                 disp->setCursor(5, 30);
-                disp->printf("Cnt:%u Cfg:%d", counter, config.configVersion);
+                disp->printf("Cnt:%u", counter);
                 disp->setCursor(5, 45);
                 disp->printf("Sleep: %d s", config.sleepInterval);
                 

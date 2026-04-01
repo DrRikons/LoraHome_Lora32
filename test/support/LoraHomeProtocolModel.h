@@ -10,9 +10,10 @@
 namespace lora_home_test {
 
 constexpr std::uint32_t CUSTOM_EPOCH = 1704067200UL;
+constexpr std::uint8_t CONFIG_UPDATE_PENDING_FLAG = 0xA5;
 constexpr std::size_t TELEMETRY_CORE_SIZE = 16;
 constexpr std::size_t TELEMETRY_FULL_SIZE = 27;
-constexpr std::size_t CONFIG_PAYLOAD_SIZE = 22;
+constexpr std::size_t CONFIG_PAYLOAD_SIZE = 19;
 
 #pragma pack(push, 1)
 struct TelemetryPayload {
@@ -21,9 +22,9 @@ struct TelemetryPayload {
     std::int16_t temperature;
     std::uint16_t battVoltage;
     std::uint8_t battPercent;
-    std::uint8_t configVer;
-    std::uint8_t opMode;
+    std::uint8_t isDevMode;
     std::uint8_t needsTimeSync;
+    std::uint8_t sleepInterval;
     std::int16_t battCurrent;
     std::int16_t battPower;
     std::uint16_t freeRam;
@@ -37,7 +38,7 @@ struct ConfigPayload {
     char header[2];
     std::uint8_t targetMac[6];
     std::uint32_t networkKey;
-    std::uint32_t sleepInterval;
+    std::uint8_t sleepInterval;
     std::uint8_t configVersion;
     std::uint8_t isDevMode;
     std::uint32_t timeOffset;
@@ -61,9 +62,9 @@ struct SensorTelemetryInput {
     float temperatureC;
     float batteryVoltageV;
     std::uint8_t batteryPercent;
-    std::uint8_t configVersion;
     bool devMode;
     std::time_t timestamp;
+    std::uint32_t sleepIntervalSeconds;
     float batteryCurrentmA;
     float batteryPowermW;
     std::uint16_t freeRamKB;
@@ -79,9 +80,9 @@ struct GatewayTelemetryState {
     float temperatureC;
     float batteryVoltageV;
     std::uint8_t batteryPercent;
-    std::uint8_t configVersion;
-    std::uint8_t opMode;
+    std::uint8_t isDevMode;
     bool needsTimeSync;
+    std::uint32_t sleepIntervalSeconds;
     bool hasDevTelemetry;
     std::int16_t batteryCurrentmA;
     std::int16_t batteryPowermW;
@@ -99,9 +100,9 @@ inline void buildTelemetryPayload(const SensorTelemetryInput& input, TelemetryPa
     output.temperature = static_cast<std::int16_t>(input.temperatureC * 100.0f);
     output.battVoltage = static_cast<std::uint16_t>(input.batteryVoltageV * 1000.0f);
     output.battPercent = input.batteryPercent;
-    output.configVer = input.configVersion;
-    output.opMode = input.devMode ? 1 : 0;
+    output.isDevMode = input.devMode ? 1 : 0;
     output.needsTimeSync = isClockValid(input.timestamp) ? 0 : 1;
+    output.sleepInterval = input.sleepIntervalSeconds;
 
     txSize = TELEMETRY_CORE_SIZE;
     if (input.devMode) {
@@ -129,9 +130,9 @@ inline GatewayTelemetryState parseTelemetryPayload(const TelemetryPayload& paylo
     state.temperatureC = payload.temperature / 100.0f;
     state.batteryVoltageV = payload.battVoltage / 1000.0f;
     state.batteryPercent = payload.battPercent;
-    state.configVersion = payload.configVer;
-    state.opMode = payload.opMode;
+    state.isDevMode = payload.isDevMode;
     state.needsTimeSync = payload.needsTimeSync != 0;
+    state.sleepIntervalSeconds = payload.sleepInterval;
     state.hasDevTelemetry = packetSize == sizeof(TelemetryPayload);
     if (state.hasDevTelemetry) {
         state.batteryCurrentmA = payload.battCurrent;
@@ -153,12 +154,16 @@ inline std::uint32_t makeGatewayTimeOffset(bool hasTrustedRtc, std::time_t local
 }
 
 inline bool gatewayShouldSendConfig(
-    std::uint8_t sensorConfigVersion,
-    std::uint8_t targetConfigVersion,
+    std::uint32_t sensorSleepInterval,
+    bool sensorDevMode,
+    std::uint32_t targetSleepInterval,
+    bool targetDevMode,
     bool sensorNeedsTimeSync,
     std::uint32_t gatewayTimeOffset
 ) {
-    return (sensorConfigVersion != targetConfigVersion) || (gatewayTimeOffset > 0 && sensorNeedsTimeSync);
+    return (sensorSleepInterval != targetSleepInterval)
+        || (sensorDevMode != targetDevMode)
+        || (gatewayTimeOffset > 0 && sensorNeedsTimeSync);
 }
 
 }  // namespace lora_home_test

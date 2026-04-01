@@ -54,6 +54,7 @@ void drawMain();
 void configureSystemTime();
 bool refreshRtcTrustFromSystemClock();
 void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format);
+bool sendUpdateBeacon();
 bool isClockValid(time_t currentTime);
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
 void reconnectMqtt();
@@ -211,8 +212,8 @@ const uint8_t AES_NETWORK_KEY[16] = {
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
 
-// flag to indicate that a packet was received
-static volatile bool receivedFlag = false;
+// FreeRTOS semaphore to replace the busy-wait flag
+static SemaphoreHandle_t radioSemaphore = NULL;
 static String rssi = "0dBm";
 static String snr = "0dB";
 
@@ -222,9 +223,9 @@ static float lastVcc = 0.0;
 static uint8_t lastBatt = 0;
 static String lastMac = "Wait...";
 static uint16_t msgCount = 0;
-static uint8_t lastConfigVer = 0;
-static uint8_t lastOpMode = 0;
+static uint8_t lastSensorIsDevMode = 0;
 static bool lastSensorNeedsTimeSync = false;
+static uint32_t lastSensorSleepInterval = 0;
 static bool lastHasDevTelemetry = false;
 static int16_t lastBattCurrent = 0;
 static int16_t lastBattPower = 0;
@@ -273,19 +274,47 @@ bool refreshRtcTrustFromSystemClock() {
     return hasValidRtcTime;
 }
 
+bool sendUpdateBeacon() {
+    uint8_t beacon = CONFIG_UPDATE_PENDING_FLAG;
+    xSemaphoreTake(radioSemaphore, 0); // clear any pending semaphore
+    int txState = radio.startTransmit(&beacon, 1);
+    if (txState == RADIOLIB_ERR_NONE) {
+        if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            Serial.println(F("Update beacon transmitted."));
+            return true;
+        } else {
+            Serial.println(F("Update beacon TX timeout!"));
+            return false;
+        }
+    }
+    Serial.printf("Update beacon startTransmit failed, code %d\n", txState);
+    return false;
+}
+
 // this function is called when a complete packet
 // is received by the module
 // IMPORTANT: this function MUST be 'void' type
 //            and MUST NOT have any arguments!
+#if defined(ESP8266) || defined(ESP32)
+ICACHE_RAM_ATTR
+#endif
 void setFlag(void)
 {
-    // we got a packet, set the flag
-    receivedFlag = true;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (radioSemaphore != NULL) {
+        xSemaphoreGiveFromISR(radioSemaphore, &xHigherPriorityTaskWoken);
+    }
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
 }
 
 void setup()
 {
     setupBoards();
+
+    // Initialize the FreeRTOS semaphore
+    radioSemaphore = xSemaphoreCreateBinary();
 
     // Initialize WiFi and NTP in the background (non-blocking)
     WiFi.setHostname(WIFI_HOSTNAME);
@@ -540,12 +569,9 @@ void loop()
         mqttClient.loop();
     }
 
-    // check if the flag is set
-    if (receivedFlag) {
-
-        // reset flag
-        receivedFlag = false;
-
+    // check if the semaphore has been given by the ISR
+    if (xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
+        
         int numBytes = radio.getPacketLength();
         byte byteArr[256];
         int state = radio.readData(byteArr, numBytes);
@@ -564,15 +590,64 @@ void loop()
                 size_t encryptedLength = numBytes - 8;
                 uint8_t* dataPtr = ((uint8_t*)&rxPayload) + 8;
                 cryptPayload(dataPtr, encryptedLength, rxPayload.msgCount);
-                
+
+                // --- TIME-CRITICAL SECTION: Respond to Sensor ---
+                // This block must execute as fast as possible to meet the sensor's short RX window.
+                ConfigPayload txConfig;
+                txConfig.header[0] = 'C';
+                txConfig.header[1] = 'F';
+                memcpy(txConfig.targetMac, rxPayload.mac, 6);
+                txConfig.networkKey = NETWORK_KEY;
+                txConfig.sleepInterval = 20; // Example config
+                txConfig.isDevMode = 1;      // Example config
+
+                if (!hasValidRtcTime) {
+                    refreshRtcTrustFromSystemClock();
+                }
+
+                time_t currentSysTime;
+                time(&currentSysTime);
+                if (hasValidRtcTime && isClockValid(currentSysTime)) {
+                    txConfig.timeOffset = (uint32_t)(currentSysTime - CUSTOM_EPOCH);
+                } else {
+                    txConfig.timeOffset = 0;
+                }
+
+                bool configUpdatePending = (rxPayload.sleepInterval != txConfig.sleepInterval) || ((rxPayload.isDevMode != 0) != (txConfig.isDevMode != 0));
+                bool timeSyncPending = (txConfig.timeOffset > 0) && (rxPayload.needsTimeSync != 0);
+
+                bool updatePending = configUpdatePending || timeSyncPending;
+                if (updatePending) {
+                    delay(1000);
+                    if (sendUpdateBeacon()) {
+                        xSemaphoreTake(radioSemaphore, 0); // clear before tx
+                        int txState = radio.startTransmit((uint8_t*)&txConfig, sizeof(ConfigPayload));
+                        if (txState == RADIOLIB_ERR_NONE) {
+                            xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(5000)); // Block until TX finishes
+                            // Log will be printed later
+                        } else {
+                            // Log will be printed later
+                        }
+                    }
+                }
+                // --- END OF TIME-CRITICAL SECTION ---
+
+                // Clear any lingering semaphore from the TX operations
+                xSemaphoreTake(radioSemaphore, 0);
+
+
+                // Put radio back into receive mode immediately to not miss the next packet
+                radio.startReceive();
+
+                // --- NON-CRITICAL SECTION: Logging, Display, and MQTT ---
+                // Now that the LoRa transaction is complete, we can perform slower tasks.
                 lastTemp = rxPayload.temperature / 100.0f;
                 lastVcc = rxPayload.battVoltage / 1000.0f;
                 lastBatt = rxPayload.battPercent;
                 msgCount = rxPayload.msgCount;
-                lastConfigVer = rxPayload.configVer;
-                lastOpMode = rxPayload.opMode;
+                lastSensorIsDevMode = rxPayload.isDevMode;
                 lastSensorNeedsTimeSync = (rxPayload.needsTimeSync != 0);
-                lastHasDevTelemetry = false;
+                lastSensorSleepInterval = rxPayload.sleepInterval;
                 
                 char macStr[18];
                 sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", 
@@ -582,10 +657,12 @@ void loop()
                 
                 Serial.println(F("Radio Received packet!"));
                 Serial.printf("MAC: %s | Msg: %u\n", macStr, msgCount);
-                Serial.printf("Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Cfg: %u | Mode: %u | NeedsTimeSync: %s\n",
-                              lastTemp, lastVcc, lastBatt, lastConfigVer, lastOpMode, lastSensorNeedsTimeSync ? "yes" : "no");
-                if (numBytes == sizeof(TelemetryPayload)) {
-                    lastHasDevTelemetry = true;
+                Serial.printf("Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s\n",
+                              lastTemp, lastVcc, lastBatt, (unsigned long)lastSensorSleepInterval,
+                              lastSensorIsDevMode, lastSensorNeedsTimeSync ? "yes" : "no");
+
+                lastHasDevTelemetry = (numBytes == sizeof(TelemetryPayload));
+                if (lastHasDevTelemetry) {
                     lastBattCurrent = rxPayload.battCurrent;
                     lastBattPower = rxPayload.battPower;
                     lastFreeRam = rxPayload.freeRam;
@@ -597,83 +674,39 @@ void loop()
                                   lastCpuTemp, lastFreeRam, lastBattCurrent, lastBattPower, lastTxPower, lastSensorSNR, lastSensorRSSI);
                 }
 
-                // Publish to MQTT if connected
+                if (updatePending) {
+                     Serial.printf("Config Sent -> Sleep: %u | DevMode: %u | TimeOffset: %lu\n",
+                                          txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
+                } else {
+                     Serial.println(F("No config or time update pending."));
+                }
+
                 if (mqttClient.connected()) {
                     publishMqtt(rxPayload, lastMac, lastHasDevTelemetry);
                 }
 
-                // prepare Config payload
-                ConfigPayload txConfig;
-                txConfig.header[0] = 'C';
-                txConfig.header[1] = 'F';
-                memcpy(txConfig.targetMac, rxPayload.mac, 6);
-                txConfig.networkKey = NETWORK_KEY;
-                txConfig.sleepInterval = 20; // Default sleep interval of 60 seconds
-                txConfig.configVersion = rxPayload.configVer; // Mirror version, change to force update
-                txConfig.isDevMode = 0;      // 0 = OP Mode
-                
-                // ESP32 SNTP updates the system clock in the background.
-                // Once the standard clock becomes valid, treat it as trusted RTC time.
-                if (!hasValidRtcTime && refreshRtcTrustFromSystemClock()) {
-                    Serial.println(F("Gateway RTC is now trusted after SNTP synchronization."));
-                }
+                screenNum = 0; // Force switch to data screen on new packet
+                lastDisplayUpdate = millis();
+                drawMain();
 
-                // Keep sensor clocks in UTC. Local timezone and DST are gateway-only concerns.
-                time_t currentSysTime;
-                time(&currentSysTime);
-                if (hasValidRtcTime && isClockValid(currentSysTime)) {
-                    txConfig.timeOffset = (uint32_t)(currentSysTime - CUSTOM_EPOCH);
-                } else {
-                    txConfig.timeOffset = 0; // 0 = Gateway RTC was not valid at boot
-                }
-
-                // Delay briefly to ensure the sensor has finished its TX routine 
-                // and fully switched into RX mode to catch our preamble.
-                delay(100);
-                
-                // Transmit configuration payload to the sensor
-                radio.standby();
-                // Allow a 5-second margin for transmission delay to avoid infinite sync loops.
-                // Sync when the sensor clock is unset or drifts more than 5 seconds.
-                bool sensorNeedsTimeSync = (txConfig.timeOffset > 0) && lastSensorNeedsTimeSync;
-                if (rxPayload.configVer != txConfig.configVersion || sensorNeedsTimeSync) {
-                    int txState = radio.transmit((uint8_t*)&txConfig, sizeof(ConfigPayload));
-                    if (txState == RADIOLIB_ERR_NONE) {
-                        Serial.println(F("Configuration transmitted successfully!"));
-                        Serial.printf("Config Sent -> Sleep: %lu | Ver: %u | DevMode: %u | TimeOffset: %lu\n",
-                                      (unsigned long)txConfig.sleepInterval, txConfig.configVersion, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
-                    } else {
-                        Serial.printf("Configuration transmission failed, code %d\n", txState);
-                    }
-                } else if (txConfig.timeOffset == 0) {
-                    Serial.println(F("Gateway RTC was bad at boot and is still not trusted. Never syncing sensors in this state."));
-                } else {
-                    Serial.printf("No Config update or time sync needed");
-                }
-
-                
-                // radio.transmit() is blocking and triggers the hardware interrupt upon completion.
-                // This causes our ISR to set receivedFlag = true. We must clear it to avoid a TX-RX infinite loop.
-                receivedFlag = false;
             } else {
                 Serial.printf("Received unknown packet of %d bytes\n", numBytes);
+                xSemaphoreTake(radioSemaphore, 0);
+                radio.startReceive();
             }
-
-            screenNum = 0; // Force switch to data screen on new packet
-            lastDisplayUpdate = millis();
-            drawMain();
 
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
             // packet was received, but is malformed
             Serial.println(F("CRC error!"));
+            xSemaphoreTake(radioSemaphore, 0);
+            radio.startReceive();
         } else {
             // some other error occurred
             Serial.print(F("failed, code "));
             Serial.println(state);
+            xSemaphoreTake(radioSemaphore, 0);
+            radio.startReceive();
         }
-
-        // put module back to listen mode
-        radio.startReceive();
 
     }
 
@@ -713,9 +746,9 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
     doc["temperature"] = payload.temperature / 100.0f;
     doc["vcc"] = payload.battVoltage / 1000.0f;
     doc["battery"] = payload.battPercent;
-    doc["configVersion"] = payload.configVer;
-    doc["opMode"] = payload.opMode;
+    doc["isDevMode"] = payload.isDevMode;
     doc["needsTimeSync"] = (payload.needsTimeSync != 0);
+    doc["sleepInterval"] = payload.sleepInterval;
     doc["gatewayRssi"] = radio.getRSSI();
     doc["gatewaySnr"] = radio.getSNR();
 
