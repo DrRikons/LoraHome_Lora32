@@ -755,6 +755,8 @@ bool listenForConfig()
                             }
                         }
                         configReceived = true;
+                        wakeCycleCount = 0; // Reset wakecycle
+
                         break; // Successfully received and applied config, exit 5s RX window early
                     } else {
                         if (serialEnabled) Serial.println("Invalid config header. Terminating RX.");
@@ -777,13 +779,13 @@ bool listenForConfig()
         Serial.printf("RX Window closed. Total RX power-on time: %lu ms. Config %s\n",
                      lastRxTime, configReceived ? "received" : "NOT received");
     }
+    
 
     if (needsRestart) {
         if (serialEnabled) {
             Serial.println("Mode switched via remote config! Restarting device..");
         }
         flushSerialOutput();
-        wakeCycleCount = 0; // Reset before restart!
         ESP.restart(); // Soft reset
     }
 
