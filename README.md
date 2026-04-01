@@ -27,7 +27,6 @@ The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/m
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*
 
 ## Telemetry Payload Format
-To maximize LoRa time-on-air efficiency and save battery, the sensor node transmits telemetry data as a tightly packed binary C++ `struct`. The `TelemetryPayload` struct is defined in `payloads.h` and its size dynamically depends on the operating mode (16 bytes in normal mode, 27 bytes in Dev Mode). The core payload includes the applied `sleepInterval`, `isDevMode`, and `needsTimeSync` fields so the gateway can evaluate config updates and UTC time sync separately without keeping long RX windows open. The payload is secured using AES-128-CTR encryption.
 To maximize LoRa time-on-air efficiency, the sensor transmits telemetry as a packed binary C++ `struct`. The `TelemetryPayload` size is dynamic: 16 bytes in normal Operation Mode and 27 bytes in Dev Mode (which includes extra debugging metrics). The core payload includes the `sleepInterval`, `isDevMode`, and `needsTimeSync` flags, allowing the gateway to evaluate configuration status without requiring the sensor to keep its receiver open unnecessarily. The payload is secured using AES-128-CTR encryption.
 *(Note: The `TelemetryPayload` and `ConfigPayload` structs are defined in `payloads.h` for reusability across Gateway and Sensor modes. Any floating point values like temperature are multiplied before transmission. The Gateway divides them upon receipt to restore the decimal values).*
 
@@ -37,7 +36,6 @@ To maximize LoRa time-on-air efficiency, the sensor transmits telemetry as a pac
 This repository includes a GitHub Action (`issue-commenter.yml`) that automatically posts a comment to any GitHub Issue referenced in a commit message (e.g., `#123`).
 
 ## Development
-When running in `devMode` (GPIO13 pulled LOW), the sensor accurately simulates its full operational cycle without deep sleeping. The simulation loop is: Wake -> Transmit -> Short RX for beacon -> (Maybe) Long RX for config -> Display -> Simulated Sleep (for exactly the configured sleep duration, mirroring deep sleep timer behavior).
 When running in `devMode` (either via the `DEV_MODE_PIN` or remote configuration), the sensor accurately simulates its full operational cycle without entering deep sleep. The simulation loop is: Wake -> Transmit -> Short RX for beacon -> (Optional) Long RX for config -> Update Display -> Pause (for the configured sleep duration). This allows for comprehensive testing of the entire device lifecycle without requiring physical resets.
 *Note: The codebase uses hardware interrupt-driven, asynchronous RX/TX routines to prevent blocking loops and hangs. Serial logging is managed by a manual `serialEnabled` flag, which is forced `true` in Dev Mode but can be toggled in Operation Mode for testing.*
 

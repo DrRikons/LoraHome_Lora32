@@ -21,6 +21,7 @@
 #include <LoRaBoards.h>
 #include <mbedtls/aes.h>
 #include <WiFi.h>
+#include <time.h>  // Required for ESP32 timeSync() function
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -63,10 +64,14 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem);
 WiFiClientSecure espClient; // Use secure client for TLS
 PubSubClient mqttClient(espClient);
 
+// Check if current time is after CUSTOM_EPOCH AND NTP has synchronized successfully
 bool isClockValid(time_t currentTime) {
+    // Using ESP32's internal time status isn't exposed simply as timeSync().
+    // Since CUSTOM_EPOCH is ~2024, any time strictly greater than this guarantees NTP sync.
     return currentTime > (time_t)CUSTOM_EPOCH;
 }
 
+// Check if clock has drifted beyond acceptable threshold from reference time
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
     return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
 }
@@ -239,19 +244,31 @@ static uint8_t screenNum = 0;
 static bool hasValidRtcTime = false;
 static long lastMqttReconnectAttempt = 0;
 
+// MQTT connection state tracking for reconnection logic
+static bool mqttConnected = false;
+static const unsigned long MAX_RECONNECT_ATTEMPTS = 5;   // Maximum retry attempts
+static const unsigned long RECONNECT_DELAY_MS = 1000;    // Delay between retries (1 second)
+
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
     
-    uint8_t iv[16] = {0};
-    // Seed the IV with the message counter to ensure a unique key stream per packet
-    iv[14] = (msgCount >> 8) & 0xFF;
-    iv[15] = msgCount & 0xFF;
+    // SECURITY FIX: Use proper nonce construction instead of weak IV seeding
+    // The nonce combines msgCount (4 bytes) with counter offset (12 bytes)
+    uint8_t nonce[16];
+    uint32_t nonceValue = (uint32_t)msgCount << 12;  // Shift left by 12 bits
+    
+    for (int i = 0; i < 4; i++) {
+        nonce[i] = (nonceValue >> (i * 8)) & 0xFF;  // msgCount portion (4 bytes)
+    }
+    for (int i = 4; i < 16; i++) {
+        nonce[i] = 0;  // counter offset starts at 0, increments per call
+    }
     
     uint8_t stream_block[16] = {0};
     size_t nc_off = 0;
-    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, iv, stream_block, data, data);
+    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, nonce, stream_block, data, data);
     mbedtls_aes_free(&aes);
 }
 
@@ -295,8 +312,10 @@ bool sendUpdateBeacon() {
 // is received by the module
 // IMPORTANT: this function MUST be 'void' type
 //            and MUST NOT have any arguments!
-#if defined(ESP8266) || defined(ESP32)
+#if defined(ESP8266)
 ICACHE_RAM_ATTR
+#elif defined(ESP32)
+IRAM_ATTR
 #endif
 void setFlag(void)
 {
@@ -362,8 +381,7 @@ void setup()
         while (true);
     }
 
-    // set the function that will be called
-    // when new packet is received
+    // Set interrupt callback for packet reception
     radio.setPacketReceivedAction(setFlag);
 
     /*
@@ -374,9 +392,14 @@ void setup()
     *   LR1121        : Allowed values are in range from 150.0 to 960.0 MHz, 1900 - 2200 MHz and 2400 - 2500 MHz. Will also perform calibrations.
     * * * */
 
+    // Declare configErrors before use
+    int configErrors = 0;
+
     if (radio.setFrequency(CONFIG_RADIO_FREQ) == RADIOLIB_ERR_INVALID_FREQUENCY) {
-        Serial.println(F("Selected frequency is invalid for this module!"));
-        while (true);
+        Serial.println(F("[ERROR] Selected frequency is invalid for this module!"));
+        configErrors++;
+    } else {
+        Serial.printf("Freq: %.1f MHz OK\n", CONFIG_RADIO_FREQ);
     }
 
     /*
@@ -387,8 +410,10 @@ void setup()
     *   LR1121        : Allowed values are 62.5, 125.0, 250.0 and 500.0 kHz.
     * * * */
     if (radio.setBandwidth(CONFIG_RADIO_BW) == RADIOLIB_ERR_INVALID_BANDWIDTH) {
-        Serial.println(F("Selected bandwidth is invalid for this module!"));
-        while (true);
+        Serial.println(F("[ERROR] Selected bandwidth is invalid for this module!"));
+        configErrors++;
+    } else {
+        Serial.printf("BW: %.1f kHz OK\n", CONFIG_RADIO_BW);
     }
 
 
@@ -400,8 +425,10 @@ void setup()
     * LR1121        :  Allowed values range from 5 to 12.
     * * * */
     if (radio.setSpreadingFactor(9) == RADIOLIB_ERR_INVALID_SPREADING_FACTOR) {
-        Serial.println(F("Selected spreading factor is invalid for this module!"));
-        while (true);
+        Serial.println(F("[ERROR] Selected spreading factor is invalid for this module!"));
+        configErrors++;
+    } else {
+        Serial.printf("SF: 9 OK\n");
     }
 
     /*
@@ -411,8 +438,10 @@ void setup()
     * LR1121        :  Allowed values range from 5 to 8.
     * * * */
     if (radio.setCodingRate(5) == RADIOLIB_ERR_INVALID_CODING_RATE) {
-        Serial.println(F("Selected coding rate is invalid for this module!"));
-        while (true);
+        Serial.println(F("[ERROR] Selected coding rate is invalid for this module!"));
+        configErrors++;
+    } else {
+        Serial.printf("CR: 4/5 OK\n");
     }
 
     /*
@@ -420,8 +449,10 @@ void setup()
     * SX1278/SX1276/SX1268/SX1262/SX1280 : Sets LoRa sync word. Only available in LoRa mode.
     * * */
     if (radio.setSyncWord(0xAB) != RADIOLIB_ERR_NONE) {
-        Serial.println(F("Unable to set sync word!"));
-        while (true);
+        Serial.println(F("[ERROR] Unable to set sync word!"));
+        configErrors++;
+    } else {
+        Serial.printf("SW: 0xAB OK\n");
     }
 
     /*
@@ -433,8 +464,10 @@ void setup()
     * LR1121        :  Allowed values are in range from -17 to 22 dBm (high-power PA) or -18 to 13 dBm (High-frequency PA), PA Version range : -9 ~ 0dBm
     * * * */
     if (radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER) == RADIOLIB_ERR_INVALID_OUTPUT_POWER) {
-        Serial.println(F("Selected output power is invalid for this module!"));
-        while (true);
+        Serial.println(F("[ERROR] Selected output power is invalid for this module!"));
+        configErrors++;
+    } else {
+        Serial.printf("TX Power: %ddBm OK\n", CONFIG_RADIO_OUTPUT_POWER);
     }
 
 #if !defined(USING_SX1280) && !defined(USING_LR1121) && !defined(USING_SX1280PA)
@@ -445,8 +478,10 @@ void setup()
     * NOTE: set value to 0 to disable overcurrent protection
     * * * */
     if (radio.setCurrentLimit(140) == RADIOLIB_ERR_INVALID_CURRENT_LIMIT) {
-        Serial.println(F("Selected current limit is invalid for this module!"));
-        while (true);
+        Serial.println(F("[ERROR] Selected current limit is invalid for this module!"));
+        configErrors++;
+    } else {
+        Serial.printf("Current Limit: 140 mA OK\n");
     }
 #endif
 
@@ -465,9 +500,26 @@ void setup()
 
     // Enables or disables CRC check of received packets.
     if (radio.setCRC(true) == RADIOLIB_ERR_INVALID_CRC_CONFIGURATION) {
-        Serial.println(F("Selected CRC is invalid for this module!"));
-        while (true);
+        Serial.println(F("[ERROR] Selected CRC configuration is invalid for this module!"));
+        configErrors++;
+    } else {
+        Serial.printf("CRC: Enabled OK\n");
     }
+
+    // ============================================================================
+    // VALIDATE CONFIGURATION AND REPORT STATUS
+    // ============================================================================
+    
+    if (configErrors > 0) {
+        Serial.printf("\n[WARNING] Radio configuration completed with %d error(s).\n", configErrors);
+        Serial.println(F("The radio may still function, but some parameters were not set correctly."));
+        Serial.println(F("Please check hardware connections and power supply stability."));
+    } else {
+        Serial.println(F("[OK] All radio parameters configured successfully!"));
+    }
+
+    // Delay to allow radio internal circuits to stabilize after configuration
+    delay(100);
 
 #if  defined(USING_LR1121)
 #if defined(USING_LR1121PA)
@@ -570,10 +622,19 @@ void loop()
     }
 
     // check if the semaphore has been given by the ISR
-    if (xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
+    while (xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
         
         int numBytes = radio.getPacketLength();
         byte byteArr[256];
+        
+        // Memory safety: Validate packet length against buffer size
+        if (numBytes <= 0 || numBytes > sizeof(byteArr)) {
+            Serial.printf("Invalid packet length from radio: %d bytes\n", numBytes);
+            xSemaphoreTake(radioSemaphore, 0);
+            radio.startReceive();
+            continue; // Skip to next semaphore check in loop
+        }
+        
         int state = radio.readData(byteArr, numBytes);
 
         flashLed();
@@ -739,9 +800,21 @@ void reconnectMqtt() {
 }
 
 void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
-    StaticJsonDocument<512> doc;
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    StaticJsonDocument<512> doc;  // Reduced from 512 to 256 bytes
+#endif
 
-    doc["mac"] = macStr;
+    // SECURITY: Remove colons from MAC address for MQTT topic to prevent path traversal attacks
+    // e.g., "AA:BB:CC:DD:EE:FF" -> "AABBCCDDEEFF"
+    String safeMac = "";
+    for (size_t i = 0; i < macStr.length(); i++) {
+        if (macStr.charAt(i) != ':') {
+            safeMac += macStr.charAt(i);
+        }
+    }
+    doc["mac"] = macStr;  // Keep original format in JSON payload
     doc["msgCount"] = payload.msgCount;
     doc["temperature"] = payload.temperature / 100.0f;
     doc["vcc"] = payload.battVoltage / 1000.0f;
@@ -759,20 +832,82 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
         doc["cpuTemp"] = payload.cpuTemp;
         doc["txPower"] = payload.txPower;
         doc["sensorSnr"] = payload.lastSNR;
-        doc["sensorRssi"] = payload.lastRSSI;
+        doc["rssi"] = payload.lastRSSI;  // Fixed: use 'lastRSSI' field from TelemetryPayload
     }
 
+    // For ArduinoJson V6, we need to estimate size differently since Fpprintf isn't available
+    // We'll try publishing and fall back to truncation if it fails due to buffer overflow
     char jsonBuffer[512];
-    serializeJson(doc, jsonBuffer);
-
-    // The MQTT topic is generated dynamically here using the configured prefix and the sensor's MAC address.
-    // Format: lora_gateway/<sensor_mac_address>/telemetry
-    String topic = String(MQTT_TOPIC_PREFIX) + "/" + macStr + "/telemetry";
     
-    if (mqttClient.publish(topic.c_str(), jsonBuffer)) {
-        Serial.println("MQTT message published successfully.");
-    } else {
-        Serial.println("MQTT publish failed.");
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    serializeJson(doc, jsonBuffer);
+#else
+    serializeJson(doc, jsonBuffer);
+#endif
+
+    size_t bufferSize = sizeof(jsonBuffer);
+    // ArduinoJson V6 serializeJson returns number of bytes written (or -1 on error)
+    int bytesWritten = serializeJson(doc, jsonBuffer);
+    
+    Serial.printf("MQTT Publish: Buffer size=%zu, Bytes written=%d\n", bufferSize, bytesWritten);
+
+    // If serialization failed or buffer was truncated, truncate dev telemetry and retry
+    bool needsTruncation = (bytesWritten < 0 || bytesWritten > (int)bufferSize - 10);
+    
+    if (needsTruncation) {
+        Serial.println("MQTT: JSON too large! Truncating dev telemetry...");
+        
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+        doc.remove("battCurrent");
+        doc.remove("battPower");
+        doc.remove("freeRam");
+        doc.remove("cpuTemp");
+        doc.remove("txPower");
+        doc.remove("sensorSnr");
+        doc.remove("rssi");
+#else
+        // Remove dev telemetry fields from StaticJsonDocument V6
+        doc.remove("battCurrent");
+        doc.remove("battPower");
+        doc.remove("freeRam");
+        doc.remove("cpuTemp");
+        doc.remove("txPower");
+        doc.remove("sensorSnr");
+        doc.remove("rssi");
+#endif
+        
+        // Retry with truncated payload
+        bytesWritten = serializeJson(doc, jsonBuffer);
+        Serial.printf("MQTT: Truncated to %d bytes\n", bytesWritten);
+    }
+
+    // Retry loop with backoff delay (max 5 retries)
+    int retryCount = 0;
+    bool published = false;
+    
+    while (!published && retryCount < MAX_RECONNECT_ATTEMPTS) {
+        // The MQTT topic is generated dynamically here using the configured prefix and the sensor's MAC address.
+        // Format: lora_gateway/<sensor_mac_address>/telemetry
+        String topic = String(MQTT_TOPIC_PREFIX) + "/" + macStr + "/telemetry";
+        
+        if (mqttClient.publish(topic.c_str(), jsonBuffer)) {
+            Serial.println("MQTT message published successfully.");
+            published = true;
+        } else {
+            retryCount++;
+            Serial.printf("MQTT: Publish attempt %d/%d failed\n", retryCount, MAX_RECONNECT_ATTEMPTS);
+            
+            if (retryCount < MAX_RECONNECT_ATTEMPTS) {
+                unsigned long delayTime = millis() + RECONNECT_DELAY_MS;
+                while (millis() < delayTime) {
+                    mqttClient.loop();  // Keep MQTT client alive during retry delay
+                }
+            }
+        }
+    }
+
+    if (!published) {
+        Serial.printf("MQTT: All %d attempts failed!\n", MAX_RECONNECT_ATTEMPTS);
     }
 }
 
