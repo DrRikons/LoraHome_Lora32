@@ -30,6 +30,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <payloads.h>
+#include <SD.h>
+#include <SPI.h>
+#include "esp_log.h"
 
 // WiFi and NTP Configuration
 #define WIFI_SSID "SSID"
@@ -249,6 +252,51 @@ static bool mqttConnected = false;
 static const unsigned long MAX_RECONNECT_ATTEMPTS = 5;   // Maximum retry attempts
 static const unsigned long RECONNECT_DELAY_MS = 1000;    // Delay between retries (1 second)
 
+static const char *TAG = "Gateway";
+static QueueHandle_t logQueue = NULL;
+
+void sdLogTask(void *pvParameters) {
+    char *logMessage;
+    while (true) {
+        if (xQueueReceive(logQueue, &logMessage, portMAX_DELAY) == pdTRUE) {
+            File logFile = SD.open("/gateway_log.txt", FILE_APPEND);
+            if (logFile) {
+                logFile.print(logMessage);
+                logFile.close();
+            }
+            free(logMessage);
+        }
+    }
+}
+
+int asyncLogWriter(const char *fmt, va_list args) {
+    char buffer[256];
+    int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
+    if (len > 0) {
+        char timePrefix[32] = "";
+        time_t sysTime;
+        time(&sysTime);
+        if (isClockValid(sysTime)) {
+            char timeStr[24];
+            formatLocalTime(sysTime, timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S");
+            snprintf(timePrefix, sizeof(timePrefix), "[%s] ", timeStr);
+        }
+        
+        printf("%s%s", timePrefix, buffer);
+        if (logQueue != NULL) {
+            char qMsgBuffer[300];
+            snprintf(qMsgBuffer, sizeof(qMsgBuffer), "%s%s", timePrefix, buffer);
+            char *qMsg = strdup(qMsgBuffer);
+            if (qMsg) {
+                if (xQueueSend(logQueue, &qMsg, 0) != pdTRUE) {
+                    free(qMsg); // Drop log to avoid blocking if the queue is full
+                }
+            }
+        }
+    }
+    return len;
+}
+
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
@@ -297,14 +345,14 @@ bool sendUpdateBeacon() {
     int txState = radio.startTransmit(&beacon, 1);
     if (txState == RADIOLIB_ERR_NONE) {
         if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            Serial.println(F("Update beacon transmitted."));
+            ESP_LOGI(TAG, "Update beacon transmitted.");
             return true;
         } else {
-            Serial.println(F("Update beacon TX timeout!"));
+            ESP_LOGW(TAG, "Update beacon TX timeout!");
             return false;
         }
     }
-    Serial.printf("Update beacon startTransmit failed, code %d\n", txState);
+    ESP_LOGE(TAG, "Update beacon startTransmit failed, code %d", txState);
     return false;
 }
 
@@ -332,6 +380,16 @@ void setup()
 {
     setupBoards();
 
+    // Initialize SD card and FreeRTOS asynchronous logging queue
+    if (SD.begin()) {
+        logQueue = xQueueCreate(20, sizeof(char*));
+        if (logQueue != NULL) {
+            xTaskCreate(sdLogTask, "SDLogTask", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+        }
+    }
+    esp_log_set_vprintf(asyncLogWriter);
+    esp_log_level_set("*", ESP_LOG_INFO);
+
     // Initialize the FreeRTOS semaphore
     radioSemaphore = xSemaphoreCreateBinary();
 
@@ -355,7 +413,7 @@ void setup()
     time(&sysTime);
     if (isClockValid(sysTime)) {
         hasValidRtcTime = true;
-        Serial.println(F("Recovered time from internal ESP32 RTC after soft reset."));
+        ESP_LOGI(TAG, "Recovered time from internal ESP32 RTC after soft reset.");
     }
 
     // When the power is turned on, a delay is required.
@@ -371,13 +429,10 @@ void setup()
 
     printResult(state == RADIOLIB_ERR_NONE);
 
-    Serial.printf("[%s]:", RADIO_TYPE_STR);
-    Serial.print(F("Radio Initializing ... "));
     if (state == RADIOLIB_ERR_NONE) {
-        Serial.println(F("success!"));
+        ESP_LOGI(TAG, "[%s]: Radio Initializing ... success!", RADIO_TYPE_STR);
     } else {
-        Serial.print(F("failed, code "));
-        Serial.println(state);
+        ESP_LOGE(TAG, "[%s]: Radio Initializing ... failed, code %d", RADIO_TYPE_STR, state);
         while (true);
     }
 
@@ -396,10 +451,10 @@ void setup()
     int configErrors = 0;
 
     if (radio.setFrequency(CONFIG_RADIO_FREQ) == RADIOLIB_ERR_INVALID_FREQUENCY) {
-        Serial.println(F("[ERROR] Selected frequency is invalid for this module!"));
+        ESP_LOGE(TAG, "Selected frequency is invalid for this module!");
         configErrors++;
     } else {
-        Serial.printf("Freq: %.1f MHz OK\n", CONFIG_RADIO_FREQ);
+        ESP_LOGI(TAG, "Freq: %.1f MHz OK", CONFIG_RADIO_FREQ);
     }
 
     /*
@@ -410,10 +465,10 @@ void setup()
     *   LR1121        : Allowed values are 62.5, 125.0, 250.0 and 500.0 kHz.
     * * * */
     if (radio.setBandwidth(CONFIG_RADIO_BW) == RADIOLIB_ERR_INVALID_BANDWIDTH) {
-        Serial.println(F("[ERROR] Selected bandwidth is invalid for this module!"));
+        ESP_LOGE(TAG, "Selected bandwidth is invalid for this module!");
         configErrors++;
     } else {
-        Serial.printf("BW: %.1f kHz OK\n", CONFIG_RADIO_BW);
+        ESP_LOGI(TAG, "BW: %.1f kHz OK", CONFIG_RADIO_BW);
     }
 
 
@@ -425,10 +480,10 @@ void setup()
     * LR1121        :  Allowed values range from 5 to 12.
     * * * */
     if (radio.setSpreadingFactor(9) == RADIOLIB_ERR_INVALID_SPREADING_FACTOR) {
-        Serial.println(F("[ERROR] Selected spreading factor is invalid for this module!"));
+        ESP_LOGE(TAG, "Selected spreading factor is invalid for this module!");
         configErrors++;
     } else {
-        Serial.printf("SF: 9 OK\n");
+        ESP_LOGI(TAG, "SF: 9 OK");
     }
 
     /*
@@ -438,10 +493,10 @@ void setup()
     * LR1121        :  Allowed values range from 5 to 8.
     * * * */
     if (radio.setCodingRate(5) == RADIOLIB_ERR_INVALID_CODING_RATE) {
-        Serial.println(F("[ERROR] Selected coding rate is invalid for this module!"));
+        ESP_LOGE(TAG, "Selected coding rate is invalid for this module!");
         configErrors++;
     } else {
-        Serial.printf("CR: 4/5 OK\n");
+        ESP_LOGI(TAG, "CR: 4/5 OK");
     }
 
     /*
@@ -449,10 +504,10 @@ void setup()
     * SX1278/SX1276/SX1268/SX1262/SX1280 : Sets LoRa sync word. Only available in LoRa mode.
     * * */
     if (radio.setSyncWord(0xAB) != RADIOLIB_ERR_NONE) {
-        Serial.println(F("[ERROR] Unable to set sync word!"));
+        ESP_LOGE(TAG, "Unable to set sync word!");
         configErrors++;
     } else {
-        Serial.printf("SW: 0xAB OK\n");
+        ESP_LOGI(TAG, "SW: 0xAB OK");
     }
 
     /*
@@ -464,10 +519,10 @@ void setup()
     * LR1121        :  Allowed values are in range from -17 to 22 dBm (high-power PA) or -18 to 13 dBm (High-frequency PA), PA Version range : -9 ~ 0dBm
     * * * */
     if (radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER) == RADIOLIB_ERR_INVALID_OUTPUT_POWER) {
-        Serial.println(F("[ERROR] Selected output power is invalid for this module!"));
+        ESP_LOGE(TAG, "Selected output power is invalid for this module!");
         configErrors++;
     } else {
-        Serial.printf("TX Power: %ddBm OK\n", CONFIG_RADIO_OUTPUT_POWER);
+        ESP_LOGI(TAG, "TX Power: %ddBm OK", CONFIG_RADIO_OUTPUT_POWER);
     }
 
 #if !defined(USING_SX1280) && !defined(USING_LR1121) && !defined(USING_SX1280PA)
@@ -478,10 +533,10 @@ void setup()
     * NOTE: set value to 0 to disable overcurrent protection
     * * * */
     if (radio.setCurrentLimit(140) == RADIOLIB_ERR_INVALID_CURRENT_LIMIT) {
-        Serial.println(F("[ERROR] Selected current limit is invalid for this module!"));
+        ESP_LOGE(TAG, "Selected current limit is invalid for this module!");
         configErrors++;
     } else {
-        Serial.printf("Current Limit: 140 mA OK\n");
+        ESP_LOGI(TAG, "Current Limit: 140 mA OK");
     }
 #endif
 
@@ -500,10 +555,10 @@ void setup()
 
     // Enables or disables CRC check of received packets.
     if (radio.setCRC(true) == RADIOLIB_ERR_INVALID_CRC_CONFIGURATION) {
-        Serial.println(F("[ERROR] Selected CRC configuration is invalid for this module!"));
+        ESP_LOGE(TAG, "Selected CRC configuration is invalid for this module!");
         configErrors++;
     } else {
-        Serial.printf("CRC: Enabled OK\n");
+        ESP_LOGI(TAG, "CRC: Enabled OK");
     }
 
     // ============================================================================
@@ -511,11 +566,11 @@ void setup()
     // ============================================================================
     
     if (configErrors > 0) {
-        Serial.printf("\n[WARNING] Radio configuration completed with %d error(s).\n", configErrors);
-        Serial.println(F("The radio may still function, but some parameters were not set correctly."));
-        Serial.println(F("Please check hardware connections and power supply stability."));
+        ESP_LOGW(TAG, "Radio configuration completed with %d error(s).", configErrors);
+        ESP_LOGW(TAG, "The radio may still function, but some parameters were not set correctly.");
+        ESP_LOGW(TAG, "Please check hardware connections and power supply stability.");
     } else {
-        Serial.println(F("[OK] All radio parameters configured successfully!"));
+        ESP_LOGI(TAG, "All radio parameters configured successfully!");
     }
 
     // Delay to allow radio internal circuits to stabilize after configuration
@@ -524,14 +579,14 @@ void setup()
 #if  defined(USING_LR1121)
 #if defined(USING_LR1121PA)
     if (CONFIG_RADIO_FREQ < 2400) {
-        Serial.printf("LR1121 PA Version Using low frequency switch table for PA version\n");
+        ESP_LOGI(TAG, "LR1121 PA Version Using low frequency switch table for PA version");
         radio.setRfSwitchTable(pa_version_rf_switch_dio_pins, low_freq_switch_table);
     } else {
-        Serial.printf("LR1121 PA Version Using high frequency switch table for PA version\n");
+        ESP_LOGI(TAG, "LR1121 PA Version Using high frequency switch table for PA version");
         radio.setRfSwitchTable(pa_version_rf_switch_dio_pins, high_freq_switch_table);
     }
 #else   //  Version without PA rf switch table
-    Serial.println("LR1121 without PA Version");
+    ESP_LOGI(TAG, "LR1121 without PA Version");
     static const uint32_t rfswitch_dio_pins[] = {
         RADIOLIB_LR11X0_DIO5, RADIOLIB_LR11X0_DIO6,
         RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC
@@ -562,7 +617,7 @@ void setup()
     // NOTE: As long as DIO2 is configured to control RF switch,
     //       it can't be used as interrupt pin!
     if (radio.setDio2AsRfSwitch() != RADIOLIB_ERR_NONE) {
-        Serial.println(F("Failed to set DIO2 as RF switch!"));
+        ESP_LOGE(TAG, "Failed to set DIO2 as RF switch!");
         while (true);
     }
 #endif //USING_SX1262
@@ -590,7 +645,7 @@ void setup()
 #endif
 
 #ifdef RADIO_CTRL
-    Serial.println("Turn on LAN, Enter Rx mode.");
+    ESP_LOGI(TAG, "Turn on LAN, Enter Rx mode.");
     /*
     * 2W and BPF LoRa LAN Control ,set HIGH turn on LAN ,RX Mode
     * */
@@ -600,13 +655,11 @@ void setup()
     delay(1000);
 
     // start listening for LoRa packets
-    Serial.print(F("Radio Starting to listen ... "));
     state = radio.startReceive();
     if (state == RADIOLIB_ERR_NONE) {
-        Serial.println(F("success!"));
+        ESP_LOGI(TAG, "Radio started listening successfully!");
     } else {
-        Serial.print(F("failed, code "));
-        Serial.println(state);
+        ESP_LOGE(TAG, "Radio start listening failed, code %d", state);
     }
 
     drawMain();
@@ -629,7 +682,7 @@ void loop()
         
         // Memory safety: Validate packet length against buffer size
         if (numBytes <= 0 || numBytes > sizeof(byteArr)) {
-            Serial.printf("Invalid packet length from radio: %d bytes\n", numBytes);
+            ESP_LOGW(TAG, "Invalid packet length from radio: %d bytes", numBytes);
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
             continue; // Skip to next semaphore check in loop
@@ -716,10 +769,9 @@ void loop()
                         rxPayload.mac[3], rxPayload.mac[4], rxPayload.mac[5]);
                 lastMac = String(macStr);
                 
-                Serial.println(F("Radio Received packet!"));
-                Serial.printf("MAC: %s | Msg: %u\n", macStr, msgCount);
-                Serial.printf("Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s\n",
-                              lastTemp, lastVcc, lastBatt, (unsigned long)lastSensorSleepInterval,
+                ESP_LOGI(TAG, "Radio Received packet! MAC: %s | Msg: %u", macStr, msgCount);
+                ESP_LOGI(TAG, "Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s", 
+                              lastTemp, lastVcc, lastBatt, (unsigned long)lastSensorSleepInterval, 
                               lastSensorIsDevMode, lastSensorNeedsTimeSync ? "yes" : "no");
 
                 lastHasDevTelemetry = (numBytes == sizeof(TelemetryPayload));
@@ -731,15 +783,15 @@ void loop()
                     lastTxPower = rxPayload.txPower;
                     lastSensorSNR = rxPayload.lastSNR;
                     lastSensorRSSI = rxPayload.lastRSSI;
-                    Serial.printf("DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm\n", 
+                    ESP_LOGD(TAG, "DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm", 
                                   lastCpuTemp, lastFreeRam, lastBattCurrent, lastBattPower, lastTxPower, lastSensorSNR, lastSensorRSSI);
                 }
 
                 if (updatePending) {
-                     Serial.printf("Config Sent -> Sleep: %u | DevMode: %u | TimeOffset: %lu\n",
+                     ESP_LOGI(TAG, "Config Sent -> Sleep: %u | DevMode: %u | TimeOffset: %lu",
                                           txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
                 } else {
-                     Serial.println(F("No config or time update pending."));
+                     ESP_LOGD(TAG, "No config or time update pending.");
                 }
 
                 if (mqttClient.connected()) {
@@ -751,20 +803,19 @@ void loop()
                 drawMain();
 
             } else {
-                Serial.printf("Received unknown packet of %d bytes\n", numBytes);
+                ESP_LOGW(TAG, "Received unknown packet of %d bytes", numBytes);
                 xSemaphoreTake(radioSemaphore, 0);
                 radio.startReceive();
             }
 
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
             // packet was received, but is malformed
-            Serial.println(F("CRC error!"));
+            ESP_LOGE(TAG, "CRC error!");
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
         } else {
             // some other error occurred
-            Serial.print(F("failed, code "));
-            Serial.println(state);
+            ESP_LOGE(TAG, "Receive failed, code %d", state);
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
         }
@@ -785,15 +836,13 @@ void reconnectMqtt() {
         if (now - lastMqttReconnectAttempt > 5000) {
             lastMqttReconnectAttempt = now;
             // Attempt to reconnect
-            Serial.print("Attempting MQTT connection...");
+            ESP_LOGI(TAG, "Attempting MQTT connection...");
             String clientId = WIFI_HOSTNAME;
             clientId += String(random(0xffff), HEX);
             if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
-                Serial.println("connected");
+                ESP_LOGI(TAG, "MQTT connected");
             } else {
-                Serial.print("failed, rc=");
-                Serial.print(mqttClient.state());
-                Serial.println(" try again in 5 seconds");
+                ESP_LOGE(TAG, "MQTT connection failed, rc=%d try again in 5 seconds", mqttClient.state());
             }
         }
     }
@@ -816,6 +865,15 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
     }
     doc["mac"] = macStr;  // Keep original format in JSON payload
     doc["msgCount"] = payload.msgCount;
+    
+    time_t sysTime;
+    time(&sysTime);
+    if (isClockValid(sysTime)) {
+        char timeStr[32];
+        formatLocalTime(sysTime, timeStr, sizeof(timeStr), "%Y-%m-%dT%H:%M:%S");
+        doc["timestamp"] = timeStr;
+    }
+
     doc["temperature"] = payload.temperature / 100.0f;
     doc["vcc"] = payload.battVoltage / 1000.0f;
     doc["battery"] = payload.battPercent;
@@ -849,13 +907,13 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
     // ArduinoJson V6 serializeJson returns number of bytes written (or -1 on error)
     int bytesWritten = serializeJson(doc, jsonBuffer);
     
-    Serial.printf("MQTT Publish: Buffer size=%zu, Bytes written=%d\n", bufferSize, bytesWritten);
+    ESP_LOGD(TAG, "MQTT Publish: Buffer size=%zu, Bytes written=%d", bufferSize, bytesWritten);
 
     // If serialization failed or buffer was truncated, truncate dev telemetry and retry
     bool needsTruncation = (bytesWritten < 0 || bytesWritten > (int)bufferSize - 10);
     
     if (needsTruncation) {
-        Serial.println("MQTT: JSON too large! Truncating dev telemetry...");
+        ESP_LOGW(TAG, "MQTT: JSON too large! Truncating dev telemetry...");
         
 #if ARDUINOJSON_VERSION_MAJOR >= 7
         doc.remove("battCurrent");
@@ -878,7 +936,7 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
         
         // Retry with truncated payload
         bytesWritten = serializeJson(doc, jsonBuffer);
-        Serial.printf("MQTT: Truncated to %d bytes\n", bytesWritten);
+        ESP_LOGD(TAG, "MQTT: Truncated to %d bytes", bytesWritten);
     }
 
     // Retry loop with backoff delay (max 5 retries)
@@ -891,11 +949,11 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
         String topic = String(MQTT_TOPIC_PREFIX) + "/" + macStr + "/telemetry";
         
         if (mqttClient.publish(topic.c_str(), jsonBuffer)) {
-            Serial.println("MQTT message published successfully.");
+            ESP_LOGI(TAG, "MQTT message published successfully.");
             published = true;
         } else {
             retryCount++;
-            Serial.printf("MQTT: Publish attempt %d/%d failed\n", retryCount, MAX_RECONNECT_ATTEMPTS);
+            ESP_LOGW(TAG, "MQTT: Publish attempt %d/%d failed", retryCount, MAX_RECONNECT_ATTEMPTS);
             
             if (retryCount < MAX_RECONNECT_ATTEMPTS) {
                 unsigned long delayTime = millis() + RECONNECT_DELAY_MS;
@@ -907,7 +965,7 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
     }
 
     if (!published) {
-        Serial.printf("MQTT: All %d attempts failed!\n", MAX_RECONNECT_ATTEMPTS);
+        ESP_LOGE(TAG, "MQTT: All %d attempts failed!", MAX_RECONNECT_ATTEMPTS);
     }
 }
 
