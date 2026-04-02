@@ -37,6 +37,8 @@
 // ELog configuration
 #define MYLOG 0  // Gateway log ID
 
+#define SD_SC_PIN 13
+
 // WiFi and NTP Configuration
 #define WIFI_SSID "SSID"
 #define WIFI_PASSWORD "***password***"
@@ -66,8 +68,8 @@ void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char
 bool sendUpdateBeacon();
 bool isClockValid(time_t currentTime);
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
-void reconnectMqtt();
-void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem);
+void mqttConnect();
+void mqttPublish(TelemetryPayload &payload, String &macStr, bool hasDevTelem);
 
 WiFiClientSecure espClient; // Use secure client for TLS
 PubSubClient mqttClient(espClient);
@@ -303,14 +305,14 @@ bool sendUpdateBeacon() {
     int txState = radio.startTransmit(&beacon, 1);
     if (txState == RADIOLIB_ERR_NONE) {
         if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            Logger.info(MYLOG, "::%s:: Update beacon transmitted." , __func__);
+            Logger.info(MYLOG, "::%s:: Update beacon transmitted." , string(__func__).substr(0, 5).c_str());
             return true;
         } else {
-            Logger.warning(MYLOG, "::%s:: Update beacon TX timeout!", __func__);
+            Logger.warning(MYLOG, "::%s:: Update beacon TX timeout!", string(__func__).substr(0, 5).c_str());
             return false;
         }
     }
-    Logger.error(MYLOG, "::%s:: Update beacon startTransmit failed, code %d", __func__, txState);
+    Logger.error(MYLOG, "::%s:: Update beacon startTransmit failed, code %d", string(__func__).substr(0, 5).c_str(), txState);
     return false;
 }
 
@@ -353,11 +355,14 @@ void setup()
     // Initialize Logger with Serial and SD output
     // Register console output (Serial)
     Logger.registerSerial(MYLOG, ELOG_LEVEL_DEBUG, "GW");
-    
-    // Configure and register SD card output
-    // SD card is already initialized by setupBoards(), just register the logger
-    Logger.registerSd(MYLOG, ELOG_LEVEL_DEBUG, "gateway");
 
+    // Configure and register SD card output
+    Logger.configureSd(SDCardSPI, SDCARD_CS, 2000000, SHARED_SPI);
+    // SD card is already initialized by setupBoards(), just register the logger
+    Logger.registerSd(MYLOG, ELOG_LEVEL_DEBUG, "gateway", ELOG_FLAG_NONE, 100000);
+
+    // Simulate the time by providing a fixed time to the RTC (You can also use the NTP time)
+    Logger.provideTime(2024, 01, 01, 0, 0, 0); //<-- CUSTOM_EPOCH
     // Initialize the FreeRTOS semaphore
     radioSemaphore = xSemaphoreCreateBinary();
 
@@ -380,15 +385,15 @@ void setup()
     refreshRtcTrustFromSystemClock();  // Check and set hasValidRtcTime based on current RTC time
     
     if (hasValidRtcTime) {
-        Logger.info(MYLOG, "::%s:: Recovered time from internal ESP32 RTC after soft reset.", __func__);
+        Logger.info(MYLOG, "::%s:: Recovered time from internal ESP32 RTC after soft reset.", string(__func__).substr(0, 5).c_str());
     } else {
         configureSystemTime(); // Ensure SNTP is configured if RTC time is not valid
         time(&sysTime);
-        Logger.info(MYLOG, "::%s:: RTC not valid, syncing time from NTP server.", __func__);
+        Logger.info(MYLOG, "::%s:: RTC not valid, syncing time from NTP server.", string(__func__).substr(0, 5).c_str());
         
         // Check if NTP sync succeeded
         if (!isClockValid(sysTime)) {
-            Logger.warning(MYLOG, "::%s:: NTP sync failed. setup will proceed with invalid time.", __func__);
+            Logger.warning(MYLOG, "::%s:: NTP sync failed. setup will proceed with invalid time.", string(__func__).substr(0, 5).c_str());
         }
     }
     
@@ -405,9 +410,9 @@ void setup()
     int state = radio.begin();
 
     if (state == RADIOLIB_ERR_NONE) {
-        Logger.info(MYLOG, "::%s:: [%s]: Radio Initializing ... success!", __func__, RADIO_TYPE_STR);
+        Logger.info(MYLOG, "::%s:: [%s]: Radio Initializing ... success!", string(__func__).substr(0, 5).c_str(), RADIO_TYPE_STR);
     } else {
-        Logger.error(MYLOG, "::%s:: [%s]: Radio Initializing ... failed, code %d", __func__, RADIO_TYPE_STR, state);
+        Logger.error(MYLOG, "::%s:: [%s]: Radio Initializing ... failed, code %d", string(__func__).substr(0, 5).c_str(), RADIO_TYPE_STR, state);
         while (true);
     }
 
@@ -426,10 +431,10 @@ void setup()
     int configErrors = 0;
 
     if (radio.setFrequency(CONFIG_RADIO_FREQ) == RADIOLIB_ERR_INVALID_FREQUENCY) {
-        Logger.error(MYLOG, "::%s:: Selected frequency is invalid for this module!", __func__);
+        Logger.error(MYLOG, "::%s:: Selected frequency is invalid for this module!", string(__func__).substr(0, 5).c_str());
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: Freq: %.1f MHz OK", __func__, CONFIG_RADIO_FREQ);
+        Logger.info(MYLOG, "::%s:: Freq: %.1f MHz OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_FREQ);
     }
 
     /*
@@ -440,10 +445,10 @@ void setup()
     *   LR1121        : Allowed values are 62.5, 125.0, 250.0 and 500.0 kHz.
     * * * */
     if (radio.setBandwidth(CONFIG_RADIO_BW) == RADIOLIB_ERR_INVALID_BANDWIDTH) {
-        Logger.error(MYLOG, "::%s:: Selected bandwidth is invalid for this module!", __func__);
+        Logger.error(MYLOG, "::%s:: Selected bandwidth is invalid for this module!", string(__func__).substr(0, 5).c_str());
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: BW: %.1f kHz OK", __func__, CONFIG_RADIO_BW);
+        Logger.info(MYLOG, "::%s:: BW: %.1f kHz OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_BW);
     }
 
 
@@ -455,10 +460,10 @@ void setup()
     * LR1121        :  Allowed values range from 5 to 12.
     * * * */
     if (radio.setSpreadingFactor(9) == RADIOLIB_ERR_INVALID_SPREADING_FACTOR) {
-        Logger.error(MYLOG, "::%s:: Selected spreading factor is invalid for this module!", __func__);
+        Logger.error(MYLOG, "::%s:: Selected spreading factor is invalid for this module!", string(__func__).substr(0, 5).c_str());
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: SF: 9 OK", __func__);
+        Logger.info(MYLOG, "::%s:: SF: 9 OK", string(__func__).substr(0, 5).c_str());
     }
 
     /*
@@ -468,10 +473,10 @@ void setup()
     * LR1121        :  Allowed values range from 5 to 8.
     * * * */
     if (radio.setCodingRate(5) == RADIOLIB_ERR_INVALID_CODING_RATE) {
-        Logger.error(MYLOG, "::%s:: Selected coding rate is invalid for this module!", __func__);
+        Logger.error(MYLOG, "::%s:: Selected coding rate is invalid for this module!", string(__func__).substr(0, 5).c_str());
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: CR: 4/5 OK", __func__);
+        Logger.info(MYLOG, "::%s:: CR: 4/5 OK", string(__func__).substr(0, 5).c_str());
     }
 
     /*
@@ -479,10 +484,10 @@ void setup()
     * SX1278/SX1276/SX1268/SX1262/SX1280 : Sets LoRa sync word. Only available in LoRa mode.
     * * */
     if (radio.setSyncWord(0xAB) != RADIOLIB_ERR_NONE) {
-        Logger.error(MYLOG, "::%s:: Unable to set sync word!", __func__);
+        Logger.error(MYLOG, "::%s:: Unable to set sync word!", string(__func__).substr(0, 5).c_str());
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: SW: 0xAB OK", __func__);
+        Logger.info(MYLOG, "::%s:: SW: 0xAB OK", string(__func__).substr(0, 5).c_str());
     }
 
     /*
@@ -494,10 +499,10 @@ void setup()
     * LR1121        :  Allowed values are in range from -17 to 22 dBm (high-power PA) or -18 to 13 dBm (High-frequency PA), PA Version range : -9 ~ 0dBm
     * * * */
     if (radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER) == RADIOLIB_ERR_INVALID_OUTPUT_POWER) {
-        Logger.error(MYLOG, "::%s:: Selected output power is invalid for this module!", __func__);
+        Logger.error(MYLOG, "::%s:: Selected output power is invalid for this module!", string(__func__).substr(0, 5).c_str());
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: TX Power: %ddBm OK", __func__, CONFIG_RADIO_OUTPUT_POWER);
+        Logger.info(MYLOG, "::%s:: TX Power: %ddBm OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_OUTPUT_POWER);
     }
 
 #if !defined(USING_SX1280) && !defined(USING_LR1121) && !defined(USING_SX1280PA)
@@ -508,10 +513,10 @@ void setup()
     * NOTE: set value to 0 to disable overcurrent protection
     * * * */
     if (radio.setCurrentLimit(140) == RADIOLIB_ERR_INVALID_CURRENT_LIMIT) {
-        Logger.error(MYLOG, "::%s:: Selected current limit is invalid for this module!", __func__);
+        Logger.error(MYLOG, "::%s:: Selected current limit is invalid for this module!", string(__func__).substr(0, 5).c_str());
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: Current Limit: 140 mA OK", __func__);
+        Logger.info(MYLOG, "::%s:: Current Limit: 140 mA OK", string(__func__).substr(0, 5).c_str());
     }
 #endif
 
@@ -530,10 +535,10 @@ void setup()
 
     // Enables or disables CRC check of received packets.
     if (radio.setCRC(true) == RADIOLIB_ERR_INVALID_CRC_CONFIGURATION) {
-        Logger.error(MYLOG, "::%s:: Selected CRC configuration is invalid for this module!", __func__);
+        Logger.error(MYLOG, "::%s:: Selected CRC configuration is invalid for this module!", string(__func__).substr(0, 5).c_str());
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: CRC: Enabled OK", __func__);
+        Logger.info(MYLOG, "::%s:: CRC: Enabled OK", string(__func__).substr(0, 5).c_str());
     }
 
     // ============================================================================
@@ -541,11 +546,11 @@ void setup()
     // ============================================================================
     
     if (configErrors > 0) {
-        Logger.warning(MYLOG, "::%s:: Radio configuration completed with %d error(s).", __func__, configErrors);
-        Logger.warning(MYLOG, "::%s:: The radio may still function, but some parameters were not set correctly.", __func__);
-        Logger.warning(MYLOG, "::%s:: Please check hardware connections and power supply stability.", __func__);
+        Logger.warning(MYLOG, "::%s:: Radio configuration completed with %d error(s).", string(__func__).substr(0, 5).c_str(), configErrors);
+        Logger.warning(MYLOG, "::%s:: The radio may still function, but some parameters were not set correctly.", string(__func__).substr(0, 5).c_str());
+        Logger.warning(MYLOG, "::%s:: Please check hardware connections and power supply stability.", string(__func__).substr(0, 5).c_str());
     } else {
-        Logger.info(MYLOG, "::%s:: All radio parameters configured successfully!", __func__);
+        Logger.info(MYLOG, "::%s:: All radio parameters configured successfully!", string(__func__).substr(0, 5).c_str());
     }
 
     // Delay to allow radio internal circuits to stabilize after configuration
@@ -554,14 +559,14 @@ void setup()
 #if  defined(USING_LR1121)
 #if defined(USING_LR1121PA)
     if (CONFIG_RADIO_FREQ < 2400) {
-        Logger.info(MYLOG, "::%s:: LR1121 PA Version Using low frequency switch table for PA version", __func__);
+        Logger.info(MYLOG, "::%s:: LR1121 PA Version Using low frequency switch table for PA version", string(__func__).substr(0, 5).c_str());
         radio.setRfSwitchTable(pa_version_rf_switch_dio_pins, low_freq_switch_table);
     } else {
-        Logger.info(MYLOG, "::%s:: LR1121 PA Version Using high frequency switch table for PA version", __func__);
+        Logger.info(MYLOG, "::%s:: LR1121 PA Version Using high frequency switch table for PA version", string(__func__).substr(0, 5).c_str());
         radio.setRfSwitchTable(pa_version_rf_switch_dio_pins, high_freq_switch_table);
     }
 #else   //  Version without PA rf switch table
-    Logger.info(MYLOG, "::%s:: LR1121 without PA Version", __func__);
+    Logger.info(MYLOG, "::%s:: LR1121 without PA Version", string(__func__).substr(0, 5).c_str());
     static const uint32_t rfswitch_dio_pins[] = {
         RADIOLIB_LR11X0_DIO5, RADIOLIB_LR11X0_DIO6,
         RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC
@@ -592,7 +597,7 @@ void setup()
     // NOTE: As long as DIO2 is configured to control RF switch,
     //       it can't be used as interrupt pin!
     if (radio.setDio2AsRfSwitch() != RADIOLIB_ERR_NONE) {
-        Logger.error(MYLOG, "::%s:: Failed to set DIO2 as RF switch!", __func__);
+        Logger.error(MYLOG, "::%s:: Failed to set DIO2 as RF switch!", string(__func__).substr(0, 5).c_str());
         while (true);
     }
 #endif //USING_SX1262
@@ -620,7 +625,7 @@ void setup()
 #endif
 
 #ifdef RADIO_CTRL
-    Logger.info(MYLOG, "::%s:: Turn on LAN, Enter Rx mode.", __func__);
+    Logger.info(MYLOG, "::%s:: Turn on LAN, Enter Rx mode.", string(__func__).substr(0, 5).c_str());
     /*
     * 2W and BPF LoRa LAN Control ,set HIGH turn on LAN ,RX Mode
     * */
@@ -632,9 +637,9 @@ void setup()
     // start listening for LoRa packets
     state = radio.startReceive();
     if (state == RADIOLIB_ERR_NONE) {
-        Logger.info(MYLOG, "::%s:: Radio started listening successfully!", __func__);
+        Logger.info(MYLOG, "::%s:: Radio started listening successfully!", string(__func__).substr(0, 5).c_str());
     } else {
-        Logger.error(MYLOG, "::%s:: Radio start listening failed, code %d", __func__, state);
+        Logger.error(MYLOG, "::%s:: Radio start listening failed, code %d", string(__func__).substr(0, 5).c_str(), state);
     }
 
     drawMain();
@@ -647,22 +652,22 @@ void loop()
     
     if (isWifiConnected) {
         if (!wasWifiConnected) {
-            Logger.info(MYLOG, "::%s:: WiFi connected. Device IP: %s", __func__, WiFi.localIP().toString().c_str());
+            Logger.info(MYLOG, "::%s:: WiFi connected. Device IP: %s", string(__func__).substr(0, 5).c_str(), WiFi.localIP().toString().c_str());
             wasWifiConnected = true;
         }
         if (!mqttClient.connected()) {
-            reconnectMqtt();
+            mqttConnect();
         }
         mqttClient.loop();
     } else {
         if (wasWifiConnected) {
-            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting..", __func__, getWifiStatusString(WiFi.status()));
+            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting..", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
             wasWifiConnected = false;
         }
         // Attempt WiFi reconnection in the background
         
         if (millis() - lastWifiReconnectAttempt > WIFI_RECONNECT_DELAY_MS) {
-            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting...", __func__, getWifiStatusString(WiFi.status()));
+            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting...", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
             WiFi.reconnect();
             lastWifiReconnectAttempt = millis();
         }
@@ -673,10 +678,10 @@ void loop()
         time_t now;
         time(&now);
         if (!isClockValid(now)) {
-            Logger.warning(MYLOG, "::%s:: Time invalid, NTP syncing...", __func__);
+            Logger.warning(MYLOG, "::%s:: Time invalid, NTP syncing...", string(__func__).substr(0, 5).c_str());
             configureSystemTime(); // Ensure SNTP is configured if not already
         } else {
-            Logger.info(MYLOG, "::%s:: Time synced via NTP.", __func__);
+            Logger.info(MYLOG, "::%s:: Time synced via NTP.", string(__func__).substr(0, 5).c_str());
         }
         lastNtpCheck = millis();
 }
@@ -689,7 +694,7 @@ void loop()
         
         // Memory safety: Validate packet length against buffer size
         if (numBytes <= 0 || numBytes > sizeof(byteArr)) {
-            Logger.warning(MYLOG, "::%s:: Invalid packet length from radio: %d bytes", __func__, numBytes);
+            Logger.warning(MYLOG, "::%s:: Invalid packet length from radio: %d bytes", string(__func__).substr(0, 5).c_str(), numBytes);
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
             continue; // Skip to next semaphore check in loop
@@ -727,7 +732,7 @@ void loop()
 
                 if (!hasValidRtcTime) {
                     if (!refreshRtcTrustFromSystemClock()){
-                        Logger.warning(MYLOG, "::%s:: Unable to Sync time from NTP server. Update Beacon will be dropped.", __func__);
+                        Logger.warning(MYLOG, "::%s:: Unable to Sync time from NTP server. Update Beacon will be dropped.", string(__func__).substr(0, 5).c_str());
                     } 
                 } 
 
@@ -751,9 +756,9 @@ void loop()
                         if (txState == RADIOLIB_ERR_NONE) {
                             xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(5000)); // Block until TX finishes
                             Logger.info(MYLOG, "::%s:: Config Sent -> Sleep: %u | DevMode: %u | TimeOffset: %lu",
-                                                      __func__, txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
+                                                      string(__func__).substr(0, 5).c_str(), txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
                         } else {
-                            Logger.error(MYLOG, "::%s:: Config startTransmit failed, code %d", __func__, txState);
+                            Logger.error(MYLOG, "::%s:: Config startTransmit failed, code %d", string(__func__).substr(0, 5).c_str(), txState);
                         }
                     }
                 }
@@ -782,9 +787,9 @@ void loop()
                         rxPayload.mac[3], rxPayload.mac[4], rxPayload.mac[5]);
                 lastMac = String(macStr);
                 
-                Logger.info(MYLOG, "::%s:: Radio Received packet! MAC: %s | Msg: %u", __func__, macStr, msgCount);
+                Logger.info(MYLOG, "::%s:: Radio Received packet! MAC: %s | Msg: %u", string(__func__).substr(0, 5).c_str(), macStr, msgCount);
                 Logger.info(MYLOG, "::%s:: Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s", 
-                              __func__, lastTemp, lastVcc, lastBatt, (unsigned long)lastSensorSleepInterval, 
+                              string(__func__).substr(0, 5).c_str(), lastTemp, lastVcc, lastBatt, (unsigned long)lastSensorSleepInterval, 
                               lastSensorIsDevMode, lastSensorNeedsTimeSync ? "yes" : "no");
 
                 lastHasDevTelemetry = (numBytes == sizeof(TelemetryPayload));
@@ -797,18 +802,18 @@ void loop()
                     lastSensorSNR = rxPayload.lastSNR;
                     lastSensorRSSI = rxPayload.lastRSSI;
                     Logger.debug(MYLOG, "::%s:: DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm", 
-                                  __func__, lastCpuTemp, lastFreeRam, lastBattCurrent, lastBattPower, lastTxPower, lastSensorSNR, lastSensorRSSI);
+                                  string(__func__).substr(0, 5).c_str(), lastCpuTemp, lastFreeRam, lastBattCurrent, lastBattPower, lastTxPower, lastSensorSNR, lastSensorRSSI);
                 }
 
                 if (updatePending) {
-                     Logger.info(MYLOG, "::%s:: Config Sent -> Sleep: %u | DevMode: %u | TimeOffset: %lu", __func__,
+                     Logger.info(MYLOG, "::%s:: Config Sent -> Sleep: %u | DevMode: %u | TimeOffset: %lu", string(__func__).substr(0, 5).c_str(),
                                           txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
                 } else {
-                     Logger.debug(MYLOG, "::%s:: No config or time update pending.", __func__);
+                     Logger.debug(MYLOG, "::%s:: No config or time update pending.", string(__func__).substr(0, 5).c_str());
                 }
 
                 if (mqttClient.connected()) {
-                    publishMqtt(rxPayload, lastMac, lastHasDevTelemetry);
+                    mqttPublish(rxPayload, lastMac, lastHasDevTelemetry);
                 }
 
                 screenNum = 0; // Force switch to data screen on new packet
@@ -816,19 +821,19 @@ void loop()
                 drawMain();
 
             } else {
-                Logger.warning(MYLOG, "::%s:: Received unknown packet of %d bytes", __func__, numBytes);
+                Logger.warning(MYLOG, "::%s:: Received unknown packet of %d bytes", string(__func__).substr(0, 5).c_str(), numBytes);
                 xSemaphoreTake(radioSemaphore, 0);
                 radio.startReceive();
             }
 
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
             // packet was received, but is malformed
-            Logger.error(MYLOG, "::%s:: CRC error!", __func__);
+            Logger.error(MYLOG, "::%s:: CRC error!", string(__func__).substr(0, 5).c_str());
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
         } else {
             // some other error occurred
-            Logger.error(MYLOG, "::%s:: Receive failed, code %d", __func__, state);
+            Logger.error(MYLOG, "::%s:: Receive failed, code %d", string(__func__).substr(0, 5).c_str(), state);
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
         }
@@ -843,40 +848,33 @@ void loop()
     }
 }
 
-void reconnectMqtt() {
+void mqttConnect() {
     if (!mqttClient.connected()) {
         long now = millis();
         if (now - lastMqttReconnectAttempt > 5000) {
             lastMqttReconnectAttempt = now;
             // Attempt to reconnect
-            Logger.info(MYLOG, "::%s:: Attempting MQTT connection...", __func__);
+            Logger.info(MYLOG, "::%s:: Attempting MQTT connection...", string(__func__).substr(0, 5).c_str());
             String clientId = WIFI_HOSTNAME;
             clientId += String(random(0xffff), HEX);
             if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
-                Logger.info(MYLOG, "::%s:: MQTT connected", __func__);
+                Logger.info(MYLOG, "::%s:: MQTT connected", string(__func__).substr(0, 5).c_str());
             } else {
-                Logger.error(MYLOG, "::%s:: MQTT connection failed, rc=%d try again in 5 seconds", __func__, mqttClient.state());
+                Logger.error(MYLOG, "::%s:: MQTT connection failed, rc=%d try again in 5 seconds", string(__func__).substr(0, 5).c_str(), mqttClient.state());
             }
         }
     }
 }
 
-void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
+void mqttPublish(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
 #if ARDUINOJSON_VERSION_MAJOR >= 7
     JsonDocument doc;
 #else
-    StaticJsonDocument<512> doc;  // Reduced from 512 to 256 bytes
+    StaticJsonDocument<512> doc;  // Fixed size buffer
 #endif
 
-    // SECURITY: Remove colons from MAC address for MQTT topic to prevent path traversal attacks
-    // e.g., "AA:BB:CC:DD:EE:FF" -> "AABBCCDDEEFF"
-    String safeMac = "";
-    for (size_t i = 0; i < macStr.length(); i++) {
-        if (macStr.charAt(i) != ':') {
-            safeMac += macStr.charAt(i);
-        }
-    }
-    doc["mac"] = macStr;  // Keep original format in JSON payload
+    // Populate JSON payload
+    doc["mac"] = macStr;
     doc["msgCount"] = payload.msgCount;
     
     time_t sysTime;
@@ -903,82 +901,30 @@ void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
         doc["cpuTemp"] = payload.cpuTemp;
         doc["txPower"] = payload.txPower;
         doc["sensorSnr"] = payload.lastSNR;
-        doc["rssi"] = payload.lastRSSI;  // Fixed: use 'lastRSSI' field from TelemetryPayload
+        doc["rssi"] = payload.lastRSSI;
     }
 
-    // For ArduinoJson V6, we need to estimate size differently since Fpprintf isn't available
-    // We'll try publishing and fall back to truncation if it fails due to buffer overflow
+    // Serialize to buffer - ArduinoJson handles size estimation internally
     char jsonBuffer[512];
+    serializeJson(doc, jsonBuffer);
     
-#if ARDUINOJSON_VERSION_MAJOR >= 7
-    serializeJson(doc, jsonBuffer);
-#else
-    serializeJson(doc, jsonBuffer);
-#endif
-
-    size_t bufferSize = sizeof(jsonBuffer);
-    // ArduinoJson V6 serializeJson returns number of bytes written (or -1 on error)
     int bytesWritten = serializeJson(doc, jsonBuffer);
-    
-    Logger.debug(MYLOG, "::%s:: MQTT Publish: Buffer size=%zu, Bytes written=%d", __func__, bufferSize, bytesWritten);
+    Logger.debug(MYLOG, "::%s:: MQTT: Buffer=%zu, Written=%d", string(__func__).substr(0, 5).c_str(), sizeof(jsonBuffer), bytesWritten);
 
-    // If serialization failed or buffer was truncated, truncate dev telemetry and retry
-    bool needsTruncation = (bytesWritten < 0 || bytesWritten > (int)bufferSize - 10);
-    
-    if (needsTruncation) {
-        Logger.warning(MYLOG, "::%s:: MQTT: JSON too large! Truncating dev telemetry...", __func__);
-        
-#if ARDUINOJSON_VERSION_MAJOR >= 7
-        doc.remove("battCurrent");
-        doc.remove("battPower");
-        doc.remove("freeRam");
-        doc.remove("cpuTemp");
-        doc.remove("txPower");
-        doc.remove("sensorSnr");
-        doc.remove("rssi");
-#else
-        // Remove dev telemetry fields from StaticJsonDocument V6
-        doc.remove("battCurrent");
-        doc.remove("battPower");
-        doc.remove("freeRam");
-        doc.remove("cpuTemp");
-        doc.remove("txPower");
-        doc.remove("sensorSnr");
-        doc.remove("rssi");
-#endif
-        
-        // Retry with truncated payload
-        bytesWritten = serializeJson(doc, jsonBuffer);
-        Logger.debug(MYLOG, "::%s:: MQTT: Truncated to %d bytes", __func__, bytesWritten);
-    }
-
-        // Retry loop with backoff delay (max 5 retries)
-    int retryCount = 0;
-    bool published = false;
-    
-    while (!published && retryCount < MAX_RECONNECT_ATTEMPTS) {
-        // The MQTT topic is generated dynamically here using the configured prefix and the sensor's MAC address.
-        // Format: lora_gateway/<sensor_mac_address>/telemetry
+    // Simple retry loop - let main loop() handle delays via mqttClient.loop()
+    for (int i = 0; i < MAX_RECONNECT_ATTEMPTS; i++) {
         String topic = String(MQTT_TOPIC_PREFIX) + "/" + macStr + "/telemetry";
         
         if (mqttClient.publish(topic.c_str(), jsonBuffer)) {
-            Logger.info(MYLOG, "::%s:: MQTT message published successfully.", __func__);
-            published = true;
-            break;  // Exit loop on success
-        } else {
-            retryCount++;
-            Logger.warning(MYLOG, "::%s:: MQTT: Publish attempt %d/%d failed", __func__, retryCount, MAX_RECONNECT_ATTEMPTS);
-            
-            if (retryCount < MAX_RECONNECT_ATTEMPTS) {
-                // Let the main loop() handle the delay naturally by calling mqttClient.loop()
-                // This avoids double-looping and busy-waiting issues
-            }
+            Logger.info(MYLOG, "::%s:: MQTT published successfully.", string(__func__).substr(0, 5).c_str());
+            return;  // Success - exit function
+        } else {    
+            Logger.warning(MYLOG, "::%s:: MQTT publish failed, retry %d..", string(__func__).substr(0, 5).c_str(), MAX_RECONNECT_ATTEMPTS);
+
         }
     }
 
-    if (!published) {
-        Logger.error(MYLOG, "::%s:: MQTT: All %d attempts failed!", __func__, MAX_RECONNECT_ATTEMPTS);
-    }
+    Logger.error(MYLOG, "::%s:: MQTT all %d attempts failed!", string(__func__).substr(0, 5).c_str(), MAX_RECONNECT_ATTEMPTS);
 }
 
 void drawMain()
