@@ -17,7 +17,7 @@
 #include <time.h>
 #include <math.h>
 #include <mbedtls/aes.h>
-#include <payloads.h>
+#include <LoRaHomeCommon.h>
 #include <LoRaBoards.h>
 
 // Pin definitions

@@ -47,3 +47,17 @@
 - Removed redundant function name injection (`[%s]`, `__func__`) from `ESP_LOG` statements.
 - Formatted human-readable date strings into the MQTT telemetry payload if the hardware clock is synced.
 - Prepended local datetime stamps to all asynchronous `esp_log` outputs (UART and SD card) when the clock is valid.
+- Cleaned up `LoRaHomeCommon.h` by removing duplicate struct fields, fixing macro syntax, and making header functions `inline` to prevent linker errors.
+- Implemented missing `mqttConnect()` logic, fixed multiple compiler errors in `Gateway/main.cpp` related to JSON and MQTT publishing, and redefined `GATEWAY_STATUS` to hold proper status metrics rather than mirroring configuration payloads.
+- Refactored `jsonBuild()` to accept a generic `void*` payload pointer, allowing it to serialize any of the packed structs (`TelemetryPayload`, `ConfigPayload`, `GatewayStatus`) dynamically based on the mode string.
+- Fixed ArduinoJson const-correctness compiler error (`JsonArray` vs `JsonArrayConst`) in `deserializeJson` and refactored the function to take a generic `void*` payload pointer to match `jsonBuild`.
+- Fixed macro variable shadowing in `FROM_JSON_ARRAY` where the `size` argument incorrectly replaced the `size()` method of ArduinoJson arrays.
+- Fixed remaining `JsonVariantConst` const-correctness errors in `FROM_JSON_ARRAY` macro by changing `is<JsonArray>()` to `is<JsonArrayConst>()`.
+- Introduced `STRING` macro to properly serialize character arrays (`wifiStatus`, `ip`, `header`) as native JSON strings rather than JSON arrays, fixing the ArduinoJson compilation error when casting to `char`.
+- Optimized `jsonBuild()` timestamp caching by removing the redundant `lastTime` check, preventing heavy `time()` and `strcpy()` calls from executing on every invocation when NTP is unsynced.
+- Updated `jsonBuild()` to always serialize the hardware RTC time, allowing NTP sync failures to be immediately visible in the JSON payload (defaulting to 1970 dates) instead of returning "unset".
+- Simplified `jsonBuild()` timestamp generation to use a standard Unix epoch integer, removing all string formatting and caching for maximum efficiency and simplicity.
+- Fixed `mqttTopic()` function to return a `String` rather than discarding locally scoped variables, making it useful for dynamic MQTT topic generation.
+- Added null pointer safeguard for the `mode` parameter in `jsonBuild()` to prevent potential ESP32 crash loops.
+- Fixed `mqttPublish` calls in the Gateway `loop()` to properly use `.c_str()` with the generated `String` topics from `mqttTopic()` and cleaned up legacy hardcoded topic strings.
+- Fixed undefined `getLocalTimeFromUtc` function call in `drawMain()` by using standard `localtime_r` to properly format the local time based on the configured TZ_INFO.
