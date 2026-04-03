@@ -192,9 +192,8 @@ struct SensorData {
 struct Config {
   uint32_t magicWord;
   uint32_t sleepInterval; // seconds
-  uint8_t configVersion;
   uint8_t isDevMode; // Remote dev mode flag (0=false, 1=true)
-} config = {RTC_MAGIC_WORD, 20, 0, 0}; // Default 20 seconds
+} config = {RTC_MAGIC_WORD, 20, 0}; // Default 20 seconds
 
 // RTC memory for config persistence
 RTC_NOINIT_ATTR Config rtcConfig; // NOINIT ensures it survives SW_CPU_RESET (ESP.restart)
@@ -282,24 +281,27 @@ void setup()
     // Load config from RTC memory first to evaluate remote dev mode
     config = rtcConfig;
 
-    if (serialEnabled) {
-        Serial.printf("Boot rtcConfig : %u sleep=%u, devMode=%d\n",
-                      rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode);
-    }
+
     
     // Validate RTC memory using the magic word and basic bounds checking
     if (config.magicWord != RTC_MAGIC_WORD || config.sleepInterval < 10 || config.sleepInterval > 86400) {
         config.magicWord = RTC_MAGIC_WORD;
+        // TO DO - configure defauls centrally
         config.sleepInterval = 60;
-        config.configVersion = 0;
         config.isDevMode = 0;
         rtcConfig = config; // Initialize RTC memory with defaults on cold boot
+        if (serialEnabled) {
+            Serial.printf("invalid rtcConfig, reinitialising to defaults: %u sleep=%u, devMode=%d\n",
+                          rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode); 
+        }
+    } else{
+            if (serialEnabled) {
+                Serial.printf("Boot rtcConfig is valid : %u sleep=%u, devMode=%d\n",
+                                rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode);
+            }
     }
 
-    if (serialEnabled) {
-        Serial.printf("validated rtcConfig : %u sleep=%u, devMode=%d\n",
-                      rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode); 
-    }
+
 
     // Check dev mode (hardware pin OR remote config)
     devMode = (digitalRead(DEV_MODE_PIN) == LOW) || (config.isDevMode != 0);
@@ -526,7 +528,6 @@ void readSensors()
 void transmitData()
 {
     // Prepare binary payload
-    ConfigPayload config;
     TelemetryPayload txPayload;
     esp_efuse_mac_get_default(txPayload.mac);
     txPayload.msgCount = ++counter;
@@ -744,20 +745,22 @@ bool listenForConfig()
 
                         if (serialEnabled) {
                             Serial.printf("received config: sleep=%u, devMode=%d\n",
-                                              config.sleepInterval, config.isDevMode);
+                                              rxConfig.sleepInterval, rxConfig.isDevMode);
                         }
 
                         rtcConfig = config; // Save to RTC
+                        if (serialEnabled) {
+                                Serial.printf("Config applied: sleep=%u, devMode=%d\n",
+                                               rtcConfig.sleepInterval, rtcConfig.isDevMode);
+                            }
 
                         bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || (config.isDevMode != 0);
                         if (devMode != cfgMode) {
                             needsRestart = true;
-                        } else  {
                             if (serialEnabled) {
-                                Serial.printf("Config updated: sleep=%u, devMode=%d\n",
-                                              config.sleepInterval, config.isDevMode);
+                                Serial.printf("Soft restart triggered to apply %s mode.", (rxConfig.isDevMode ==1 ) ? "DEV" : "OP");
                             }
-                        }
+                        } 
                         configReceived = true;
                         wakeCycleCount = 0; // Reset wakecycle
 
