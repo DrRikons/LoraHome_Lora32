@@ -39,6 +39,8 @@
 
 *Note: This file is intended to provide a condensed context for AI coding assistants. Keep it updated alongside major structural changes.*
 ## Recent Changes
+- Enhanced NTP validation in Gateway with boot-time drift detection and WiFi status check in `isClockValid()` to distinguish true NTP sync from Logger.provideTime() epoch.
+## Recent Changes
 - Fixed ESP32 compilation errors in `modes/GateWay/main.cpp`.
 - Replaced deprecated `ICACHE_RAM_ATTR` with `IRAM_ATTR` for ESP32.
 - Handled NTP synchronization validation without relying on the non-standard `timeSync()` function.
