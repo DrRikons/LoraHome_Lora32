@@ -1,138 +1,195 @@
-#ifndef LORA_HOME_COMMON_H
-#define LORA_HOME_COMMON_H
+#pragma once
 
-#include <RadioLib.h>
-#include <LoRaBoards.h>
-#include <mbedtls/aes.h>
-#include <time.h>
-#include <math.h>
+#ifndef LORAHOMECOMMON_H
+#define LORAHOMECOMMON_H
 
-// Shared secret key for Gateway-to-Sensor config authentication
-#define NETWORK_KEY 0x3FA4B2C1
-
-// 16-Byte Shared secret key for AES-128 encryption
-static const uint8_t AES_NETWORK_KEY[16] = {
-    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
-    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
-};
+#include <Arduino.h> // For uint8_t, uint16_t, etc.
+#include <ArduinoJson.h>
+#include <stdint.h>
 
 // Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
 #define CUSTOM_EPOCH 1704067200UL
+// Shared secret key for Gateway-to-Sensor config authentication
+#define NETWORK_KEY 0x3FA4B2C1
 
-// Function Prototypes
-void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount);
-bool initRadio();
+constexpr uint8_t CONFIG_UPDATE_PENDING_FLAG = 0xA5;
 
-inline bool isClockValid(time_t currentTime) {
-    return currentTime > (time_t)CUSTOM_EPOCH;
+// // Packed binary structure for highly efficient LoRa transmission
+// struct __attribute__((packed)) TelemetryPayload {
+//   // --- Core variables (16 bytes, always sent) ---
+//   uint8_t  mac[6];       // 6 bytes: Raw MAC address
+//   uint16_t msgCount;     // 2 bytes: Message counter (cycles at 65535)
+//   int16_t  temperature;  // 2 bytes: External Temp (x 100)
+//   uint16_t battVoltage;  // 2 bytes: Battery Voltage in mV (x 1000)
+//   uint8_t  battPercent;  // 1 byte:  Battery capacity (0-100%)
+//   uint8_t  isDevMode;    // 1 byte:  0=Op, 1=Dev
+//   uint8_t  needsTimeSync; // 1 byte:  0=clock OK, 1=clock unset/needs sync
+//   uint8_t  sleepInterval; // 1 byte: Applied sleep interval in seconds
+
+//   // --- Dev mode variables (11 bytes, conditionally sent) ---
+//   int16_t  battCurrent;  // 2 bytes: Battery Current in mA
+//   int16_t  battPower;    // 2 bytes: Battery Power in mW
+//   uint16_t freeRam;      // 2 bytes: Free RAM in KB
+//   int8_t   cpuTemp;      // 1 byte:  CPU Temp in C
+//   int8_t   txPower;      // 1 byte:  TX Power in dBm
+//   int8_t   lastSNR;      // 1 byte:  Last received SNR
+//   int16_t  lastRSSI;     // 2 bytes: Last received RSSI
+// };
+
+// // Packed binary structure for received configuration payloads (18 bytes)
+// struct __attribute__((packed)) ConfigPayload {
+//   char     header[2];      // 2 bytes: "CF" identifier to reject noise
+//   uint8_t  targetMac[6];   // 6 bytes: Target MAC address (or FF:FF:FF:FF:FF:FF for broadcast)
+//   uint32_t networkKey;     // 4 bytes: Shared secret key to prevent unauthorized spoofing
+//   uint8_t  sleepInterval;  // 1 byte: Sleep interval in seconds
+//   uint8_t  isDevMode;      // 1 byte:  0 = OP Mode, 1 = Dev Mode
+//   uint32_t timeOffset;     // 4 bytes: UTC seconds since CUSTOM_EPOCH
+// };
+
+// Macro Signature: 
+// FIELD(type, name, json_key)
+// ARRAY(type, name, size, json_key)
+// STRING(name, max_len, json_key)
+
+#define TELEMETRY_CORE_FIELDS(FIELD, ARRAY, STRING) \
+    ARRAY(uint8_t,  mac, 6, "mac") \
+    FIELD(uint16_t, msgCount, "msgCount") \
+    FIELD(int16_t,  temperature, "temperature") \
+    FIELD(uint16_t, battVoltage, "battVoltage") \
+    FIELD(uint8_t,  battPercent, "battPercent") \
+    FIELD(uint8_t,  isDevMode, "isDevMode") \
+    FIELD(uint8_t,  needsTimeSync, "needsTimeSync") \
+    FIELD(uint8_t,  sleepInterval, "sleepInterval")
+
+#define TELEMETRY_DEV_FIELDS(FIELD, ARRAY, STRING) \
+    FIELD(int16_t,  battCurrent, "battCurrent") \
+    FIELD(int16_t,  battPower, "battPower") \
+    FIELD(uint16_t, freeRam, "freeRam") \
+    FIELD(int8_t,   cpuTemp, "cpuTemp") \
+    FIELD(int8_t,   txPower, "txPower") \
+    FIELD(int8_t,   lastSNR, "lastSNR") \
+    FIELD(int16_t,  lastRSSI, "lastRSSI")
+
+#define CONFIG_PAYLOAD(FIELD, ARRAY, STRING) \
+   STRING(header, 2, "header") \
+   ARRAY(uint8_t,  targetMac, 6, "targetMac") \
+   FIELD(uint32_t, networkKey, "networkKey") \
+   FIELD(uint8_t,  sleepInterval, "sleepInterval") \
+   FIELD(uint8_t,  isDevMode, "isDevMode") \
+   FIELD(uint32_t, timeOffset, "timeOffset")
+
+#define GATEWAY_STATUS(FIELD, ARRAY, STRING) \
+   FIELD(int16_t,  gatewayRssi, "gatewayRssi") \
+   FIELD(float,    gatewaySnr, "gatewaySnr") \
+   STRING(wifiStatus, 20, "wifiStatus") \
+   STRING(ip, 16, "ip") \
+   FIELD(uint32_t, freeRam, "freeRam")
+
+// Define how to declare a variable inside the struct
+#define DECLARE_FIELD(type, name, json_key) type name;
+#define DECLARE_ARRAY(type, name, size, json_key) type name[size];
+#define DECLARE_STRING(name, size, json_key) char name[size];
+
+struct __attribute__((packed)) TelemetryPayload {
+    // --- Core variables ---
+    TELEMETRY_CORE_FIELDS(DECLARE_FIELD, DECLARE_ARRAY, DECLARE_STRING)
+    
+    // --- Dev mode variables ---
+    TELEMETRY_DEV_FIELDS(DECLARE_FIELD, DECLARE_ARRAY, DECLARE_STRING)
+
+};
+
+struct __attribute__((packed)) ConfigPayload {
+
+    // --- Config Payload ---
+    CONFIG_PAYLOAD(DECLARE_FIELD, DECLARE_ARRAY, DECLARE_STRING)
+
+};
+
+struct __attribute__((packed)) GatewayStatus {
+
+    // --- Config Payload ---
+    GATEWAY_STATUS(DECLARE_FIELD, DECLARE_ARRAY, DECLARE_STRING)
+
+};
+
+// ============================================================================
+// JSON Serialization Macros - MUST stay defined until after all uses!
+// ============================================================================
+
+// #define TO_JSON_FIELD(type, name, json_key) \
+//     doc[json_key] = payload.name;
+
+// #define TO_JSON_ARRAY(type, name, size, json_key) \
+//     { \
+//         JsonArray arr = doc[json_key].to<JsonArray>(); \
+//         for(int i = 0; i < size; i++) { arr.add(payload.name[i]); } \
+//     }
+
+// Safely extract a scalar: Only update if the key exists
+#define FROM_JSON_FIELD(type, name, json_key) \
+    if (doc.containsKey(json_key)) { \
+        payload.name = doc[json_key].as<type>(); \
+    }
+
+// Safely extract an array: Check type and enforce strict bounds limits
+#define FROM_JSON_ARRAY(type, name, max_len, json_key) \
+    if (doc.containsKey(json_key) && doc[json_key].is<JsonArrayConst>()) { \
+        JsonArrayConst arr = doc[json_key].as<JsonArrayConst>(); \
+        size_t itemsToCopy = (arr.size() < max_len) ? arr.size() : max_len; \
+        for(size_t i = 0; i < itemsToCopy; i++) { \
+            payload.name[i] = arr[i].as<type>(); \
+        } \
+    }
+
+#define FROM_JSON_STRING(name, max_len, json_key) \
+    if (doc.containsKey(json_key) && doc[json_key].is<const char*>()) { \
+        strncpy(payload.name, doc[json_key].as<const char*>(), max_len); \
+    }
+
+// ============================================================================
+// Generic Deserialization function - uses FROM_JSON_FIELD and FROM_JSON_ARRAY
+// ============================================================================
+ inline bool deserializeJson(void* rawPayload, const JsonDocument& doc, const char* mode) {
+    if (!rawPayload || !mode) return false;
+    
+    switch(mode[0]) {
+        case 'c': { // "core"
+            TelemetryPayload& payload = *static_cast<TelemetryPayload*>(rawPayload);
+            TELEMETRY_CORE_FIELDS(FROM_JSON_FIELD, FROM_JSON_ARRAY, FROM_JSON_STRING)
+            break;
+        }
+        case 'd': { // "dev"
+            TelemetryPayload& payload = *static_cast<TelemetryPayload*>(rawPayload);
+            TELEMETRY_DEV_FIELDS(FROM_JSON_FIELD, FROM_JSON_ARRAY, FROM_JSON_STRING)
+            break;
+        }
+        case 'g': { // "gatewayStatus"
+            GatewayStatus& payload = *static_cast<GatewayStatus*>(rawPayload);
+            GATEWAY_STATUS(FROM_JSON_FIELD, FROM_JSON_ARRAY, FROM_JSON_STRING)
+            break;
+        }
+        case 'p': { // "payloadConfig"
+            ConfigPayload& payload = *static_cast<ConfigPayload*>(rawPayload);
+            CONFIG_PAYLOAD(FROM_JSON_FIELD, FROM_JSON_ARRAY, FROM_JSON_STRING)
+            break;
+        }
+        default:
+            return false;
+    }
+    return true;
 }
 
-inline bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
-    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
-}
+// ============================================================================
+// CLEANUP - Remove all macros at END of file to prevent namespace pollution
+// ============================================================================
+#undef DECLARE_FIELD  
+#undef DECLARE_ARRAY  
+#undef DECLARE_STRING
+// #undef TO_JSON_FIELD
+// #undef TO_JSON_ARRAY
+#undef FROM_JSON_FIELD
+#undef FROM_JSON_ARRAY   
+#undef FROM_JSON_STRING
 
-#if     defined(USING_SX1276)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           868.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   17
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             125.0
-#endif
-extern SX1276 radio;
-
-#elif   defined(USING_SX1278)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           433.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   17
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             125.0
-#endif
-extern SX1278 radio;
-
-#elif   defined(USING_SX1262)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           850.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   22
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             125.0
-#endif
-extern SX1262 radio;
-
-#elif   defined(USING_SX1280)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           2400.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   13
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             203.125
-#endif
-extern SX1280 radio;
-
-#elif  defined(USING_SX1280PA)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           2400.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   3           // PA Version power range : -18 ~ 3dBm
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             203.125
-#endif
-extern SX1280 radio;
-
-#elif   defined(USING_SX1268)
-#ifndef CONFIG_RADIO_FREQ
-#define CONFIG_RADIO_FREQ           433.0
-#endif
-#ifndef CONFIG_RADIO_OUTPUT_POWER
-#define CONFIG_RADIO_OUTPUT_POWER   22
-#endif
-#ifndef CONFIG_RADIO_BW
-#define CONFIG_RADIO_BW             125.0
-#endif
-extern SX1268 radio;
-
-#elif   defined(USING_LR1121)
-
-/*
-* Important: LR1121 PA Version
-*
-* The 2.4G version does not have a power amplifier (PA). The permissible power setting is 13dBm.
-*
-* If it is a version with a built-in PA, please do not exceed 0dBm in the maximum power setting.
-* This is because a power amplifier has been added to the RF front-end; setting it to 0dBm will achieve an output power of 22dBm.
-* Setting it to more than 1dBm may damage the PA.
-*
-* */
-
-#define CONFIG_RADIO_FREQ           2450.0
-#define CONFIG_RADIO_OUTPUT_POWER   LILYGO_RADIO_2G4_TX_POWER_LIMIT
-#define CONFIG_RADIO_BW             125.0
-
-// The maximum power of LR1121 Sub 1G band can only be set to 22 dBm
-// #define CONFIG_RADIO_FREQ           868.0
-// #define CONFIG_RADIO_OUTPUT_POWER   22
-// #define CONFIG_RADIO_BW             125.0
-
-extern LR1121 radio;
-
-#ifdef USING_LR1121PA
-// LR1121 Version PA RF switch table
-extern const uint32_t pa_version_rf_switch_dio_pins[];
-extern const Module::RfSwitchMode_t high_freq_switch_table[];
-extern const Module::RfSwitchMode_t low_freq_switch_table[];
-#endif /*USING_LR1121PA*/
-#endif /*Radio define end*/
-
-#endif // LORA_HOME_COMMON_H
+#endif // LORAHOMECOMMON_H

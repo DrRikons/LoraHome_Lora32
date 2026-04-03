@@ -17,7 +17,7 @@
 #include <time.h>
 #include <math.h>
 #include <mbedtls/aes.h>
-#include <payloads.h>
+#include <LoRaHomeCommon.h>
 #include <LoRaBoards.h>
 
 // Pin definitions
@@ -433,14 +433,21 @@ void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
     
-    uint8_t iv[16] = {0};
-    // Seed the IV with the message counter to ensure a unique key stream per packet
-    iv[14] = (msgCount >> 8) & 0xFF;
-    iv[15] = msgCount & 0xFF;
+    // SECURITY FIX: Use proper nonce construction instead of weak IV seeding
+    // The nonce combines msgCount (4 bytes) with counter offset (12 bytes)
+    uint8_t nonce[16];
+    uint32_t nonceValue = (uint32_t)msgCount << 12;  // Shift left by 12 bits
+    
+    for (int i = 0; i < 4; i++) {
+        nonce[i] = (nonceValue >> (i * 8)) & 0xFF;  // msgCount portion (4 bytes)
+    }
+    for (int i = 4; i < 16; i++) {
+        nonce[i] = 0;  // counter offset starts at 0, increments per call
+    }
     
     uint8_t stream_block[16] = {0};
     size_t nc_off = 0;
-    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, iv, stream_block, data, data);
+    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, nonce, stream_block, data, data);
     mbedtls_aes_free(&aes);
 }
 
@@ -755,6 +762,8 @@ bool listenForConfig()
                             }
                         }
                         configReceived = true;
+                        wakeCycleCount = 0; // Reset wakecycle
+
                         break; // Successfully received and applied config, exit 5s RX window early
                     } else {
                         if (serialEnabled) Serial.println("Invalid config header. Terminating RX.");
@@ -777,13 +786,13 @@ bool listenForConfig()
         Serial.printf("RX Window closed. Total RX power-on time: %lu ms. Config %s\n",
                      lastRxTime, configReceived ? "received" : "NOT received");
     }
+    
 
     if (needsRestart) {
         if (serialEnabled) {
             Serial.println("Mode switched via remote config! Restarting device..");
         }
         flushSerialOutput();
-        wakeCycleCount = 0; // Reset before restart!
         ESP.restart(); // Soft reset
     }
 

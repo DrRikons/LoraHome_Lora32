@@ -19,7 +19,6 @@
 #include <Arduino.h>
 #include <RadioLib.h>
 #include <LoRaBoards.h>
-#include <mbedtls/aes.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -28,7 +27,17 @@
 #include <time.h>
 #include <math.h>
 #include <stdlib.h>
-#include <payloads.h>
+#include <LoRaHomeCommon.h>
+#include <SD.h>
+#include <SPI.h>
+#include <Crypto.h>
+#include <AES.h>
+#include <Elog.h>
+
+// ELog configuration
+#define MYLOG 0  // Gateway log ID
+
+#define SD_SC_PIN 13
 
 // WiFi and NTP Configuration
 #define WIFI_SSID "SSID"
@@ -42,33 +51,43 @@
 #define MQTT_USER "LoRa" // Optional
 #define MQTT_PASSWORD "Password" // Optional
 #define MQTT_TOPIC_PREFIX "lora_gateway"
-// Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
-#define CUSTOM_EPOCH 1704067200UL
+
 
 // Forward declarations
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount);
-void setFlag(void);
 void setup();
 void loop();
 void drawMain();
 void configureSystemTime();
 bool refreshRtcTrustFromSystemClock();
 void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format);
+void mqttPublish(const char* topic, JsonDocument& doc);
 bool sendUpdateBeacon();
 bool isClockValid(time_t currentTime);
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
-void reconnectMqtt();
-void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem);
+void mqttConnect();
+String mqttTopic(const String* mac, const char* mode);
+void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, const char* mode);
 
 WiFiClientSecure espClient; // Use secure client for TLS
 PubSubClient mqttClient(espClient);
 
+// Check if current time is after CUSTOM_EPOCH AND NTP has synchronized successfully
 bool isClockValid(time_t currentTime) {
+    // Using ESP32's internal time status isn't exposed simply as timeSync().
+    // Since CUSTOM_EPOCH is ~2024, any time strictly greater than this guarantees NTP sync.
     return currentTime > (time_t)CUSTOM_EPOCH;
 }
 
+// Check if clock has drifted beyond acceptable threshold from reference time
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
     return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
+}
+
+void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format) {
+    struct tm localTimeInfo;
+    localtime_r(&utcTime, &localTimeInfo);
+    strftime(buffer, bufferSize, format, &localTimeInfo);
 }
 
 #if     defined(USING_SX1276)
@@ -201,11 +220,6 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 #endif /*USING_LR1121PA*/
 #endif /*Radio define end*/
 
-// Shared secret key for Gateway-to-Sensor config authentication
-#define NETWORK_KEY 0x3FA4B2C1
-
-
-
 // 16-Byte Shared secret key for AES-128 encryption
 const uint8_t AES_NETWORK_KEY[16] = {
     0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
@@ -216,49 +230,56 @@ const uint8_t AES_NETWORK_KEY[16] = {
 static SemaphoreHandle_t radioSemaphore = NULL;
 static String rssi = "0dBm";
 static String snr = "0dB";
-
 // Display variables
-static float lastTemp = 0.0;
-static float lastVcc = 0.0;
-static uint8_t lastBatt = 0;
-static String lastMac = "Wait...";
+static float sensorTemp = 0.0;
+static float sensorVcc = 0.0;
+static uint8_t sensorBatt = 0;
+static String sensorMac = "Wait...";
 static uint16_t msgCount = 0;
-static uint8_t lastSensorIsDevMode = 0;
-static bool lastSensorNeedsTimeSync = false;
-static uint32_t lastSensorSleepInterval = 0;
-static bool lastHasDevTelemetry = false;
-static int16_t lastBattCurrent = 0;
-static int16_t lastBattPower = 0;
-static uint16_t lastFreeRam = 0;
-static int8_t lastCpuTemp = 0;
-static int8_t lastTxPower = 0;
-static int8_t lastSensorSNR = 0;
-static int16_t lastSensorRSSI = 0;
+static uint8_t sensorIsDevMode = 0;
+static bool sensorNeedsTimeSync = false;
+static uint32_t sensorSleepInterval = 0;
+static bool sensorHasTelemetry = false;
+static int16_t sensorBattCurrent = 0;
+static int16_t sensorBattPower = 0;
+static uint16_t sensorFreeRam = 0;
+static int8_t sensorCpuTemp = 0;
+static int8_t sensorTxPower = 0;
+static int8_t sensorSNR = 0;
+static int16_t sensorRSSI = 0;
 static uint32_t lastDisplayUpdate = 0;
 static uint8_t screenNum = 0;
 static bool hasValidRtcTime = false;
 static long lastMqttReconnectAttempt = 0;
+static long lastWifiReconnectAttempt = 0;
+// MQTT connection state tracking for reconnection logic
+static bool mqttConnected = false;
+static const unsigned long MAX_RECONNECT_ATTEMPTS = 5;   // Maximum retry attempts
+static const unsigned long RECONNECT_DELAY_MS = 1000;    // Delay between retries (1 second)
+static const unsigned long WIFI_RECONNECT_DELAY_MS = 10000;  
+static const unsigned long NTP_SYNC_DELAY_MS = 30000;  // Delay between NTP Syncs (30 seconds)
 
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
     
-    uint8_t iv[16] = {0};
-    // Seed the IV with the message counter to ensure a unique key stream per packet
-    iv[14] = (msgCount >> 8) & 0xFF;
-    iv[15] = msgCount & 0xFF;
+    // SECURITY FIX: Use proper nonce construction instead of weak IV seeding
+    // The nonce combines msgCount (4 bytes) with counter offset (12 bytes)
+    uint8_t nonce[16];
+    uint32_t nonceValue = (uint32_t)msgCount << 12;  // Shift left by 12 bits
+    
+    for (int i = 0; i < 4; i++) {
+        nonce[i] = (nonceValue >> (i * 8)) & 0xFF;  // msgCount portion (4 bytes)
+    }
+    for (int i = 4; i < 16; i++) {
+        nonce[i] = 0;  // counter offset starts at 0, increments per call
+    }
     
     uint8_t stream_block[16] = {0};
     size_t nc_off = 0;
-    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, iv, stream_block, data, data);
+    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, nonce, stream_block, data, data);
     mbedtls_aes_free(&aes);
-}
-
-void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format) {
-    struct tm localTimeInfo;
-    localtime_r(&utcTime, &localTimeInfo);
-    strftime(buffer, bufferSize, format, &localTimeInfo);
 }
 
 void configureSystemTime() {
@@ -280,23 +301,37 @@ bool sendUpdateBeacon() {
     int txState = radio.startTransmit(&beacon, 1);
     if (txState == RADIOLIB_ERR_NONE) {
         if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            Serial.println(F("Update beacon transmitted."));
+            Logger.info(MYLOG, "::%s:: Update beacon transmitted." , string(__func__).substr(0, 5).c_str());
             return true;
         } else {
-            Serial.println(F("Update beacon TX timeout!"));
+            Logger.warning(MYLOG, "::%s:: Update beacon TX timeout!", string(__func__).substr(0, 5).c_str());
             return false;
         }
     }
-    Serial.printf("Update beacon startTransmit failed, code %d\n", txState);
+    Logger.error(MYLOG, "::%s:: Update beacon startTransmit failed, code %d", string(__func__).substr(0, 5).c_str(), txState);
     return false;
 }
 
+const char* getWifiStatusString(wl_status_t status) {
+  switch (status) {
+    case 0:      return "IDLE_STATUS";
+    case 1:      return "NO_SSID_AVAIL";
+    case 2:      return "SCAN_COMPLETED";
+    case 3:      return "CONNECTED";
+    case 4:      return "CONNECT_FAILED";
+    case 5:      return "CONNECTION_LOST";
+    case 6:      return "DISCONNECTED";
+    default:                  return "UNKNOWN_STATUS";
+  }
+}
 // this function is called when a complete packet
 // is received by the module
 // IMPORTANT: this function MUST be 'void' type
 //            and MUST NOT have any arguments!
-#if defined(ESP8266) || defined(ESP32)
+#if defined(ESP8266)
 ICACHE_RAM_ATTR
+#elif defined(ESP32)
+IRAM_ATTR
 #endif
 void setFlag(void)
 {
@@ -313,6 +348,17 @@ void setup()
 {
     setupBoards();
 
+    // Initialize Logger with Serial and SD output
+    // Register console output (Serial)
+    Logger.registerSerial(MYLOG, ELOG_LEVEL_DEBUG, "GW");
+
+    // Configure and register SD card output
+    Logger.configureSd(SDCardSPI, SDCARD_CS, 2000000, SHARED_SPI);
+    // SD card is already initialized by setupBoards(), just register the logger
+    Logger.registerSd(MYLOG, ELOG_LEVEL_DEBUG, "gateway", ELOG_FLAG_NONE, 100000);
+
+    // Simulate the time by providing a fixed time to the RTC (You can also use the NTP time)
+    Logger.provideTime(2024, 01, 01, 0, 0, 0); //<-- CUSTOM_EPOCH
     // Initialize the FreeRTOS semaphore
     radioSemaphore = xSemaphoreCreateBinary();
 
@@ -328,16 +374,25 @@ void setup()
     // Setup MQTT
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
 
-    // Start ESP32 SNTP with a POSIX timezone string so localtime() includes DST.
-    configureSystemTime();
     
     // Attempt to recover time from ESP32's hardware RTC (survives software resets)
     time_t sysTime;
     time(&sysTime);
-    if (isClockValid(sysTime)) {
-        hasValidRtcTime = true;
-        Serial.println(F("Recovered time from internal ESP32 RTC after soft reset."));
+    refreshRtcTrustFromSystemClock();  // Check and set hasValidRtcTime based on current RTC time
+    
+    if (hasValidRtcTime) {
+        Logger.info(MYLOG, "::%s:: Recovered time from internal ESP32 RTC after soft reset.", string(__func__).substr(0, 5).c_str());
+    } else {
+        configureSystemTime(); // Ensure SNTP is configured if RTC time is not valid
+        time(&sysTime);
+        Logger.info(MYLOG, "::%s:: RTC not valid, syncing time from NTP server.", string(__func__).substr(0, 5).c_str());
+        
+        // Check if NTP sync succeeded
+        if (!isClockValid(sysTime)) {
+            Logger.warning(MYLOG, "::%s:: NTP sync failed. setup will proceed with invalid time.", string(__func__).substr(0, 5).c_str());
+        }
     }
+    
 
     // When the power is turned on, a delay is required.
     delay(1500);
@@ -350,20 +405,14 @@ void setup()
     // initialize radio with default settings
     int state = radio.begin();
 
-    printResult(state == RADIOLIB_ERR_NONE);
-
-    Serial.printf("[%s]:", RADIO_TYPE_STR);
-    Serial.print(F("Radio Initializing ... "));
     if (state == RADIOLIB_ERR_NONE) {
-        Serial.println(F("success!"));
+        Logger.info(MYLOG, "::%s:: [%s]: Radio Initializing ... success!", string(__func__).substr(0, 5).c_str(), RADIO_TYPE_STR);
     } else {
-        Serial.print(F("failed, code "));
-        Serial.println(state);
+        Logger.error(MYLOG, "::%s:: [%s]: Radio Initializing ... failed, code %d", string(__func__).substr(0, 5).c_str(), RADIO_TYPE_STR, state);
         while (true);
     }
 
-    // set the function that will be called
-    // when new packet is received
+    // Set interrupt callback for packet reception
     radio.setPacketReceivedAction(setFlag);
 
     /*
@@ -374,9 +423,14 @@ void setup()
     *   LR1121        : Allowed values are in range from 150.0 to 960.0 MHz, 1900 - 2200 MHz and 2400 - 2500 MHz. Will also perform calibrations.
     * * * */
 
+    // Declare configErrors before use
+    int configErrors = 0;
+
     if (radio.setFrequency(CONFIG_RADIO_FREQ) == RADIOLIB_ERR_INVALID_FREQUENCY) {
-        Serial.println(F("Selected frequency is invalid for this module!"));
-        while (true);
+        Logger.error(MYLOG, "::%s:: Selected frequency is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        configErrors++;
+    } else {
+        Logger.info(MYLOG, "::%s:: Freq: %.1f MHz OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_FREQ);
     }
 
     /*
@@ -387,8 +441,10 @@ void setup()
     *   LR1121        : Allowed values are 62.5, 125.0, 250.0 and 500.0 kHz.
     * * * */
     if (radio.setBandwidth(CONFIG_RADIO_BW) == RADIOLIB_ERR_INVALID_BANDWIDTH) {
-        Serial.println(F("Selected bandwidth is invalid for this module!"));
-        while (true);
+        Logger.error(MYLOG, "::%s:: Selected bandwidth is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        configErrors++;
+    } else {
+        Logger.info(MYLOG, "::%s:: BW: %.1f kHz OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_BW);
     }
 
 
@@ -400,8 +456,10 @@ void setup()
     * LR1121        :  Allowed values range from 5 to 12.
     * * * */
     if (radio.setSpreadingFactor(9) == RADIOLIB_ERR_INVALID_SPREADING_FACTOR) {
-        Serial.println(F("Selected spreading factor is invalid for this module!"));
-        while (true);
+        Logger.error(MYLOG, "::%s:: Selected spreading factor is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        configErrors++;
+    } else {
+        Logger.info(MYLOG, "::%s:: SF: 9 OK", string(__func__).substr(0, 5).c_str());
     }
 
     /*
@@ -411,8 +469,10 @@ void setup()
     * LR1121        :  Allowed values range from 5 to 8.
     * * * */
     if (radio.setCodingRate(5) == RADIOLIB_ERR_INVALID_CODING_RATE) {
-        Serial.println(F("Selected coding rate is invalid for this module!"));
-        while (true);
+        Logger.error(MYLOG, "::%s:: Selected coding rate is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        configErrors++;
+    } else {
+        Logger.info(MYLOG, "::%s:: CR: 4/5 OK", string(__func__).substr(0, 5).c_str());
     }
 
     /*
@@ -420,8 +480,10 @@ void setup()
     * SX1278/SX1276/SX1268/SX1262/SX1280 : Sets LoRa sync word. Only available in LoRa mode.
     * * */
     if (radio.setSyncWord(0xAB) != RADIOLIB_ERR_NONE) {
-        Serial.println(F("Unable to set sync word!"));
-        while (true);
+        Logger.error(MYLOG, "::%s:: Unable to set sync word!", string(__func__).substr(0, 5).c_str());
+        configErrors++;
+    } else {
+        Logger.info(MYLOG, "::%s:: SW: 0xAB OK", string(__func__).substr(0, 5).c_str());
     }
 
     /*
@@ -433,8 +495,10 @@ void setup()
     * LR1121        :  Allowed values are in range from -17 to 22 dBm (high-power PA) or -18 to 13 dBm (High-frequency PA), PA Version range : -9 ~ 0dBm
     * * * */
     if (radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER) == RADIOLIB_ERR_INVALID_OUTPUT_POWER) {
-        Serial.println(F("Selected output power is invalid for this module!"));
-        while (true);
+        Logger.error(MYLOG, "::%s:: Selected output power is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        configErrors++;
+    } else {
+        Logger.info(MYLOG, "::%s:: TX Power: %ddBm OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_OUTPUT_POWER);
     }
 
 #if !defined(USING_SX1280) && !defined(USING_LR1121) && !defined(USING_SX1280PA)
@@ -445,8 +509,10 @@ void setup()
     * NOTE: set value to 0 to disable overcurrent protection
     * * * */
     if (radio.setCurrentLimit(140) == RADIOLIB_ERR_INVALID_CURRENT_LIMIT) {
-        Serial.println(F("Selected current limit is invalid for this module!"));
-        while (true);
+        Logger.error(MYLOG, "::%s:: Selected current limit is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        configErrors++;
+    } else {
+        Logger.info(MYLOG, "::%s:: Current Limit: 140 mA OK", string(__func__).substr(0, 5).c_str());
     }
 #endif
 
@@ -465,21 +531,38 @@ void setup()
 
     // Enables or disables CRC check of received packets.
     if (radio.setCRC(true) == RADIOLIB_ERR_INVALID_CRC_CONFIGURATION) {
-        Serial.println(F("Selected CRC is invalid for this module!"));
-        while (true);
+        Logger.error(MYLOG, "::%s:: Selected CRC configuration is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        configErrors++;
+    } else {
+        Logger.info(MYLOG, "::%s:: CRC: Enabled OK", string(__func__).substr(0, 5).c_str());
     }
+
+    // ============================================================================
+    // VALIDATE CONFIGURATION AND REPORT STATUS
+    // ============================================================================
+    
+    if (configErrors > 0) {
+        Logger.warning(MYLOG, "::%s:: Radio configuration completed with %d error(s).", string(__func__).substr(0, 5).c_str(), configErrors);
+        Logger.warning(MYLOG, "::%s:: The radio may still function, but some parameters were not set correctly.", string(__func__).substr(0, 5).c_str());
+        Logger.warning(MYLOG, "::%s:: Please check hardware connections and power supply stability.", string(__func__).substr(0, 5).c_str());
+    } else {
+        Logger.info(MYLOG, "::%s:: All radio parameters configured successfully!", string(__func__).substr(0, 5).c_str());
+    }
+
+    // Delay to allow radio internal circuits to stabilize after configuration
+    delay(100);
 
 #if  defined(USING_LR1121)
 #if defined(USING_LR1121PA)
     if (CONFIG_RADIO_FREQ < 2400) {
-        Serial.printf("LR1121 PA Version Using low frequency switch table for PA version\n");
+        Logger.info(MYLOG, "::%s:: LR1121 PA Version Using low frequency switch table for PA version", string(__func__).substr(0, 5).c_str());
         radio.setRfSwitchTable(pa_version_rf_switch_dio_pins, low_freq_switch_table);
     } else {
-        Serial.printf("LR1121 PA Version Using high frequency switch table for PA version\n");
+        Logger.info(MYLOG, "::%s:: LR1121 PA Version Using high frequency switch table for PA version", string(__func__).substr(0, 5).c_str());
         radio.setRfSwitchTable(pa_version_rf_switch_dio_pins, high_freq_switch_table);
     }
 #else   //  Version without PA rf switch table
-    Serial.println("LR1121 without PA Version");
+    Logger.info(MYLOG, "::%s:: LR1121 without PA Version", string(__func__).substr(0, 5).c_str());
     static const uint32_t rfswitch_dio_pins[] = {
         RADIOLIB_LR11X0_DIO5, RADIOLIB_LR11X0_DIO6,
         RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC
@@ -510,7 +593,7 @@ void setup()
     // NOTE: As long as DIO2 is configured to control RF switch,
     //       it can't be used as interrupt pin!
     if (radio.setDio2AsRfSwitch() != RADIOLIB_ERR_NONE) {
-        Serial.println(F("Failed to set DIO2 as RF switch!"));
+        Logger.error(MYLOG, "::%s:: Failed to set DIO2 as RF switch!", string(__func__).substr(0, 5).c_str());
         while (true);
     }
 #endif //USING_SX1262
@@ -538,7 +621,7 @@ void setup()
 #endif
 
 #ifdef RADIO_CTRL
-    Serial.println("Turn on LAN, Enter Rx mode.");
+    Logger.info(MYLOG, "::%s:: Turn on LAN, Enter Rx mode.", string(__func__).substr(0, 5).c_str());
     /*
     * 2W and BPF LoRa LAN Control ,set HIGH turn on LAN ,RX Mode
     * */
@@ -548,13 +631,11 @@ void setup()
     delay(1000);
 
     // start listening for LoRa packets
-    Serial.print(F("Radio Starting to listen ... "));
     state = radio.startReceive();
     if (state == RADIOLIB_ERR_NONE) {
-        Serial.println(F("success!"));
+        Logger.info(MYLOG, "::%s:: Radio started listening successfully!", string(__func__).substr(0, 5).c_str());
     } else {
-        Serial.print(F("failed, code "));
-        Serial.println(state);
+        Logger.error(MYLOG, "::%s:: Radio start listening failed, code %d", string(__func__).substr(0, 5).c_str(), state);
     }
 
     drawMain();
@@ -562,148 +643,214 @@ void setup()
 
 void loop()
 {
-    if (WiFi.isConnected()) {
+    // connect wifi-mqtt
+    static bool wasWifiConnected = false;
+    bool isWifiConnected = WiFi.isConnected();
+    
+    if (isWifiConnected) {
+        if (!wasWifiConnected) {
+            Logger.info(MYLOG, "::%s:: WiFi connected. Device IP: %s", string(__func__).substr(0, 5).c_str(), WiFi.localIP().toString().c_str());
+            wasWifiConnected = true;
+        }
         if (!mqttClient.connected()) {
-            reconnectMqtt();
+            mqttConnect();
         }
         mqttClient.loop();
+    } else {
+        if (wasWifiConnected) {
+            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting..", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
+            wasWifiConnected = false;
+        }
+        // Attempt WiFi reconnection in the background
+        
+        if (millis() - lastWifiReconnectAttempt > WIFI_RECONNECT_DELAY_MS) {
+            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting...", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
+            WiFi.reconnect();
+            lastWifiReconnectAttempt = millis();
+        }
     }
+    
+    // sync from NTP
+    static unsigned long lastNtpCheck = 0;
+    if (millis() - lastNtpCheck > NTP_SYNC_DELAY_MS) {
+        time_t now;
+        time(&now);
+        if (!isClockValid(now)) {
+            Logger.warning(MYLOG, "::%s:: Time invalid, NTP syncing...", string(__func__).substr(0, 5).c_str());
+            configureSystemTime(); // Ensure SNTP is configured if not already
+        } else {
+            Logger.info(MYLOG, "::%s:: Time synced via NTP.", string(__func__).substr(0, 5).c_str());
+        }
+        lastNtpCheck = millis();
+}
 
     // check if the semaphore has been given by the ISR
-    if (xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
+    while (xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
         
+        // process received data from the radio 
         int numBytes = radio.getPacketLength();
         byte byteArr[256];
+        
+        // Memory safety: Validate packet length against buffer size
+        if (numBytes <= 0 || numBytes > sizeof(byteArr)) {
+            Logger.warning(MYLOG, "::%s:: Invalid packet length from radio: %d bytes", string(__func__).substr(0, 5).c_str(), numBytes);
+            xSemaphoreTake(radioSemaphore, 0);
+            radio.startReceive();
+            continue; // Skip to next semaphore check in loop
+        }
+        
         int state = radio.readData(byteArr, numBytes);
 
         flashLed();
 
         if (state == RADIOLIB_ERR_NONE) {
-
+            // capture reception information
             rssi = String(radio.getRSSI()) + "dBm";
             snr = String(radio.getSNR()) + "dB";
 
+            // decrypt the received payload
+            Logger.debug(MYLOG, "::%s:: Received %d bytes from radio", string(__func__).substr(0, 5).c_str(), numBytes);
             if (numBytes == 16 || numBytes == sizeof(TelemetryPayload)) {
                 TelemetryPayload rxPayload;
-                memcpy(&rxPayload, byteArr, numBytes);
+                // FIX: Cast to uint8_t* to treat both source and destination as raw byte arrays
+                // This prevents incorrect interpretation of bytes when copying to mixed-type struct
+                uint8_t* payloadPtr = (uint8_t*)&rxPayload;
+                memcpy(payloadPtr, byteArr, numBytes);
                 
                 size_t encryptedLength = numBytes - 8;
                 uint8_t* dataPtr = ((uint8_t*)&rxPayload) + 8;
                 cryptPayload(dataPtr, encryptedLength, rxPayload.msgCount);
+                // TO DO: check that received paylaod has been decrytped successfuly
 
                 // --- TIME-CRITICAL SECTION: Respond to Sensor ---
                 // This block must execute as fast as possible to meet the sensor's short RX window.
+                // construct sensor configuration payload
+
                 ConfigPayload txConfig;
-                txConfig.header[0] = 'C';
-                txConfig.header[1] = 'F';
+                txConfig.header[0] = 'C'; // harcoded
+                txConfig.header[1] = 'F'; // hardcoded
                 memcpy(txConfig.targetMac, rxPayload.mac, 6);
                 txConfig.networkKey = NETWORK_KEY;
-                txConfig.sleepInterval = 20; // Example config
-                txConfig.isDevMode = 1;      // Example config
+                txConfig.sleepInterval = 20; // Example config will be read from mqtt
+                txConfig.isDevMode = 1;      // Example config will be read from mqtt
 
+                //ensure RTC is synced before transmiting timeoffset
                 if (!hasValidRtcTime) {
-                    refreshRtcTrustFromSystemClock();
-                }
-
+                    if (!refreshRtcTrustFromSystemClock()){
+                        Logger.warning(MYLOG, "::%s:: Unable to Sync from NTP server.", string(__func__).substr(0, 5).c_str());
+                    } 
+                } 
+                
+                // calculate time offset
                 time_t currentSysTime;
                 time(&currentSysTime);
                 if (hasValidRtcTime && isClockValid(currentSysTime)) {
                     txConfig.timeOffset = (uint32_t)(currentSysTime - CUSTOM_EPOCH);
                 } else {
                     txConfig.timeOffset = 0;
+                    Logger.warning(MYLOG, "::%s:: Update Beacon will be dropped this loop.", string(__func__).substr(0, 5).c_str());
                 }
 
+                // determine and transmit the update beacon 
                 bool configUpdatePending = (rxPayload.sleepInterval != txConfig.sleepInterval) || ((rxPayload.isDevMode != 0) != (txConfig.isDevMode != 0));
                 bool timeSyncPending = (txConfig.timeOffset > 0) && (rxPayload.needsTimeSync != 0);
-
-                bool updatePending = configUpdatePending || timeSyncPending;
+                bool updatePending = (configUpdatePending || timeSyncPending) && hasValidRtcTime; // enable beacon only if RTC is ok
                 if (updatePending) {
                     delay(1000);
-                    if (sendUpdateBeacon()) {
+                    if (sendUpdateBeacon()) { // check if beacon was transmitted
                         xSemaphoreTake(radioSemaphore, 0); // clear before tx
-                        int txState = radio.startTransmit((uint8_t*)&txConfig, sizeof(ConfigPayload));
+                        int txState = radio.startTransmit((uint8_t*)&txConfig, sizeof(ConfigPayload)); // transmit sensor config
                         if (txState == RADIOLIB_ERR_NONE) {
                             xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(5000)); // Block until TX finishes
-                            // Log will be printed later
+                            Logger.info(MYLOG, "::%s:: Config Sent", string(__func__).substr(0, 5).c_str());
+                            Logger.debug(MYLOG, "::%s:: Config: Sleep: %u | DevMode: %u | TimeOffset: %lu",
+                                                      string(__func__).substr(0, 5).c_str(), txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
                         } else {
-                            // Log will be printed later
+                            Logger.error(MYLOG, "::%s:: Config startTransmit failed, code %d", string(__func__).substr(0, 5).c_str(), txState);
                         }
                     }
+                } else {
+                     Logger.info(MYLOG, "::%s:: No config or time update pending.", string(__func__).substr(0, 5).c_str());
                 }
                 // --- END OF TIME-CRITICAL SECTION ---
-
                 // Clear any lingering semaphore from the TX operations
                 xSemaphoreTake(radioSemaphore, 0);
-
 
                 // Put radio back into receive mode immediately to not miss the next packet
                 radio.startReceive();
 
                 // --- NON-CRITICAL SECTION: Logging, Display, and MQTT ---
                 // Now that the LoRa transaction is complete, we can perform slower tasks.
-                lastTemp = rxPayload.temperature / 100.0f;
-                lastVcc = rxPayload.battVoltage / 1000.0f;
-                lastBatt = rxPayload.battPercent;
-                msgCount = rxPayload.msgCount;
-                lastSensorIsDevMode = rxPayload.isDevMode;
-                lastSensorNeedsTimeSync = (rxPayload.needsTimeSync != 0);
-                lastSensorSleepInterval = rxPayload.sleepInterval;
-                
-                char macStr[18];
-                sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", 
-                        rxPayload.mac[0], rxPayload.mac[1], rxPayload.mac[2],
-                        rxPayload.mac[3], rxPayload.mac[4], rxPayload.mac[5]);
-                lastMac = String(macStr);
-                
-                Serial.println(F("Radio Received packet!"));
-                Serial.printf("MAC: %s | Msg: %u\n", macStr, msgCount);
-                Serial.printf("Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s\n",
-                              lastTemp, lastVcc, lastBatt, (unsigned long)lastSensorSleepInterval,
-                              lastSensorIsDevMode, lastSensorNeedsTimeSync ? "yes" : "no");
 
-                lastHasDevTelemetry = (numBytes == sizeof(TelemetryPayload));
-                if (lastHasDevTelemetry) {
-                    lastBattCurrent = rxPayload.battCurrent;
-                    lastBattPower = rxPayload.battPower;
-                    lastFreeRam = rxPayload.freeRam;
-                    lastCpuTemp = rxPayload.cpuTemp;
-                    lastTxPower = rxPayload.txPower;
-                    lastSensorSNR = rxPayload.lastSNR;
-                    lastSensorRSSI = rxPayload.lastRSSI;
-                    Serial.printf("DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm\n", 
-                                  lastCpuTemp, lastFreeRam, lastBattCurrent, lastBattPower, lastTxPower, lastSensorSNR, lastSensorRSSI);
+                sensorHasTelemetry = (numBytes == sizeof(TelemetryPayload));
+                if (sensorHasTelemetry) {
+                    Logger.debug(MYLOG, "::%s:: Sensor payload has data", string(__func__).substr(0, 5).c_str());
+                    Logger.debug(MYLOG, "::%s:: Reconstructing MAC Adress", string(__func__).substr(0, 5).c_str());
+                    char macStr[18];
+                    sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", 
+                            rxPayload.mac[0], rxPayload.mac[1], rxPayload.mac[2],
+                            rxPayload.mac[3], rxPayload.mac[4], rxPayload.mac[5]);
+                    sensorMac = String(macStr);
+                    Logger.debug(MYLOG, "::%s:: Normalising telemetry values for debug", string(__func__).substr(0, 5).c_str());
+                    sensorTemp = rxPayload.temperature / 100.0f;
+                    sensorVcc = rxPayload.battVoltage / 1000.0f;
+                    sensorBatt = rxPayload.battPercent;
+                    msgCount = rxPayload.msgCount;
+                    sensorIsDevMode = rxPayload.isDevMode;
+                    sensorNeedsTimeSync = (rxPayload.needsTimeSync != 0);
+                    sensorSleepInterval = rxPayload.sleepInterval;
+
+                    Logger.info(MYLOG, "::%s:: Radio Received packet! MAC: %s | Msg: %u", string(__func__).substr(0, 5).c_str(), macStr, msgCount);
+                    Logger.info(MYLOG, "::%s:: Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s", 
+                                  string(__func__).substr(0, 5).c_str(), sensorTemp, sensorVcc, sensorBatt, (unsigned long)sensorSleepInterval, 
+                                  sensorIsDevMode, sensorNeedsTimeSync ? "yes" : "no");
+                    
+                    // compose telemetry json                    
+                    if (mqttClient.connected()) {
+                        StaticJsonDocument<256> docCore; 
+                        jsonBuild(&rxPayload, docCore, &sensorMac, "core"); 
+                        String telemetryDataTopic = mqttTopic(&sensorMac, "core");
+                        mqttPublish(telemetryDataTopic.c_str(), docCore);
+                        Logger.debug(MYLOG, "::%s:: Sensor telemetry data published: %s : %s", string(__func__).substr(0, 5).c_str(), telemetryDataTopic.c_str(), docCore.as<String>().c_str());
+
+                        if (rxPayload.isDevMode == 1){
+                            StaticJsonDocument<256> docDev; 
+                            jsonBuild(&rxPayload, docDev, &sensorMac, "dev");
+                            String devTelemetryDataTopic = mqttTopic(&sensorMac, "dev");
+                            mqttPublish(devTelemetryDataTopic.c_str(), docDev);
+                            Logger.debug(MYLOG, "::%s:: Sensor dev telemetry data published: %s : %s", string(__func__).substr(0, 5).c_str(), devTelemetryDataTopic.c_str(), docDev.as<String>().c_str());  
+                        }
+                    } 
+                     
+                 
+                    sensorBattCurrent = rxPayload.battCurrent;
+                    sensorBattPower = rxPayload.battPower;
+                    sensorFreeRam = rxPayload.freeRam;
+                    sensorCpuTemp = rxPayload.cpuTemp;
+                    sensorTxPower = rxPayload.txPower;
+                    sensorSNR = rxPayload.lastSNR;
+                    sensorRSSI = rxPayload.lastRSSI;
+                    Logger.debug(MYLOG, "::%s:: DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm", 
+                                  string(__func__).substr(0, 5).c_str(), sensorCpuTemp, sensorFreeRam, sensorBattCurrent, sensorBattPower, sensorTxPower, sensorSNR, sensorRSSI);
                 }
-
-                if (updatePending) {
-                     Serial.printf("Config Sent -> Sleep: %u | DevMode: %u | TimeOffset: %lu\n",
-                                          txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
-                } else {
-                     Serial.println(F("No config or time update pending."));
-                }
-
-                if (mqttClient.connected()) {
-                    publishMqtt(rxPayload, lastMac, lastHasDevTelemetry);
-                }
-
                 screenNum = 0; // Force switch to data screen on new packet
                 lastDisplayUpdate = millis();
                 drawMain();
 
             } else {
-                Serial.printf("Received unknown packet of %d bytes\n", numBytes);
+                Logger.warning(MYLOG, "::%s:: Received unknown packet of %d bytes", string(__func__).substr(0, 5).c_str(), numBytes);
                 xSemaphoreTake(radioSemaphore, 0);
                 radio.startReceive();
             }
 
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
             // packet was received, but is malformed
-            Serial.println(F("CRC error!"));
+            Logger.error(MYLOG, "::%s:: CRC error!", string(__func__).substr(0, 5).c_str());
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
         } else {
             // some other error occurred
-            Serial.print(F("failed, code "));
-            Serial.println(state);
+            Logger.error(MYLOG, "::%s:: Receive failed, code %d", string(__func__).substr(0, 5).c_str(), state);
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
         }
@@ -718,61 +865,141 @@ void loop()
     }
 }
 
-void reconnectMqtt() {
-    if (!mqttClient.connected()) {
-        long now = millis();
-        if (now - lastMqttReconnectAttempt > 5000) {
-            lastMqttReconnectAttempt = now;
-            // Attempt to reconnect
-            Serial.print("Attempting MQTT connection...");
-            String clientId = WIFI_HOSTNAME;
-            clientId += String(random(0xffff), HEX);
-            if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
-                Serial.println("connected");
-            } else {
-                Serial.print("failed, rc=");
-                Serial.print(mqttClient.state());
-                Serial.println(" try again in 5 seconds");
-            }
+String mqttTopic(const String* mac, const char* mode) {
+    if (!mac || !mode) return String(MQTT_TOPIC_PREFIX) + "/error";
+    
+    switch(mode[0]) { 
+    case 'c': { // "core" starts with 'c'
+        return String(MQTT_TOPIC_PREFIX) + "/sensor/" + mac->c_str() + "/data";
+    }
+    case 'd': { // "dev" starts with 'd'  
+        return String(MQTT_TOPIC_PREFIX) + "/sensor/" + mac->c_str() + "/telemetry";
+    }
+    case 'g': { // "gatewayStatus" starts with 'g'
+        return String(MQTT_TOPIC_PREFIX) + "/gateway/" + mac->c_str() + "/status";
+    }
+    case 'p': { // "payloadConfig" starts with 'p' (since 'c' is taken by core)
+        return String(MQTT_TOPIC_PREFIX) + "/config/" + mac->c_str();
+    }
+    default:
+        return String(MQTT_TOPIC_PREFIX) + "/error";
+    }    
+}
+
+void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, const char* mode) {
+    doc.clear(); 
+    
+    // Always add hardware timestamp. If NTP fails, this makes the failure visible (e.g., 1970 dates)
+    static unsigned long lastTimestamp = 0;  // Track when timestamp was last updated
+    static char cachedTimeStr[24];
+    
+    // Cache timestamp for 1 second - fixed: compare elapsed time, not against constant
+    if (lastTimestamp == 0 || (millis() - lastTimestamp) > 1000) {
+        time_t sysTime = time(nullptr);
+        formatLocalTime(sysTime, cachedTimeStr, sizeof(cachedTimeStr), "%Y-%m-%dT%H:%M:%S");
+        lastTimestamp = millis();  // Record when we updated the timestamp
+        if (lastTimestamp == 0) lastTimestamp = 1; // Edge case: prevent re-triggering if millis() is exactly 0
+    }
+    doc["timestamp"] = cachedTimeStr;
+    
+    // Re-define JSON macros locally since they are #undef'd at the end of LoRaHomeCommon.h
+    #define TO_JSON_FIELD(type, name, json_key) \
+        doc[json_key] = payload.name;
+
+    #define TO_JSON_ARRAY(type, name, size, json_key) \
+        { \
+            JsonArray arr = doc[json_key].to<JsonArray>(); \
+            for(int i = 0; i < size; i++) { arr.add(payload.name[i]); } \
         }
+
+    #define TO_JSON_STRING(name, max_len, json_key) \
+        { \
+            char temp[max_len + 1]; \
+            memcpy(temp, payload.name, max_len); \
+            temp[max_len] = '\0'; \
+            doc[json_key] = temp; \
+        }
+
+    // Safeguard against null pointers
+    if (rawPayload != nullptr && mode != nullptr) {
+        // Conditionally create json - check first character (fastest possible check)
+        switch(mode[0]) { 
+            case 'c': { // "core" starts with 'c'
+                const TelemetryPayload& payload = *static_cast<const TelemetryPayload*>(rawPayload);
+                TELEMETRY_CORE_FIELDS(TO_JSON_FIELD, TO_JSON_ARRAY, TO_JSON_STRING);
+                break;
+            }
+            case 'd': { // "dev" starts with 'd'  
+                const TelemetryPayload& payload = *static_cast<const TelemetryPayload*>(rawPayload);
+                TELEMETRY_DEV_FIELDS(TO_JSON_FIELD, TO_JSON_ARRAY, TO_JSON_STRING);
+                break;
+            }
+            case 'g': { // "gatewayStatus" starts with 'g'
+                const GatewayStatus& payload = *static_cast<const GatewayStatus*>(rawPayload);
+                GATEWAY_STATUS(TO_JSON_FIELD, TO_JSON_ARRAY, TO_JSON_STRING);
+                break;
+            }
+            case 'p': { // "payloadConfig" starts with 'p' (since 'c' is taken by core)
+                const ConfigPayload& payload = *static_cast<const ConfigPayload*>(rawPayload);
+                CONFIG_PAYLOAD(TO_JSON_FIELD, TO_JSON_ARRAY, TO_JSON_STRING);
+                break;
+            }
+            default:
+                break;
+        }
+    } else{
+        Logger.error(MYLOG, "::%s:: null pointer exception caused by rawPayload or mode", string(__func__).substr(0, 5).c_str());
+    }
+
+    #undef TO_JSON_FIELD
+    #undef TO_JSON_ARRAY
+    #undef TO_JSON_STRING
+
+    // Override mac array with formatted string if provided
+    if (mac) {
+        doc["mac"] = *mac;
+    }
+}
+  
+void mqttPublish(const char* topic, JsonDocument& doc) {
+    if (!mqttClient.connected()) {
+        Logger.warning(MYLOG, "::%s:: MQTT not connected. Cannot publish to %s", string(__func__).substr(0, 5).c_str(), topic);
+        return;
+    }
+    char jsonBuffer[256];
+    size_t n = serializeJson(doc, jsonBuffer);
+    if (n > 0) {
+        if (mqttClient.publish(topic, jsonBuffer)) {
+            Logger.info(MYLOG, "::%s:: MQTT published to topic: %s", string(__func__).substr(0, 5).c_str(), topic);
+            Logger.debug(MYLOG, "::%s:: Payload: %s", string(__func__).substr(0, 5).c_str(), jsonBuffer);
+        } else {
+            Logger.error(MYLOG, "::%s:: MQTT publish failed to topic: %s", string(__func__).substr(0, 5).c_str(), topic);
+        }
+    } else {
+        Logger.error(MYLOG, "::%s:: JSON serialization failed for topic: %s", string(__func__).substr(0, 5).c_str(), topic);
     }
 }
 
-void publishMqtt(TelemetryPayload &payload, String &macStr, bool hasDevTelem) {
-    StaticJsonDocument<512> doc;
-
-    doc["mac"] = macStr;
-    doc["msgCount"] = payload.msgCount;
-    doc["temperature"] = payload.temperature / 100.0f;
-    doc["vcc"] = payload.battVoltage / 1000.0f;
-    doc["battery"] = payload.battPercent;
-    doc["isDevMode"] = payload.isDevMode;
-    doc["needsTimeSync"] = (payload.needsTimeSync != 0);
-    doc["sleepInterval"] = payload.sleepInterval;
-    doc["gatewayRssi"] = radio.getRSSI();
-    doc["gatewaySnr"] = radio.getSNR();
-
-    if (hasDevTelem) {
-        doc["battCurrent"] = payload.battCurrent;
-        doc["battPower"] = payload.battPower;
-        doc["freeRam"] = payload.freeRam;
-        doc["cpuTemp"] = payload.cpuTemp;
-        doc["txPower"] = payload.txPower;
-        doc["sensorSnr"] = payload.lastSNR;
-        doc["sensorRssi"] = payload.lastRSSI;
-    }
-
-    char jsonBuffer[512];
-    serializeJson(doc, jsonBuffer);
-
-    // The MQTT topic is generated dynamically here using the configured prefix and the sensor's MAC address.
-    // Format: lora_gateway/<sensor_mac_address>/telemetry
-    String topic = String(MQTT_TOPIC_PREFIX) + "/" + macStr + "/telemetry";
-    
-    if (mqttClient.publish(topic.c_str(), jsonBuffer)) {
-        Serial.println("MQTT message published successfully.");
-    } else {
-        Serial.println("MQTT publish failed.");
+void mqttConnect() {
+    if (millis() - lastMqttReconnectAttempt > RECONNECT_DELAY_MS) {
+        Logger.info(MYLOG, "::%s:: Attempting MQTT connection...", string(__func__).substr(0, 5).c_str());
+        String clientId = "LoRaGateway-";
+        clientId += String(random(0xffff), HEX);
+        
+        if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+            Logger.info(MYLOG, "::%s:: MQTT connected!", string(__func__).substr(0, 5).c_str());
+            mqttConnected = true;
+            
+            StaticJsonDocument<256> doc;
+            doc["status"] = "online";
+            doc["ip"] = WiFi.localIP().toString();
+            String topic = String(MQTT_TOPIC_PREFIX) + "/status";
+            mqttPublish(topic.c_str(), doc);
+        } else {
+            Logger.warning(MYLOG, "::%s:: MQTT connect failed, rc=%d. Trying again later.", string(__func__).substr(0, 5).c_str(), mqttClient.state());
+            mqttConnected = false;
+        }
+        lastMqttReconnectAttempt = millis();
     }
 }
 
@@ -787,13 +1014,13 @@ void drawMain()
             disp->setCursor(5, 15);
             disp->print("MAC:");
             disp->setCursor(35, 15);
-            disp->print(lastMac);
+            disp->print(sensorMac);
             
             disp->setCursor(5, 30);
-            disp->printf("Temp: %.1f C", lastTemp);
+            disp->printf("Temp: %.1f C", sensorTemp);
             
             disp->setCursor(5, 45);
-            disp->printf("Bat: %.2fV (%d%%)", lastVcc, lastBatt);
+            disp->printf("Bat: %.2fV (%d%%)", sensorVcc, sensorBatt);
             
             disp->setCursor(5, 60);
             disp->printf("Msg Cnt: %u", msgCount);
@@ -813,8 +1040,10 @@ void drawMain()
             time_t sysTime;
             time(&sysTime);
             if (isClockValid(sysTime)) {
+                struct tm timeinfo;
+                localtime_r(&sysTime, &timeinfo);
                 char timeStr[20];
-                formatLocalTime(sysTime, timeStr, sizeof(timeStr), "%y-%m-%d %H:%M");
+                strftime(timeStr, sizeof(timeStr), "%y-%m-%d %H:%M", &timeinfo);
                 disp->print(timeStr);
             } else {
                 disp->print("Time: Syncing...");
