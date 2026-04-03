@@ -47,3 +47,8 @@
 #build files
 *.cli*
 include*
+
+*AG*
+
+#secrets
+*secrets.h

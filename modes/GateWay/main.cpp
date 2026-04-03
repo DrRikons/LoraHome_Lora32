@@ -15,20 +15,16 @@
 #include <Crypto.h>
 #include <AES.h>
 #include <Elog.h>
+#include <secrets.h> // WiFi and MQTT credentials
 
 // ELog configuration
 #define MYLOG 0  // Gateway log ID
-// WiFi and NTP Configuration
-#define WIFI_SSID "SSID"
-#define WIFI_PASSWORD "***password***"
-#define WIFI_HOSTNAME "LoRaGateway"
+// NTP Configuration
 #define TZ_INFO "EET-2EEST,M3.5.0/3,M10.5.0/4" // Europe/Athens
 // MQTT Configuration
-#define MQTT_BROKER "broker_IP" // IMPORTANT: Replace with your MQTT broker IP
+// Creds moved to secrets.h
 #define MQTT_PORT 8883              // Default port for MQTT over TLS
-#define MQTT_USER "LoRa" // Optional
-#define MQTT_PASSWORD "Password" // Optional
-#define MQTT_TOPIC_PREFIX "lora_gateway"
+#define MQTT_TOPIC_PREFIX "lorahome" 
 
 #if     defined(USING_SX1276)
 #ifndef CONFIG_RADIO_FREQ
