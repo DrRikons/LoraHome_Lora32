@@ -1,21 +1,3 @@
-/*
-   RadioLib Receive with Interrupts Example
-
-   This example listens for LoRa transmissions and tries to
-   receive them. Once a packet is received, an interrupt is
-   triggered. To successfully receive data, the following
-   settings have to be the same on both transmitter
-   and receiver:
-    - carrier frequency
-    - bandwidth
-    - spreading factor
-    - coding rate
-    - sync word
-
-   For full API reference, see the GitHub Pages
-   https://jgromes.github.io/RadioLib/
-*/
-
 #include <Arduino.h>
 #include <RadioLib.h>
 #include <LoRaBoards.h>
@@ -36,59 +18,17 @@
 
 // ELog configuration
 #define MYLOG 0  // Gateway log ID
-
-#define SD_SC_PIN 13
-
 // WiFi and NTP Configuration
 #define WIFI_SSID "SSID"
 #define WIFI_PASSWORD "***password***"
 #define WIFI_HOSTNAME "LoRaGateway"
 #define TZ_INFO "EET-2EEST,M3.5.0/3,M10.5.0/4" // Europe/Athens
-
 // MQTT Configuration
 #define MQTT_BROKER "broker_IP" // IMPORTANT: Replace with your MQTT broker IP
 #define MQTT_PORT 8883              // Default port for MQTT over TLS
 #define MQTT_USER "LoRa" // Optional
 #define MQTT_PASSWORD "Password" // Optional
 #define MQTT_TOPIC_PREFIX "lora_gateway"
-
-
-// Forward declarations
-void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount);
-void setup();
-void loop();
-void drawMain();
-void configureSystemTime();
-bool refreshRtcTrustFromSystemClock();
-void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format);
-void mqttPublish(const char* topic, JsonDocument& doc);
-bool sendUpdateBeacon();
-bool isClockValid(time_t currentTime);
-bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
-void mqttConnect();
-String mqttTopic(const String* mac, const char* mode);
-void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, const char* mode);
-
-WiFiClientSecure espClient; // Use secure client for TLS
-PubSubClient mqttClient(espClient);
-
-// Check if current time is after CUSTOM_EPOCH AND NTP has synchronized successfully
-bool isClockValid(time_t currentTime) {
-    // Using ESP32's internal time status isn't exposed simply as timeSync().
-    // Since CUSTOM_EPOCH is ~2024, any time strictly greater than this guarantees NTP sync.
-    return currentTime > (time_t)CUSTOM_EPOCH;
-}
-
-// Check if clock has drifted beyond acceptable threshold from reference time
-bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
-    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
-}
-
-void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format) {
-    struct tm localTimeInfo;
-    localtime_r(&utcTime, &localTimeInfo);
-    strftime(buffer, bufferSize, format, &localTimeInfo);
-}
 
 #if     defined(USING_SX1276)
 #ifndef CONFIG_RADIO_FREQ
@@ -220,12 +160,6 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 #endif /*USING_LR1121PA*/
 #endif /*Radio define end*/
 
-// 16-Byte Shared secret key for AES-128 encryption
-const uint8_t AES_NETWORK_KEY[16] = {
-    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
-    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
-};
-
 // FreeRTOS semaphore to replace the busy-wait flag
 static SemaphoreHandle_t radioSemaphore = NULL;
 static String rssi = "0dBm";
@@ -258,6 +192,59 @@ static const unsigned long MAX_RECONNECT_ATTEMPTS = 5;   // Maximum retry attemp
 static const unsigned long RECONNECT_DELAY_MS = 1000;    // Delay between retries (1 second)
 static const unsigned long WIFI_RECONNECT_DELAY_MS = 10000;  
 static const unsigned long NTP_SYNC_DELAY_MS = 30000;  // Delay between NTP Syncs (30 seconds)
+static unsigned long bootMillis = 0;
+static bool bootTimeSet = false;
+
+
+// Forward Function declarations
+void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount);
+void setup();
+void loop();
+void drawMain();
+void configureSystemTime();
+bool refreshRtcTrustFromSystemClock();
+void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format);
+void mqttPublish(const char* topic, JsonDocument& doc);
+bool sendUpdateBeacon();
+bool isClockValid(time_t currentTime);
+bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
+void mqttConnect();
+String mqttTopic(const String* mac, const char* mode);
+void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, const char* mode);
+void initRadio();
+
+WiFiClientSecure espClient; // Use secure client for TLS
+PubSubClient mqttClient(espClient);
+
+// Check if current time reflects true NTP sync (not just boot epoch + drift)
+bool isClockValid(time_t currentTime) {
+    if (!bootTimeSet) {
+        bootMillis = millis();
+        bootTimeSet = true;
+    }
+    
+    unsigned long uptimeSeconds = (millis() - bootMillis) / 1000;
+    time_t expectedBootTime = (time_t)CUSTOM_EPOCH + uptimeSeconds;
+    
+    // If current time matches expected boot drift (±10s), NTP has NOT synced
+        if ( (abs((long)(currentTime - expectedBootTime)) <= 10) || (currentTime < (time_t)CUSTOM_EPOCH)){
+        return false;
+    }
+    
+    // True NTP sync: significantly ahead of boot time AND WiFi connected
+    return (currentTime > (time_t)CUSTOM_EPOCH + uptimeSeconds + 10) && WiFi.isConnected();
+}
+
+// Check if clock has drifted beyond acceptable threshold from reference time
+bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
+    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
+}
+
+void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format) {
+    struct tm localTimeInfo;
+    localtime_r(&utcTime, &localTimeInfo);
+    strftime(buffer, bufferSize, format, &localTimeInfo);
+}
 
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     mbedtls_aes_context aes;
@@ -324,6 +311,7 @@ const char* getWifiStatusString(wl_status_t status) {
     default:                  return "UNKNOWN_STATUS";
   }
 }
+
 // this function is called when a complete packet
 // is received by the module
 // IMPORTANT: this function MUST be 'void' type
@@ -344,6 +332,8 @@ void setFlag(void)
     }
 }
 
+
+
 void setup()
 {
     setupBoards();
@@ -355,7 +345,7 @@ void setup()
     // Configure and register SD card output
     Logger.configureSd(SDCardSPI, SDCARD_CS, 2000000, SHARED_SPI);
     // SD card is already initialized by setupBoards(), just register the logger
-    Logger.registerSd(MYLOG, ELOG_LEVEL_DEBUG, "gateway", ELOG_FLAG_NONE, 100000);
+    Logger.registerSd(MYLOG, ELOG_LEVEL_DEBUG, "gateway", ELOG_FLAG_NONE, 102400);
 
     // Simulate the time by providing a fixed time to the RTC (You can also use the NTP time)
     Logger.provideTime(2024, 01, 01, 0, 0, 0); //<-- CUSTOM_EPOCH
@@ -395,8 +385,14 @@ void setup()
     
 
     // When the power is turned on, a delay is required.
-    delay(1500);
+    vTaskDelay(pdMS_TO_TICKS(1500));
 
+    initRadio();
+
+    drawMain();
+}
+
+void initRadio() {
 #ifdef  RADIO_TCXO_ENABLE
     pinMode(RADIO_TCXO_ENABLE, OUTPUT);
     digitalWrite(RADIO_TCXO_ENABLE, HIGH);
@@ -550,7 +546,7 @@ void setup()
     }
 
     // Delay to allow radio internal circuits to stabilize after configuration
-    delay(100);
+    vTaskDelay(pdMS_TO_TICKS(100));
 
 #if  defined(USING_LR1121)
 #if defined(USING_LR1121PA)
@@ -628,17 +624,15 @@ void setup()
     digitalWrite(RADIO_CTRL, HIGH);
 #endif /*RADIO_CTRL*/
 
-    delay(1000);
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
     // start listening for LoRa packets
     state = radio.startReceive();
     if (state == RADIOLIB_ERR_NONE) {
         Logger.info(MYLOG, "::%s:: Radio started listening successfully!", string(__func__).substr(0, 5).c_str());
     } else {
-        Logger.error(MYLOG, "::%s:: Radio start listening failed, code %d", string(__func__).substr(0, 5).c_str(), state);
+        Logger.error(MYLOG, "::%s:: Radio failed to start, code %d", string(__func__).substr(0, 5).c_str(), state);
     }
-
-    drawMain();
 }
 
 void loop()
@@ -675,14 +669,18 @@ void loop()
     if (millis() - lastNtpCheck > NTP_SYNC_DELAY_MS) {
         time_t now;
         time(&now);
-        if (!isClockValid(now)) {
-            Logger.warning(MYLOG, "::%s:: Time invalid, NTP syncing...", string(__func__).substr(0, 5).c_str());
-            configureSystemTime(); // Ensure SNTP is configured if not already
+        if (WiFi.isConnected()) {
+            if (!isClockValid(now)) {
+                Logger.warning(MYLOG, "::%s:: Time invalid, NTP syncing...", string(__func__).substr(0, 5).c_str());
+                configureSystemTime();
+            } else {
+                Logger.info(MYLOG, "::%s:: Time synced via NTP.", string(__func__).substr(0, 5).c_str());
+            }
         } else {
-            Logger.info(MYLOG, "::%s:: Time synced via NTP.", string(__func__).substr(0, 5).c_str());
+            Logger.debug(MYLOG, "::%s:: WiFi disconnected, skipping NTP sync.", string(__func__).substr(0, 5).c_str());
         }
         lastNtpCheck = millis();
-}
+    }
 
     // check if the semaphore has been given by the ISR
     while (xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
@@ -756,7 +754,7 @@ void loop()
                 bool timeSyncPending = (txConfig.timeOffset > 0) && (rxPayload.needsTimeSync != 0);
                 bool updatePending = (configUpdatePending || timeSyncPending) && hasValidRtcTime; // enable beacon only if RTC is ok
                 if (updatePending) {
-                    delay(1000);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                     if (sendUpdateBeacon()) { // check if beacon was transmitted
                         xSemaphoreTake(radioSemaphore, 0); // clear before tx
                         int txState = radio.startTransmit((uint8_t*)&txConfig, sizeof(ConfigPayload)); // transmit sensor config
@@ -799,39 +797,39 @@ void loop()
                     sensorIsDevMode = rxPayload.isDevMode;
                     sensorNeedsTimeSync = (rxPayload.needsTimeSync != 0);
                     sensorSleepInterval = rxPayload.sleepInterval;
-
+                    if (rxPayload.isDevMode == 1){
+                        sensorBattCurrent = rxPayload.battCurrent;
+                        sensorBattPower = rxPayload.battPower;
+                        sensorFreeRam = rxPayload.freeRam;
+                        sensorCpuTemp = rxPayload.cpuTemp;
+                        sensorTxPower = rxPayload.txPower;
+                        sensorSNR = rxPayload.lastSNR;
+                        sensorRSSI = rxPayload.lastRSSI;
+                        Logger.debug(MYLOG, "::%s:: DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm", 
+                                  string(__func__).substr(0, 5).c_str(), sensorCpuTemp, sensorFreeRam, sensorBattCurrent, sensorBattPower, sensorTxPower, sensorSNR, sensorRSSI);
+                    }        
                     Logger.info(MYLOG, "::%s:: Radio Received packet! MAC: %s | Msg: %u", string(__func__).substr(0, 5).c_str(), macStr, msgCount);
                     Logger.info(MYLOG, "::%s:: Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s", 
                                   string(__func__).substr(0, 5).c_str(), sensorTemp, sensorVcc, sensorBatt, (unsigned long)sensorSleepInterval, 
                                   sensorIsDevMode, sensorNeedsTimeSync ? "yes" : "no");
                     
-                    // compose telemetry json                    
+                    // compose telemetry json and publish to mqtt broker                    
                     if (mqttClient.connected()) {
-                        StaticJsonDocument<256> docCore; 
+                        StaticJsonDocument<512> docCore; 
                         jsonBuild(&rxPayload, docCore, &sensorMac, "core"); 
                         String telemetryDataTopic = mqttTopic(&sensorMac, "core");
                         mqttPublish(telemetryDataTopic.c_str(), docCore);
                         Logger.debug(MYLOG, "::%s:: Sensor telemetry data published: %s : %s", string(__func__).substr(0, 5).c_str(), telemetryDataTopic.c_str(), docCore.as<String>().c_str());
 
                         if (rxPayload.isDevMode == 1){
-                            StaticJsonDocument<256> docDev; 
+                            StaticJsonDocument<512> docDev; 
                             jsonBuild(&rxPayload, docDev, &sensorMac, "dev");
                             String devTelemetryDataTopic = mqttTopic(&sensorMac, "dev");
                             mqttPublish(devTelemetryDataTopic.c_str(), docDev);
                             Logger.debug(MYLOG, "::%s:: Sensor dev telemetry data published: %s : %s", string(__func__).substr(0, 5).c_str(), devTelemetryDataTopic.c_str(), docDev.as<String>().c_str());  
                         }
-                    } 
-                     
-                 
-                    sensorBattCurrent = rxPayload.battCurrent;
-                    sensorBattPower = rxPayload.battPower;
-                    sensorFreeRam = rxPayload.freeRam;
-                    sensorCpuTemp = rxPayload.cpuTemp;
-                    sensorTxPower = rxPayload.txPower;
-                    sensorSNR = rxPayload.lastSNR;
-                    sensorRSSI = rxPayload.lastRSSI;
-                    Logger.debug(MYLOG, "::%s:: DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm", 
-                                  string(__func__).substr(0, 5).c_str(), sensorCpuTemp, sensorFreeRam, sensorBattCurrent, sensorBattPower, sensorTxPower, sensorSNR, sensorRSSI);
+                    }
+                    
                 }
                 screenNum = 0; // Force switch to data screen on new packet
                 lastDisplayUpdate = millis();
@@ -983,14 +981,13 @@ void mqttPublish(const char* topic, JsonDocument& doc) {
 void mqttConnect() {
     if (millis() - lastMqttReconnectAttempt > RECONNECT_DELAY_MS) {
         Logger.info(MYLOG, "::%s:: Attempting MQTT connection...", string(__func__).substr(0, 5).c_str());
-        String clientId = "LoRaGateway-";
-        clientId += String(random(0xffff), HEX);
+        String clientId = "LoraHomeGW-" + String((uint32_t)ESP.getEfuseMac(), HEX);
         
         if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
             Logger.info(MYLOG, "::%s:: MQTT connected!", string(__func__).substr(0, 5).c_str());
             mqttConnected = true;
             
-            StaticJsonDocument<256> doc;
+            StaticJsonDocument<512> doc;
             doc["status"] = "online";
             doc["ip"] = WiFi.localIP().toString();
             String topic = String(MQTT_TOPIC_PREFIX) + "/status";

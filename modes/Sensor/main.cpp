@@ -1,14 +1,3 @@
-/*
-   LoRa Remote Sensor Example
-
-   This device acts as a remote sensor:
-   - Reads temperature from DS18B20
-   - Reads battery voltage/current/capacity from INA226
-   - Transmits data via LoRa
-   - Enters deep sleep to conserve energy
-   - Supports dev mode for debugging
-*/
-
 #include <RadioLib.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -24,85 +13,8 @@
 #define DS18B20_PIN 4  // GPIO4 for DS18B20
 // Use a non-strapping pin to avoid boot issues (GPIO0/2/4/12/15 are strapping pins)
 #define DEV_MODE_PIN 13 // GPIO13 for dev mode toggle (pull low to enable)
-
-// Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
-#define CUSTOM_EPOCH 1704067200UL
-
 // Magic word to validate RTC memory integrity
 #define RTC_MAGIC_WORD 0xA1B2C3D4
-
-// Shared secret key for Gateway-to-Sensor config authentication
-#define NETWORK_KEY 0x3FA4B2C1
-
-// 16-Byte Shared secret key for AES-128 encryption
-const uint8_t AES_NETWORK_KEY[16] = {
-    0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
-    0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
-};
-
-// Dev mode flag
-bool devMode = false;
-// Manual flag to enable serial output in Operation mode for testing. Requires reflash.
-bool serialEnabled = false; 
-
-bool isClockValid(time_t currentTime) {
-    return currentTime > (time_t)CUSTOM_EPOCH;
-}
-
-bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
-    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
-}
-
-void flushSerialOutput() {
-    if (!serialEnabled) {
-        return;
-    }
-
-    Serial.flush();
-    delay(20);
-}
-
-// Function Prototypes
-void readSensors();
-void transmitData();
-void enterDeepSleep();
-void wakeCycle();
-void checkForUpdates();
-bool waitForUpdateBeacon();
-bool listenForConfig();
-void drawMain();
-void flushSerialOutput();
-
-
-// Sensor objects
-OneWire oneWire(DS18B20_PIN);
-DallasTemperature sensors(&oneWire);
-INA226_WE ina226 = INA226_WE(0x40); // INA226 at default I2C address 0x40
-
-// Data structure for transmission
-struct SensorData {
-  float temperature;
-  float batteryVoltage;
-  float batteryCurrent;
-  float batteryPower;
-  uint8_t batteryPercent;
-  float cpuTemp;
-  uint32_t freeRam;
-  float lastSNR;
-  float lastRSSI;
-  uint32_t timestamp;
-} sensorData;
-
-// Configuration structure
-struct Config {
-  uint32_t magicWord;
-  uint32_t sleepInterval; // seconds
-  uint8_t configVersion;
-  uint8_t isDevMode; // Remote dev mode flag (0=false, 1=true)
-} config = {RTC_MAGIC_WORD, 20, 0, 0}; // Default 20 seconds
-
-// RTC memory for config persistence
-RTC_NOINIT_ATTR Config rtcConfig; // NOINIT ensures it survives SW_CPU_RESET (ESP.restart)
 
 #if     defined(USING_SX1276)
 #ifndef CONFIG_RADIO_FREQ
@@ -234,6 +146,13 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 #endif /*USING_LR1121PA*/
 #endif /*Radio define end*/
 
+
+// Sensor objects
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature sensors(&oneWire);
+INA226_WE ina226 = INA226_WE(0x40); // INA226 at default I2C address 0x40
+
+
 // save transmission state between loops
 static int transmissionState = RADIOLIB_ERR_NONE;
 // FreeRTOS semaphore to replace the busy-wait flag
@@ -244,11 +163,88 @@ static String payload;
 static uint32_t lastTxTime = 0;
 static uint32_t lastRxTime = 0;
 static uint32_t lastBeaconRxTime = 0;
-
 // Transmission details
 static String deviceId;
 static int screenNum = -1;
 static int msgOffset = 0;
+// Dev mode flag
+static bool devMode = false;
+// Manual flag to enable serial output in Operation mode for testing. Requires reflash.
+static bool serialEnabled = false; 
+static unsigned long bootMillis = 0;
+static bool bootTimeSet = false;
+
+// Sensor Data structure
+struct SensorData {
+  float temperature;
+  float batteryVoltage;
+  float batteryCurrent;
+  float batteryPower;
+  uint8_t batteryPercent;
+  float cpuTemp;
+  uint32_t freeRam;
+  float lastSNR;
+  float lastRSSI;
+  uint32_t timestamp;
+} sensorData;
+
+// Configuration structure
+struct Config {
+  uint32_t magicWord;
+  uint32_t sleepInterval; // seconds
+  uint8_t configVersion;
+  uint8_t isDevMode; // Remote dev mode flag (0=false, 1=true)
+} config = {RTC_MAGIC_WORD, 20, 0, 0}; // Default 20 seconds
+
+// RTC memory for config persistence
+RTC_NOINIT_ATTR Config rtcConfig; // NOINIT ensures it survives SW_CPU_RESET (ESP.restart)
+
+// Function Prototypes
+void readSensors();
+void transmitData();
+void enterDeepSleep();
+void wakeCycle();
+void checkForUpdates();
+bool waitForUpdateBeacon();
+bool listenForConfig();
+void drawMain();
+void flushSerialOutput();
+
+// Check if current time reflects true NTP sync (not just boot epoch + drift)
+bool isClockValid(time_t currentTime) {
+    if (!bootTimeSet) {
+        bootMillis = millis();
+        bootTimeSet = true;
+    }
+    
+    unsigned long uptimeSeconds = (millis() - bootMillis) / 1000;
+    time_t expectedBootTime = (time_t)CUSTOM_EPOCH + uptimeSeconds;
+    // If current time matches expected boot drift (±10s), NTP has NOT synced
+    if ( (abs((long)(currentTime - expectedBootTime)) <= 10) || (currentTime < (time_t)CUSTOM_EPOCH)){
+        if (serialEnabled) {
+            Serial.println("Clock is not valid - likely still at boot epoch");
+        }
+        return false;
+    }
+    if (serialEnabled) {
+            Serial.println("Clock is valid");
+    }
+    return true;  // Sensor time is valid
+}
+
+bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
+    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
+}
+
+void flushSerialOutput() {
+    if (!serialEnabled) {
+        return;
+    }
+
+    Serial.flush();
+    delay(20);
+}
+
 
 // Callback function for LoRa hardware interrupts.
 // IMPORTANT: This function MUST be 'void' type and MUST NOT have any arguments!
@@ -487,7 +483,8 @@ void wakeCycle() {
 // Reads data from connected sensors (DS18B20, INA226) and internal ESP32 metrics (CPU temp, RAM).
 // Used in: Both Operation and Dev modes
 void readSensors()
-{
+{   
+    
     // Read DS18B20 temperature
     sensors.requestTemperatures();
     sensorData.temperature = sensors.getTempCByIndex(0);
@@ -529,6 +526,7 @@ void readSensors()
 void transmitData()
 {
     // Prepare binary payload
+    ConfigPayload config;
     TelemetryPayload txPayload;
     esp_efuse_mac_get_default(txPayload.mac);
     txPayload.msgCount = ++counter;
@@ -538,7 +536,6 @@ void transmitData()
     txPayload.isDevMode = (uint8_t)devMode;
     txPayload.needsTimeSync = isClockValid((time_t)sensorData.timestamp) ? 0 : 1;
     txPayload.sleepInterval = config.sleepInterval;
-
     size_t txSize = 16; // Core payload size
 
     if (devMode) {
