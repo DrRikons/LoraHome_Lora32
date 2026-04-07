@@ -171,7 +171,7 @@ static int msgOffset = 0;
 static bool devMode = false;
 // Manual flag to enable serial output in Operation mode for testing. Requires reflash.
 static bool serialEnabled = false; 
-static unsigned long bootMillis = 0;
+static unsigned long bootTime = 0;
 static bool bootTimeSet = false;
 
 // Sensor Data structure
@@ -212,11 +212,11 @@ void flushSerialOutput();
 // Check if current time reflects true NTP sync (not just boot epoch + drift)
 bool isClockValid(time_t currentTime) {
     if (!bootTimeSet) {
-        bootMillis = millis();
+        bootTime = millis();
         bootTimeSet = true;
     }
     
-    unsigned long uptimeSeconds = (millis() - bootMillis) / 1000;
+    unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
     time_t expectedBootTime = (time_t)CUSTOM_EPOCH + uptimeSeconds;
     // If current time matches expected boot drift (±10s), NTP has NOT synced
     if ( (abs((long)(currentTime - expectedBootTime)) <= 10) || (currentTime < (time_t)CUSTOM_EPOCH)){

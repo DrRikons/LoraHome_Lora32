@@ -46,6 +46,7 @@
 
 #build files
 *.cli*
+*.bla*
 include*
 
 *AG*

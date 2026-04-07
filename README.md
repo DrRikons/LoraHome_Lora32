@@ -44,3 +44,6 @@ When running in `devMode` (either via the `DEV_MODE_PIN` or remote configuration
 An `.aiexclude` file is included to prevent AI coding assistants from indexing large third-party libraries in the `lib/` folder and build artifacts in the `.pio/` folder, preserving context space.
 
 For AI assistants, refer to `.github/projectsummary.md` for a high-level overview of the project's architecture, hardware, and configuration formats. Please keep the project summary updated when introducing major changes or new features.
+
+## Recent Updates
+- Fixed a bug in the Gateway's `isClockValid` function where the unsynced RTC time check used incorrect math (adding uptime instead of subtracting it). The gateway will now correctly invalidate the clock if it is free-running from `CUSTOM_EPOCH` without an actual NTP sync.

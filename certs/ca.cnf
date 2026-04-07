@@ -1,0 +1,19 @@
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_ca
+prompt = no
+
+[req_distinguished_name]
+C = GR
+ST = State
+L = City
+O = LoRaHome
+OU = Gateway
+CN = LoRa Gateway CA
+
+[v3_ca]
+keyUsage = keyCertSign, cRLSign
+basicConstraints = CA:TRUE
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+

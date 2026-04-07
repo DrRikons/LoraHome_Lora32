@@ -1,0 +1,24 @@
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = GR
+ST = State
+L = City
+O = LoRaHome
+OU = Gateway
+CN = lora-gateway.local
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+subjectAltName = @alt_names
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+
+[alt_names]
+DNS.1 = lora-gateway.local
+IP.1 = 192.168.1.100
+

@@ -15,6 +15,7 @@
 #include <Crypto.h>
 #include <AES.h>
 #include <Elog.h>
+#include <uptime.h>
 #include <secrets.h> // WiFi and MQTT credentials
 
 // ELog configuration
@@ -188,9 +189,6 @@ static const unsigned long MAX_RECONNECT_ATTEMPTS = 5;   // Maximum retry attemp
 static const unsigned long RECONNECT_DELAY_MS = 1000;    // Delay between retries (1 second)
 static const unsigned long WIFI_RECONNECT_DELAY_MS = 10000;  
 static const unsigned long NTP_SYNC_DELAY_MS = 30000;  // Delay between NTP Syncs (30 seconds)
-static unsigned long bootMillis = 0;
-static bool bootTimeSet = false;
-
 
 // Forward Function declarations
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount);
@@ -212,25 +210,19 @@ void initRadio();
 WiFiClientSecure espClient; // Use secure client for TLS
 PubSubClient mqttClient(espClient);
 
-// Check if current time reflects true NTP sync (not just boot epoch + drift)
-bool isClockValid(time_t currentTime) {
-    if (!bootTimeSet) {
-        bootMillis = millis();
-        bootTimeSet = true;
-    }
-    
-    unsigned long uptimeSeconds = (millis() - bootMillis) / 1000;
-    time_t expectedBootTime = (time_t)CUSTOM_EPOCH + uptimeSeconds;
-    
-    // If current time matches expected boot drift (±10s), NTP has NOT synced
-        if ( (abs((long)(currentTime - expectedBootTime)) <= 10) || (currentTime < (time_t)CUSTOM_EPOCH)){
+// Check if clock is set != 1970 or CUSTOM_EPOCH + boot
+bool isClockValid(time_t timeNow) {
+        // If now is between 1970 and  2024 + boot time
+        if ( (abs((long)(timeNow - (time_t)CUSTOM_EPOCH + uptime::getSeconds())) <= 10) || (timeNow < (time_t)CUSTOM_EPOCH)){
+    // If now is between 1970 and  2024 + boot time
+    if ( (abs((long)(timeNow - (time_t)CUSTOM_EPOCH - uptime::getSeconds())) <= 10) || (timeNow < (time_t)CUSTOM_EPOCH)){
         return false;
     }
-    
-    // True NTP sync: significantly ahead of boot time AND WiFi connected
-    return (currentTime > (time_t)CUSTOM_EPOCH + uptimeSeconds + 10) && WiFi.isConnected();
-}
 
+    // True when
+    return (timeNow > (time_t)CUSTOM_EPOCH );
+}
+}
 // Check if clock has drifted beyond acceptable threshold from reference time
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
     return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
@@ -240,6 +232,19 @@ void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char
     struct tm localTimeInfo;
     localtime_r(&utcTime, &localTimeInfo);
     strftime(buffer, bufferSize, format, &localTimeInfo);
+}
+
+void configureSystemTime() {
+    configTzTime(TZ_INFO, "pool.ntp.org", "time.nist.gov", "time.google.com");
+}
+
+bool refreshRtcTrustFromSystemClock() {
+    time_t currentTime;
+    time(&currentTime);
+    if (isClockValid(currentTime)) {
+        hasValidRtcTime = true;
+    }
+    return hasValidRtcTime;
 }
 
 void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
@@ -263,19 +268,6 @@ void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
     size_t nc_off = 0;
     mbedtls_aes_crypt_ctr(&aes, length, &nc_off, nonce, stream_block, data, data);
     mbedtls_aes_free(&aes);
-}
-
-void configureSystemTime() {
-    configTzTime(TZ_INFO, "pool.ntp.org", "time.nist.gov", "time.google.com");
-}
-
-bool refreshRtcTrustFromSystemClock() {
-    time_t currentTime;
-    time(&currentTime);
-    if (isClockValid(currentTime)) {
-        hasValidRtcTime = true;
-    }
-    return hasValidRtcTime;
 }
 
 bool sendUpdateBeacon() {
@@ -328,10 +320,10 @@ void setFlag(void)
     }
 }
 
-
-
 void setup()
 {
+    uptime::calculateUptime();
+
     setupBoards();
 
     // Initialize Logger with Serial and SD output
@@ -740,15 +732,16 @@ void loop()
                 time(&currentSysTime);
                 if (hasValidRtcTime && isClockValid(currentSysTime)) {
                     txConfig.timeOffset = (uint32_t)(currentSysTime - CUSTOM_EPOCH);
+                    bool timeSyncPending = (txConfig.timeOffset > 0) && (rxPayload.needsTimeSync != 0);
                 } else {
                     txConfig.timeOffset = 0;
                     Logger.warning(MYLOG, "::%s:: Update Beacon will be dropped this loop.", string(__func__).substr(0, 5).c_str());
                 }
 
                 // determine and transmit the update beacon 
-                bool configUpdatePending = (rxPayload.sleepInterval != txConfig.sleepInterval) || ((rxPayload.isDevMode != 0) != (txConfig.isDevMode != 0));
-                bool timeSyncPending = (txConfig.timeOffset > 0) && (rxPayload.needsTimeSync != 0);
-                bool updatePending = (configUpdatePending || timeSyncPending) && hasValidRtcTime; // enable beacon only if RTC is ok
+                bool sensorNeedsConfig = (rxPayload.sleepInterval != txConfig.sleepInterval) || ((rxPayload.isDevMode != 0) != (txConfig.isDevMode != 0));
+                
+                bool updatePending = (sensorNeedsConfig || rxPayload.needsTimeSync) && hasValidRtcTime; // enable beacon only if RTC is ok
                 if (updatePending) {
                     vTaskDelay(pdMS_TO_TICKS(1000));
                     if (sendUpdateBeacon()) { // check if beacon was transmitted
@@ -870,11 +863,12 @@ String mqttTopic(const String* mac, const char* mode) {
         return String(MQTT_TOPIC_PREFIX) + "/sensor/" + mac->c_str() + "/telemetry";
     }
     case 'g': { // "gatewayStatus" starts with 'g'
-        return String(MQTT_TOPIC_PREFIX) + "/gateway/" + mac->c_str() + "/status";
+        return String(MQTT_TOPIC_PREFIX) + "/gateway/status";
     }
-    case 'p': { // "payloadConfig" starts with 'p' (since 'c' is taken by core)
-        return String(MQTT_TOPIC_PREFIX) + "/config/" + mac->c_str();
-    }
+    // disabled config topic will be read for updates
+    // case 'p': { // "payloadConfig" starts with 'p' (since 'c' is taken by core)
+    //     return String(MQTT_TOPIC_PREFIX) + "/config/" + mac->c_str();
+    // }
     default:
         return String(MQTT_TOPIC_PREFIX) + "/error";
     }    
