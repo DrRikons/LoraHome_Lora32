@@ -6,6 +6,8 @@
 #include <Arduino.h> // For uint8_t, uint16_t, etc.
 #include <ArduinoJson.h>
 #include <stdint.h>
+#include <time.h>
+#include <math.h>
 
 // Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
 #define CUSTOM_EPOCH 1704067200UL
@@ -19,6 +21,20 @@ const uint8_t AES_NETWORK_KEY[16] = {
     0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C
 };
 
+// Shared by Sensor and GateWay: true if currentTime has diverged from the boot-epoch
+// estimate (CUSTOM_EPOCH + uptimeSeconds), meaning a real clock sync has occurred.
+// Callers supply their own uptimeSeconds source (deep-sleeping devices vs long-running ones).
+inline bool isClockValidSince(time_t currentTime, unsigned long uptimeSeconds) {
+    time_t expectedBootTime = (time_t)CUSTOM_EPOCH + (time_t)uptimeSeconds;
+    if (labs((long)(currentTime - expectedBootTime)) <= 10 || currentTime < (time_t)CUSTOM_EPOCH) {
+        return false;
+    }
+    return true;
+}
+
+inline bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
+    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
+}
 
 #define TELEMETRY_CORE_FIELDS(FIELD, ARRAY, STRING) \
     ARRAY(uint8_t,  mac, 6, "mac") \

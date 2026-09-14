@@ -212,20 +212,7 @@ PubSubClient mqttClient(espClient);
 
 // Check if clock is set != 1970 or CUSTOM_EPOCH + boot
 bool isClockValid(time_t timeNow) {
-        // If now is between 1970 and  2024 + boot time
-        if ( (abs((long)(timeNow - (time_t)CUSTOM_EPOCH + uptime::getSeconds())) <= 10) || (timeNow < (time_t)CUSTOM_EPOCH)){
-    // If now is between 1970 and  2024 + boot time
-    if ( (abs((long)(timeNow - (time_t)CUSTOM_EPOCH - uptime::getSeconds())) <= 10) || (timeNow < (time_t)CUSTOM_EPOCH)){
-        return false;
-    }
-
-    // True when
-    return (timeNow > (time_t)CUSTOM_EPOCH );
-}
-}
-// Check if clock has drifted beyond acceptable threshold from reference time
-bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
-    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
+    return isClockValidSince(timeNow, (unsigned long)uptime::getSeconds());
 }
 
 void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format) {

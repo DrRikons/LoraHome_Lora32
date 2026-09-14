@@ -215,24 +215,13 @@ bool isClockValid(time_t currentTime) {
         bootTime = millis();
         bootTimeSet = true;
     }
-    
-    unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
-    time_t expectedBootTime = (time_t)CUSTOM_EPOCH + uptimeSeconds;
-    // If current time matches expected boot drift (±10s), NTP has NOT synced
-    if ( (abs((long)(currentTime - expectedBootTime)) <= 10) || (currentTime < (time_t)CUSTOM_EPOCH)){
-        if (serialEnabled) {
-            Serial.println("Clock is not valid - likely still at boot epoch");
-        }
-        return false;
-    }
-    if (serialEnabled) {
-            Serial.println("Clock is valid");
-    }
-    return true;  // Sensor time is valid
-}
 
-bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds) {
-    return fabs(difftime(currentTime, referenceTime)) > thresholdSeconds;
+    unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
+    bool valid = isClockValidSince(currentTime, uptimeSeconds);
+    if (serialEnabled) {
+        Serial.println(valid ? "Clock is valid" : "Clock is not valid - likely still at boot epoch");
+    }
+    return valid;
 }
 
 void flushSerialOutput() {
