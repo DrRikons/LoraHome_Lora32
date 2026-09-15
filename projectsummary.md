@@ -9,6 +9,7 @@ Detailed implementation documentation and separate Sensor/Gateway workflow diagr
     - Receives telemetry payloads from sensors via LoRa.
     - Sends configuration and time sync payloads back to sensors on demand.
     - Publishes sensor data to an MQTT broker over TLS.
+    - Publishes `GatewayStatus` (radio RSSI/SNR, WiFi state, IP, and free RAM) to `lorahome/gateway/status` each connected loop cycle.
     - Has an OLED display to show live sensor telemetry and gateway status.
 2.  **Sensor (`modes/Sensor/main.cpp`)**: 
     - Low-power battery-operated node.
@@ -42,6 +43,7 @@ Detailed implementation documentation and separate Sensor/Gateway workflow diagr
 - **Development Mode**: Bypasses deep sleep for continuous operation and simulation/testing. Can be toggled remotely via the configuration payload or physically overridden via `DEV_MODE_PIN` (GPIO13). Configuration states survive soft resets via `RTC_NOINIT_ATTR` memory.
 - **Sensor logging**: Serial diagnostics are prefixed with UTC after synchronization, otherwise elapsed boot time.
 - **Downlink timing**: The Sensor enters beacon RX immediately after uplink; the Gateway waits 50 ms before beacon TX for radio turnaround.
+- **MQTT telemetry**: The Gateway publishes core data for both 20-byte operation-mode and 31-byte development-mode telemetry packets.
 
 *Note: This file is intended to provide a condensed context for AI coding assistants. Keep it updated alongside major structural changes.*
 ## Recent Changes

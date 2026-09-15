@@ -148,7 +148,8 @@ sequenceDiagram
 
 - WiFi uses station mode; MQTT uses `WiFiClientSecure` and `PubSubClient` on the configured TLS port.
 - The Gateway requests NTP time in the configured Athens timezone. UTC timestamps are sent to Sensors as seconds relative to `CUSTOM_EPOCH` (2024-01-01 UTC).
-- MQTT publication is split by sensor mode: normal data goes to `lorahome/sensor/<mac>/data`; development telemetry goes to `lorahome/sensor/<mac>/telemetry`; gateway status uses `lorahome/gateway/status`.
+- MQTT publication is split by sensor mode: normal data goes to `lorahome/sensor/<mac>/data`; development telemetry goes to `lorahome/sensor/<mac>/telemetry`; online gateway status uses `lorahome/gateway/status`.
+- Both valid telemetry sizes enter the core-data MQTT path; only the 31-byte development packet also produces the development-metrics publication.
 - The OLED alternates between current sensor data and gateway status. Logging is configured through Elog and may be sent to serial and SD storage.
 
 ## Radio protocol

@@ -279,7 +279,7 @@ const char* getWifiStatusString(wl_status_t status) {
     case 4:      return "CONNECT_FAILED";
     case 5:      return "CONNECTION_LOST";
     case 6:      return "DISCONNECTED";
-    default:                  return "UNKNOWN_STATUS";
+    default:     return "UNKNOWN_STATUS";
   }
 }
 
@@ -712,7 +712,9 @@ void loop()
                 // --- NON-CRITICAL SECTION: Logging, Display, and MQTT ---
                 // Now that the LoRa transaction is complete, we can perform slower tasks.
 
-                sensorHasTelemetry = (numBytes == sizeof(TelemetryPayload));
+                // Both compact operation-mode and full development-mode packets
+                // contain the core telemetry fields and must be published.
+                sensorHasTelemetry = (numBytes == 20 || numBytes == sizeof(TelemetryPayload));
                 if (sensorHasTelemetry) {
                     Logger.debug(MYLOG, "::%s:: Sensor payload has data", string(__func__).substr(0, 5).c_str());
                     Logger.debug(MYLOG, "::%s:: Reconstructing MAC Adress", string(__func__).substr(0, 5).c_str());
@@ -799,6 +801,22 @@ void loop()
             mqttConnect();
         }
         mqttClient.loop();
+        GatewayStatus status{};
+        status.gatewayRssi = (int16_t)radio.getRSSI();
+        status.gatewaySnr = radio.getSNR();
+        snprintf(status.wifiStatus, sizeof(status.wifiStatus), "%s", getWifiStatusString(WiFi.status()));
+        snprintf(status.ip, sizeof(status.ip), "%s", WiFi.localIP().toString().c_str());
+        status.freeRam = ESP.getFreeHeap();
+        static GatewayStatus lastStatus{};
+        static bool hasPublishedStatus = false;
+        if (!hasPublishedStatus || memcmp(&status, &lastStatus, sizeof(status)) != 0) {
+            StaticJsonDocument<256> statusDoc;
+            jsonBuild(&status, statusDoc, nullptr, "gatewayStatus");
+            String statusTopic = mqttTopic(nullptr, "gatewayStatus");
+            mqttPublish(statusTopic.c_str(), statusDoc);
+            lastStatus = status;
+            hasPublishedStatus = true;
+        }
     } else {
         if (wasWifiConnected) {
             Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting..", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
@@ -831,13 +849,15 @@ void loop()
 }
 
 String mqttTopic(const String* mac, const char* mode) {
-    if (!mac || !mode) return String(MQTT_TOPIC_PREFIX) + "/error";
+    if (!mode) return String(MQTT_TOPIC_PREFIX) + "/error";
     
     switch(mode[0]) { 
     case 'c': { // "core" starts with 'c'
+        if (!mac) return String(MQTT_TOPIC_PREFIX) + "/error";
         return String(MQTT_TOPIC_PREFIX) + "/sensor/" + mac->c_str() + "/data";
     }
     case 'd': { // "dev" starts with 'd'  
+        if (!mac) return String(MQTT_TOPIC_PREFIX) + "/error";
         return String(MQTT_TOPIC_PREFIX) + "/sensor/" + mac->c_str() + "/telemetry";
     }
     case 'g': { // "gatewayStatus" starts with 'g'
@@ -954,12 +974,16 @@ void mqttConnect() {
         if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
             Logger.info(MYLOG, "::%s:: MQTT connected!", string(__func__).substr(0, 5).c_str());
             mqttConnected = true;
-            
-            StaticJsonDocument<512> doc;
-            doc["status"] = "online";
-            doc["ip"] = WiFi.localIP().toString();
-            String topic = String(MQTT_TOPIC_PREFIX) + "/status";
-            mqttPublish(topic.c_str(), doc);
+            GatewayStatus status{};
+            status.gatewayRssi = (int16_t)radio.getRSSI();
+            status.gatewaySnr = radio.getSNR();
+            snprintf(status.wifiStatus, sizeof(status.wifiStatus), "%s", getWifiStatusString(WiFi.status()));
+            snprintf(status.ip, sizeof(status.ip), "%s", WiFi.localIP().toString().c_str());
+            status.freeRam = ESP.getFreeHeap();
+            StaticJsonDocument<256> statusDoc;
+            jsonBuild(&status, statusDoc, nullptr, "gatewayStatus");
+            String statusTopic = mqttTopic(nullptr, "gatewayStatus");
+            mqttPublish(statusTopic.c_str(), statusDoc);
         } else {
             Logger.warning(MYLOG, "::%s:: MQTT connect failed, rc=%d. Trying again later.", string(__func__).substr(0, 5).c_str(), mqttClient.state());
             mqttConnected = false;
