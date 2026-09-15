@@ -11,13 +11,14 @@ namespace lora_home_test {
 
 constexpr std::uint32_t CUSTOM_EPOCH = 1704067200UL;
 constexpr std::uint8_t CONFIG_UPDATE_PENDING_FLAG = 0xA5;
-constexpr std::size_t TELEMETRY_CORE_SIZE = 16;
-constexpr std::size_t TELEMETRY_FULL_SIZE = 27;
+constexpr std::size_t TELEMETRY_CORE_SIZE = 20;
+constexpr std::size_t TELEMETRY_FULL_SIZE = 31;
 constexpr std::size_t CONFIG_PAYLOAD_SIZE = 19;
 
 #pragma pack(push, 1)
 struct TelemetryPayload {
     std::uint8_t mac[6];
+    std::uint32_t bootNonce;
     std::uint16_t msgCount;
     std::int16_t temperature;
     std::uint16_t battVoltage;
@@ -58,6 +59,7 @@ inline bool hasClockDrift(std::time_t currentTime, std::time_t referenceTime, do
 
 struct SensorTelemetryInput {
     std::uint8_t mac[6];
+    std::uint32_t bootNonce;
     std::uint16_t msgCount;
     float temperatureC;
     float batteryVoltageV;
@@ -96,6 +98,7 @@ struct GatewayTelemetryState {
 inline void buildTelemetryPayload(const SensorTelemetryInput& input, TelemetryPayload& output, std::size_t& txSize) {
     std::memset(&output, 0, sizeof(output));
     std::memcpy(output.mac, input.mac, sizeof(output.mac));
+    output.bootNonce = input.bootNonce;
     output.msgCount = input.msgCount;
     output.temperature = static_cast<std::int16_t>(input.temperatureC * 100.0f);
     output.battVoltage = static_cast<std::uint16_t>(input.batteryVoltageV * 1000.0f);

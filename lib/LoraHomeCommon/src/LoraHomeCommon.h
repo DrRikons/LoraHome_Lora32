@@ -11,15 +11,13 @@
 
 // Base time offset to reduce LoRa payload sizes (Jan 1, 2024 00:00:00 UTC)
 #define CUSTOM_EPOCH 1704067200UL
-// Shared secret key for Gateway-to-Sensor config authentication
-#define NETWORK_KEY 0x3FA4B2C1
 
 constexpr uint8_t CONFIG_UPDATE_PENDING_FLAG = 0xA5;
-// 16-Byte Shared secret key for AES-128 encryption
 
 // Shared by Sensor and GateWay: true if currentTime has diverged from the boot-epoch
 // estimate (CUSTOM_EPOCH + uptimeSeconds), meaning a real clock sync has occurred.
 // Callers supply their own uptimeSeconds source (deep-sleeping devices vs long-running ones).
+
 inline bool isClockValidSince(time_t currentTime, unsigned long uptimeSeconds) {
     time_t expectedBootTime = (time_t)CUSTOM_EPOCH + (time_t)uptimeSeconds;
     if (labs((long)(currentTime - expectedBootTime)) <= 10 || currentTime < (time_t)CUSTOM_EPOCH) {
@@ -34,6 +32,7 @@ inline bool hasClockDrift(time_t currentTime, time_t referenceTime, double thres
 
 #define TELEMETRY_CORE_FIELDS(FIELD, ARRAY, STRING) \
     ARRAY(uint8_t,  mac, 6, "mac") \
+    FIELD(uint32_t, bootNonce, "bootNonce") \
     FIELD(uint16_t, msgCount, "msgCount") \
     FIELD(int16_t,  temperature, "temperature") \
     FIELD(uint16_t, battVoltage, "battVoltage") \
@@ -56,6 +55,7 @@ inline bool hasClockDrift(time_t currentTime, time_t referenceTime, double thres
    ARRAY(uint8_t,  targetMac, 6, "targetMac") \
    FIELD(uint32_t, networkKey, "networkKey") \
    FIELD(uint8_t,  sleepInterval, "sleepInterval") \
+   FIELD(uint8_t,  configVersion, "configVersion") \
    FIELD(uint8_t,  isDevMode, "isDevMode") \
    FIELD(uint32_t, timeOffset, "timeOffset")
 
@@ -93,6 +93,9 @@ struct __attribute__((packed)) GatewayStatus {
     GATEWAY_STATUS(DECLARE_FIELD, DECLARE_ARRAY, DECLARE_STRING)
 
 };
+
+static_assert(sizeof(TelemetryPayload) == 31, "TelemetryPayload wire format must be 31 bytes");
+static_assert(sizeof(ConfigPayload) == 19, "ConfigPayload wire format must be 19 bytes");
 
 // ============================================================================
 // JSON Serialization Macros - MUST stay defined until after all uses!

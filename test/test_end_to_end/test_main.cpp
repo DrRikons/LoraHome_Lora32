@@ -8,6 +8,7 @@ void test_end_to_end_sensor_to_gateway_roundtrip() {
     SensorTelemetryInput input{};
     std::uint8_t mac[6] = {0xF0, 0x24, 0xF9, 0xB0, 0x26, 0xAC};
     std::memcpy(input.mac, mac, sizeof(mac));
+    input.bootNonce = 0x4A7C92E1;
     input.msgCount = 7;
     input.temperatureC = 23.91f;
     input.batteryVoltageV = 4.144f;
@@ -31,6 +32,7 @@ void test_end_to_end_sensor_to_gateway_roundtrip() {
 
     TEST_ASSERT_EQUAL_UINT32(TELEMETRY_FULL_SIZE, txSize);
     TEST_ASSERT_EQUAL_UINT16(7, parsed.msgCount);
+    TEST_ASSERT_EQUAL_UINT32(0x4A7C92E1, encoded.bootNonce);
     TEST_ASSERT_FLOAT_WITHIN(0.02f, 23.91f, parsed.temperatureC);
     TEST_ASSERT_FLOAT_WITHIN(0.01f, 4.14f, parsed.batteryVoltageV);
     TEST_ASSERT_EQUAL_UINT8(98, parsed.batteryPercent);

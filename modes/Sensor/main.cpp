@@ -6,6 +6,7 @@
 #include <time.h>
 #include <math.h>
 #include <mbedtls/aes.h>
+#include <esp_system.h>
 #include <LoRaHomeCommon.h>
 #include <LoRaBoards.h>
 #include <secrets.h>
@@ -160,6 +161,7 @@ static int transmissionState = RADIOLIB_ERR_NONE;
 static SemaphoreHandle_t radioSemaphore = NULL;
 RTC_DATA_ATTR static uint16_t counter = 0;
 RTC_DATA_ATTR static uint8_t wakeCycleCount = 0;
+RTC_DATA_ATTR static uint32_t bootNonce = 0;
 static String payload;
 static uint32_t lastTxTime = 0;
 static uint32_t lastRxTime = 0;
@@ -174,6 +176,62 @@ static bool devMode = false;
 static bool serialEnabled = false; 
 static unsigned long bootTime = 0;
 static bool bootTimeSet = false;
+
+// Adds a timestamp to all Sensor diagnostic output without changing call sites.
+// UTC is used after a gateway time sync; otherwise elapsed boot time is shown.
+class TimestampedSerial {
+public:
+    explicit TimestampedSerial(HardwareSerial& serialPort) : serial(serialPort) {}
+
+    void begin(unsigned long baud) { serial.begin(baud); }
+    void flush() { serial.flush(); }
+
+    template <typename T>
+    size_t print(const T& value) {
+        writePrefix();
+        return serial.print(value);
+    }
+
+    template <typename T>
+    size_t println(const T& value) {
+        writePrefix();
+        return serial.println(value);
+    }
+
+    size_t println() {
+        writePrefix();
+        return serial.println();
+    }
+
+    int printf(const char* format, ...) {
+        char message[256];
+        va_list args;
+        va_start(args, format);
+        int length = vsnprintf(message, sizeof(message), format, args);
+        va_end(args);
+        writePrefix();
+        serial.print(message);
+        return length;
+    }
+
+private:
+    HardwareSerial& serial;
+
+    void writePrefix() {
+        time_t now;
+        time(&now);
+        if (isClockValidSince(now, millis() / 1000)) {
+            char timestamp[24];
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+            serial.printf("[%s] ", timestamp);
+        } else {
+            serial.printf("[+%lus] ", millis() / 1000);
+        }
+    }
+};
+
+TimestampedSerial sensorSerial(Serial);
+#define Serial sensorSerial
 
 // Sensor Data structure
 struct SensorData {
@@ -257,6 +315,13 @@ void setup()
 {
     // Initialize the FreeRTOS semaphore
     radioSemaphore = xSemaphoreCreateBinary();
+
+    // RTC memory preserves this across deep sleep; a cold boot gets a new
+    // public session value so AES-CTR streams cannot repeat after counter reset.
+    if (bootNonce == 0) {
+        bootNonce = esp_random();
+        if (bootNonce == 0) bootNonce = 1;
+    }
 
     // Early evaluate devMode to enable serial immediately if needed
     pinMode(DEV_MODE_PIN, INPUT_PULLUP);
@@ -416,26 +481,23 @@ void loop()
 }
 
 // Encrypts or decrypts a payload in place using AES-128-CTR
-void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
+void cryptPayload(uint8_t* data, size_t length, const uint8_t* mac, uint32_t bootNonceValue, uint16_t msgCount) {
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
     
-    // SECURITY FIX: Use proper nonce construction instead of weak IV seeding
-    // The nonce combines msgCount (4 bytes) with counter offset (12 bytes)
-    uint8_t nonce[16];
-    uint32_t nonceValue = (uint32_t)msgCount << 12;  // Shift left by 12 bits
-    
-    for (int i = 0; i < 4; i++) {
-        nonce[i] = (nonceValue >> (i * 8)) & 0xFF;  // msgCount portion (4 bytes)
-    }
-    for (int i = 4; i < 16; i++) {
-        nonce[i] = 0;  // counter offset starts at 0, increments per call
-    }
+    // Bind the CTR nonce to this sensor and boot session. The public MAC and
+    // bootNonce prevent different sensors or cold boots from reusing a stream.
+    uint8_t ctrNonce[16];
+    memcpy(ctrNonce, mac, 6);
+    memcpy(ctrNonce + 6, &bootNonceValue, sizeof(bootNonceValue));
+    ctrNonce[10] = msgCount & 0xFF;
+    ctrNonce[11] = (msgCount >> 8) & 0xFF;
+    memset(ctrNonce + 12, 0, 4);
     
     uint8_t stream_block[16] = {0};
     size_t nc_off = 0;
-    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, nonce, stream_block, data, data);
+    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, ctrNonce, stream_block, data, data);
     mbedtls_aes_free(&aes);
 }
 
@@ -466,7 +528,6 @@ void wakeCycle() {
     
     if (serialEnabled) Serial.println("--- Transmit ---");
     transmitData();
-    delay(1000);
 
     if (serialEnabled) Serial.println("--- Receive ---");
     checkForUpdates();
@@ -520,6 +581,7 @@ void transmitData()
     // Prepare binary payload
     TelemetryPayload txPayload;
     esp_efuse_mac_get_default(txPayload.mac);
+    txPayload.bootNonce = bootNonce;
     txPayload.msgCount = ++counter;
     txPayload.temperature = (int16_t)(sensorData.temperature * 100); 
     txPayload.battVoltage = (uint16_t)(sensorData.batteryVoltage * 1000);
@@ -527,7 +589,7 @@ void transmitData()
     txPayload.isDevMode = (uint8_t)devMode;
     txPayload.needsTimeSync = isClockValid((time_t)sensorData.timestamp) ? 0 : 1;
     txPayload.sleepInterval = config.sleepInterval;
-    size_t txSize = 16; // Core payload size
+    size_t txSize = 20; // Core payload size
 
     if (devMode) {
         txPayload.battCurrent = (int16_t)sensorData.batteryCurrent;
@@ -537,7 +599,7 @@ void transmitData()
         txPayload.txPower = (int8_t)CONFIG_RADIO_OUTPUT_POWER;
         txPayload.lastSNR = (int8_t)sensorData.lastSNR;
         txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
-        txSize = sizeof(TelemetryPayload); // 27 bytes full size
+        txSize = sizeof(TelemetryPayload); // 31 bytes full size
     }
 
     if (serialEnabled) {
@@ -551,10 +613,10 @@ void transmitData()
         }
     }
 
-    // ENCRYPT the data portion (skip 8 bytes of MAC and msgCount, which act as the public IV)
-    size_t encryptedLength = txSize - 8;
-    uint8_t* dataPtr = ((uint8_t*)&txPayload) + 8;
-    cryptPayload(dataPtr, encryptedLength, txPayload.msgCount);
+    // Encrypt only after the public nonce material (MAC, boot nonce, counter).
+    size_t encryptedLength = txSize - 12;
+    uint8_t* dataPtr = ((uint8_t*)&txPayload) + 12;
+    cryptPayload(dataPtr, encryptedLength, txPayload.mac, txPayload.bootNonce, txPayload.msgCount);
 
     // Turn LED on during transmission
     digitalWrite(BOARD_LED, LED_ON);
@@ -564,6 +626,13 @@ void transmitData()
 
     // Transmit the raw binary struct directly
     transmissionState = radio.startTransmit((uint8_t*)&txPayload, txSize);
+
+    if (transmissionState != RADIOLIB_ERR_NONE) {
+        if (serialEnabled) Serial.printf("Failed to start TX (state %d)\n", transmissionState);
+        digitalWrite(BOARD_LED, !LED_ON);
+        radio.standby();
+        return;
+    }
 
     if (serialEnabled) {
         Serial.printf("Transmitting binary payload (%d bytes): %s\n", txSize, payload.c_str());
@@ -620,8 +689,8 @@ bool waitForUpdateBeacon()
     xSemaphoreTake(radioSemaphore, 0); // Clear semaphore
     radio.startReceive();// Start non-blocking background reception
     unsigned long startTime = millis();
-    // Calculate the time-on-air for a 1-byte beacon packet and add a 50ms margin.
-    uint32_t beaconAirtimeMs = (radio.getTimeOnAir(1) / 1000) + 50;
+    // Allow the gateway enough scheduling headroom to switch from RX to TX.
+    uint32_t beaconAirtimeMs = (radio.getTimeOnAir(1) / 1000) + 250;
     while (millis() - startTime < beaconAirtimeMs) {
         uint32_t elapsed = millis() - startTime;
         uint32_t remaining = beaconAirtimeMs > elapsed ? beaconAirtimeMs - elapsed : 0;
@@ -711,8 +780,6 @@ bool listenForConfig()
 
                         config.magicWord = RTC_MAGIC_WORD;
                         config.sleepInterval = rxConfig.sleepInterval;
-                        // Config token handling is currently disabled.
-                        // config.configVersion = rxConfig.configVersion;
                         config.isDevMode = (rxConfig.isDevMode > 0);
 
                         if (rxConfig.timeOffset > 0) {

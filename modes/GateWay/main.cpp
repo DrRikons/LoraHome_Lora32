@@ -191,7 +191,7 @@ static const unsigned long WIFI_RECONNECT_DELAY_MS = 10000;
 static const unsigned long NTP_SYNC_DELAY_MS = 30000;  // Delay between NTP Syncs (30 seconds)
 
 // Forward Function declarations
-void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount);
+void cryptPayload(uint8_t* data, size_t length, const uint8_t* mac, uint32_t bootNonceValue, uint16_t msgCount);
 void setup();
 void loop();
 void drawMain();
@@ -234,26 +234,22 @@ bool refreshRtcTrustFromSystemClock() {
     return hasValidRtcTime;
 }
 
-void cryptPayload(uint8_t* data, size_t length, uint16_t msgCount) {
+void cryptPayload(uint8_t* data, size_t length, const uint8_t* mac, uint32_t bootNonceValue, uint16_t msgCount) {
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
     mbedtls_aes_setkey_enc(&aes, AES_NETWORK_KEY, 128); // 128-bit AES
     
-    // SECURITY FIX: Use proper nonce construction instead of weak IV seeding
-    // The nonce combines msgCount (4 bytes) with counter offset (12 bytes)
-    uint8_t nonce[16];
-    uint32_t nonceValue = (uint32_t)msgCount << 12;  // Shift left by 12 bits
-    
-    for (int i = 0; i < 4; i++) {
-        nonce[i] = (nonceValue >> (i * 8)) & 0xFF;  // msgCount portion (4 bytes)
-    }
-    for (int i = 4; i < 16; i++) {
-        nonce[i] = 0;  // counter offset starts at 0, increments per call
-    }
+    // Match the sensor's MAC-scoped, per-boot CTR nonce.
+    uint8_t ctrNonce[16];
+    memcpy(ctrNonce, mac, 6);
+    memcpy(ctrNonce + 6, &bootNonceValue, sizeof(bootNonceValue));
+    ctrNonce[10] = msgCount & 0xFF;
+    ctrNonce[11] = (msgCount >> 8) & 0xFF;
+    memset(ctrNonce + 12, 0, 4);
     
     uint8_t stream_block[16] = {0};
     size_t nc_off = 0;
-    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, nonce, stream_block, data, data);
+    mbedtls_aes_crypt_ctr(&aes, length, &nc_off, ctrNonce, stream_block, data, data);
     mbedtls_aes_free(&aes);
 }
 
@@ -612,52 +608,7 @@ void initRadio() {
 
 void loop()
 {
-    // connect wifi-mqtt
-    static bool wasWifiConnected = false;
-    bool isWifiConnected = WiFi.isConnected();
-    
-    if (isWifiConnected) {
-        if (!wasWifiConnected) {
-            Logger.info(MYLOG, "::%s:: WiFi connected. Device IP: %s", string(__func__).substr(0, 5).c_str(), WiFi.localIP().toString().c_str());
-            wasWifiConnected = true;
-        }
-        if (!mqttClient.connected()) {
-            mqttConnect();
-        }
-        mqttClient.loop();
-    } else {
-        if (wasWifiConnected) {
-            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting..", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
-            wasWifiConnected = false;
-        }
-        // Attempt WiFi reconnection in the background
-        
-        if (millis() - lastWifiReconnectAttempt > WIFI_RECONNECT_DELAY_MS) {
-            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting...", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
-            WiFi.reconnect();
-            lastWifiReconnectAttempt = millis();
-        }
-    }
-    
-    // sync from NTP
-    static unsigned long lastNtpCheck = 0;
-    if (millis() - lastNtpCheck > NTP_SYNC_DELAY_MS) {
-        time_t now;
-        time(&now);
-        if (WiFi.isConnected()) {
-            if (!isClockValid(now)) {
-                Logger.warning(MYLOG, "::%s:: Time invalid, NTP syncing...", string(__func__).substr(0, 5).c_str());
-                configureSystemTime();
-            } else {
-                Logger.info(MYLOG, "::%s:: Time synced via NTP.", string(__func__).substr(0, 5).c_str());
-            }
-        } else {
-            Logger.debug(MYLOG, "::%s:: WiFi disconnected, skipping NTP sync.", string(__func__).substr(0, 5).c_str());
-        }
-        lastNtpCheck = millis();
-    }
-
-    // check if the semaphore has been given by the ISR
+    // Service the radio before any potentially blocking network maintenance.
     while (xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
         
         // process received data from the radio 
@@ -683,16 +634,16 @@ void loop()
 
             // decrypt the received payload
             Logger.debug(MYLOG, "::%s:: Received %d bytes from radio", string(__func__).substr(0, 5).c_str(), numBytes);
-            if (numBytes == 16 || numBytes == sizeof(TelemetryPayload)) {
+            if (numBytes == 20 || numBytes == sizeof(TelemetryPayload)) {
                 TelemetryPayload rxPayload;
                 // FIX: Cast to uint8_t* to treat both source and destination as raw byte arrays
                 // This prevents incorrect interpretation of bytes when copying to mixed-type struct
                 uint8_t* payloadPtr = (uint8_t*)&rxPayload;
                 memcpy(payloadPtr, byteArr, numBytes);
                 
-                size_t encryptedLength = numBytes - 8;
-                uint8_t* dataPtr = ((uint8_t*)&rxPayload) + 8;
-                cryptPayload(dataPtr, encryptedLength, rxPayload.msgCount);
+                size_t encryptedLength = numBytes - 12;
+                uint8_t* dataPtr = ((uint8_t*)&rxPayload) + 12;
+                cryptPayload(dataPtr, encryptedLength, rxPayload.mac, rxPayload.bootNonce, rxPayload.msgCount);
                 // TO DO: check that received paylaod has been decrytped successfuly
 
                 // --- TIME-CRITICAL SECTION: Respond to Sensor ---
@@ -705,6 +656,7 @@ void loop()
                 memcpy(txConfig.targetMac, rxPayload.mac, 6);
                 txConfig.networkKey = NETWORK_KEY;
                 txConfig.sleepInterval = 20; // Example config will be read from mqtt
+                txConfig.configVersion = 1;
                 txConfig.isDevMode = 1;      // Example config will be read from mqtt
 
                 //ensure RTC is synced before transmiting timeoffset
@@ -730,15 +682,19 @@ void loop()
                 
                 bool updatePending = (sensorNeedsConfig || rxPayload.needsTimeSync) && hasValidRtcTime; // enable beacon only if RTC is ok
                 if (updatePending) {
-                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    // Give the Sensor time to leave TX/standby and enter its beacon RX window.
+                    vTaskDelay(pdMS_TO_TICKS(50));
                     if (sendUpdateBeacon()) { // check if beacon was transmitted
                         xSemaphoreTake(radioSemaphore, 0); // clear before tx
                         int txState = radio.startTransmit((uint8_t*)&txConfig, sizeof(ConfigPayload)); // transmit sensor config
                         if (txState == RADIOLIB_ERR_NONE) {
-                            xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(5000)); // Block until TX finishes
-                            Logger.info(MYLOG, "::%s:: Config Sent", string(__func__).substr(0, 5).c_str());
-                            Logger.debug(MYLOG, "::%s:: Config: Sleep: %u | DevMode: %u | TimeOffset: %lu",
-                                                      string(__func__).substr(0, 5).c_str(), txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
+                            if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
+                                Logger.info(MYLOG, "::%s:: Config Sent", string(__func__).substr(0, 5).c_str());
+                                Logger.debug(MYLOG, "::%s:: Config: Sleep: %u | DevMode: %u | TimeOffset: %lu",
+                                                          string(__func__).substr(0, 5).c_str(), txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
+                            } else {
+                                Logger.error(MYLOG, "::%s:: Config TX timeout", string(__func__).substr(0, 5).c_str());
+                            }
                         } else {
                             Logger.error(MYLOG, "::%s:: Config startTransmit failed, code %d", string(__func__).substr(0, 5).c_str(), txState);
                         }
@@ -829,6 +785,41 @@ void loop()
             radio.startReceive();
         }
 
+    }
+
+    // Connect WiFi/MQTT only after any pending downlink has been sent.
+    static bool wasWifiConnected = false;
+    bool isWifiConnected = WiFi.isConnected();
+    if (isWifiConnected) {
+        if (!wasWifiConnected) {
+            Logger.info(MYLOG, "::%s:: WiFi connected. Device IP: %s", string(__func__).substr(0, 5).c_str(), WiFi.localIP().toString().c_str());
+            wasWifiConnected = true;
+        }
+        if (!mqttClient.connected()) {
+            mqttConnect();
+        }
+        mqttClient.loop();
+    } else {
+        if (wasWifiConnected) {
+            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting..", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
+            wasWifiConnected = false;
+        }
+        if (millis() - lastWifiReconnectAttempt > WIFI_RECONNECT_DELAY_MS) {
+            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting...", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
+            WiFi.reconnect();
+            lastWifiReconnectAttempt = millis();
+        }
+    }
+
+    static unsigned long lastNtpCheck = 0;
+    if (millis() - lastNtpCheck > NTP_SYNC_DELAY_MS) {
+        time_t now;
+        time(&now);
+        if (WiFi.isConnected() && !isClockValid(now)) {
+            Logger.warning(MYLOG, "::%s:: Time invalid, NTP syncing...", string(__func__).substr(0, 5).c_str());
+            configureSystemTime();
+        }
+        lastNtpCheck = millis();
     }
 
     // Rotate screen every 5 seconds

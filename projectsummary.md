@@ -1,5 +1,7 @@
 # Project Summary: LoRa32 Boiler Control
 
+Detailed implementation documentation and separate Sensor/Gateway workflow diagrams are in `FIRMWARE_GUIDE.md`.
+
 ## Architecture Overview
 1.  **Gateway (`modes/GateWay/main.cpp`)**: 
     - Always-on node with WiFi and MQTT capabilities.
@@ -23,19 +25,23 @@
 
 ## Payload Formats (AES-128-CTR Encrypted)
 - **TelemetryPayload**: Packed binary C++ `struct`.
-  - **Size**: 16 bytes (Normal Operation Mode) or 27 bytes (Dev Mode with extra metrics).
+  - **Size**: 20 bytes (Normal Operation Mode) or 31 bytes (Dev Mode with extra metrics).
+  - **Nonce**: The public MAC, random per-boot nonce, and message counter scope AES-CTR encryption.
   - **Content**: Includes `sleepInterval`, `isDevMode`, `needsTimeSync` flags, and sensor readings.
 - **ConfigPayload**: 19-byte binary structure.
   - `header`: 2 bytes (`"CF"`)
   - `targetMac`: 6 bytes
   - `networkKey`: 4 bytes
   - `sleepInterval`: 1 byte (deep sleep time in seconds)
+  - `configVersion`: 1 byte (currently `1`)
   - `isDevMode`: 1 byte (`1` to enable, `0` to disable)
   - `timeOffset`: 4 bytes (UTC epoch sync)
 
 ## Operating Modes
 - **Operation Mode**: Standard power-saving mode utilizing ESP32 deep sleep.
 - **Development Mode**: Bypasses deep sleep for continuous operation and simulation/testing. Can be toggled remotely via the configuration payload or physically overridden via `DEV_MODE_PIN` (GPIO13). Configuration states survive soft resets via `RTC_NOINIT_ATTR` memory.
+- **Sensor logging**: Serial diagnostics are prefixed with UTC after synchronization, otherwise elapsed boot time.
+- **Downlink timing**: The Sensor enters beacon RX immediately after uplink; the Gateway waits 50 ms before beacon TX for radio turnaround.
 
 *Note: This file is intended to provide a condensed context for AI coding assistants. Keep it updated alongside major structural changes.*
 ## Recent Changes
