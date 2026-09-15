@@ -8,6 +8,7 @@
 #include <mbedtls/aes.h>
 #include <LoRaHomeCommon.h>
 #include <LoRaBoards.h>
+#include <secrets.h>
 
 // Pin definitions
 #define DS18B20_PIN 4  // GPIO4 for DS18B20
