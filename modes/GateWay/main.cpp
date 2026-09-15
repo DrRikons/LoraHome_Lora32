@@ -187,6 +187,10 @@ static long lastWifiReconnectAttempt = 0;
 static bool mqttConnected = false;
 static const unsigned long MAX_RECONNECT_ATTEMPTS = 5;   // Maximum retry attempts
 static const unsigned long RECONNECT_DELAY_MS = 1000;    // Delay between retries (1 second)
+static const unsigned long MAX_MQTT_RECONNECT_DELAY_MS = 60000;
+static const unsigned long STATUS_MIN_INTERVAL_MS = 5000;
+static const unsigned long STATUS_HEARTBEAT_MS = 60000;
+static unsigned long mqttReconnectDelayMs = RECONNECT_DELAY_MS;
 static const unsigned long WIFI_RECONNECT_DELAY_MS = 10000;  
 static const unsigned long NTP_SYNC_DELAY_MS = 30000;  // Delay between NTP Syncs (30 seconds)
 
@@ -198,7 +202,7 @@ void drawMain();
 void configureSystemTime();
 bool refreshRtcTrustFromSystemClock();
 void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char* format);
-void mqttPublish(const char* topic, JsonDocument& doc);
+bool mqttPublish(const char* topic, JsonDocument& doc, bool retained = false);
 bool sendUpdateBeacon();
 bool isClockValid(time_t currentTime);
 bool hasClockDrift(time_t currentTime, time_t referenceTime, double thresholdSeconds);
@@ -800,6 +804,9 @@ void loop()
         if (!mqttClient.connected()) {
             mqttConnect();
         }
+        static bool mqttWasConnected = false;
+        bool mqttJustConnected = mqttClient.connected() && !mqttWasConnected;
+        mqttWasConnected = mqttClient.connected();
         mqttClient.loop();
         GatewayStatus status{};
         status.gatewayRssi = (int16_t)radio.getRSSI();
@@ -809,13 +816,25 @@ void loop()
         status.freeRam = ESP.getFreeHeap();
         static GatewayStatus lastStatus{};
         static bool hasPublishedStatus = false;
-        if (!hasPublishedStatus || memcmp(&status, &lastStatus, sizeof(status)) != 0) {
+        static unsigned long lastStatusPublishMs = 0;
+        // Heap fluctuates continuously; include it in published status but do
+        // not let it independently trigger another MQTT publication.
+        GatewayStatus comparableStatus = status;
+        GatewayStatus comparableLastStatus = lastStatus;
+        comparableStatus.freeRam = 0;
+        comparableLastStatus.freeRam = 0;
+        bool statusChanged = !hasPublishedStatus || memcmp(&comparableStatus, &comparableLastStatus, sizeof(status)) != 0;
+        bool statusDue = (millis() - lastStatusPublishMs) >= STATUS_HEARTBEAT_MS;
+        bool changeDue = statusChanged && (millis() - lastStatusPublishMs) >= STATUS_MIN_INTERVAL_MS;
+        if (mqttJustConnected || changeDue || statusDue) {
             StaticJsonDocument<256> statusDoc;
             jsonBuild(&status, statusDoc, nullptr, "gatewayStatus");
             String statusTopic = mqttTopic(nullptr, "gatewayStatus");
-            mqttPublish(statusTopic.c_str(), statusDoc);
-            lastStatus = status;
-            hasPublishedStatus = true;
+            if (mqttPublish(statusTopic.c_str(), statusDoc, true)) {
+                lastStatus = status;
+                hasPublishedStatus = true;
+                lastStatusPublishMs = millis();
+            }
         }
     } else {
         if (wasWifiConnected) {
@@ -947,33 +966,36 @@ void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, con
     }
 }
   
-void mqttPublish(const char* topic, JsonDocument& doc) {
+bool mqttPublish(const char* topic, JsonDocument& doc, bool retained) {
     if (!mqttClient.connected()) {
         Logger.warning(MYLOG, "::%s:: MQTT not connected. Cannot publish to %s", string(__func__).substr(0, 5).c_str(), topic);
-        return;
+        return false;
     }
     char jsonBuffer[256];
     size_t n = serializeJson(doc, jsonBuffer);
     if (n > 0) {
-        if (mqttClient.publish(topic, jsonBuffer)) {
+        if (mqttClient.publish(topic, jsonBuffer, retained)) {
             Logger.info(MYLOG, "::%s:: MQTT published to topic: %s", string(__func__).substr(0, 5).c_str(), topic);
             Logger.debug(MYLOG, "::%s:: Payload: %s", string(__func__).substr(0, 5).c_str(), jsonBuffer);
+            return true;
         } else {
             Logger.error(MYLOG, "::%s:: MQTT publish failed to topic: %s", string(__func__).substr(0, 5).c_str(), topic);
         }
     } else {
         Logger.error(MYLOG, "::%s:: JSON serialization failed for topic: %s", string(__func__).substr(0, 5).c_str(), topic);
     }
+    return false;
 }
 
 void mqttConnect() {
-    if (millis() - lastMqttReconnectAttempt > RECONNECT_DELAY_MS) {
+    if (millis() - lastMqttReconnectAttempt > mqttReconnectDelayMs) {
         Logger.info(MYLOG, "::%s:: Attempting MQTT connection...", string(__func__).substr(0, 5).c_str());
         String clientId = "LoraHomeGW-" + String((uint32_t)ESP.getEfuseMac(), HEX);
         
         if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
             Logger.info(MYLOG, "::%s:: MQTT connected!", string(__func__).substr(0, 5).c_str());
             mqttConnected = true;
+            mqttReconnectDelayMs = RECONNECT_DELAY_MS;
             GatewayStatus status{};
             status.gatewayRssi = (int16_t)radio.getRSSI();
             status.gatewaySnr = radio.getSNR();
@@ -987,6 +1009,7 @@ void mqttConnect() {
         } else {
             Logger.warning(MYLOG, "::%s:: MQTT connect failed, rc=%d. Trying again later.", string(__func__).substr(0, 5).c_str(), mqttClient.state());
             mqttConnected = false;
+            mqttReconnectDelayMs = min(mqttReconnectDelayMs * 2, MAX_MQTT_RECONNECT_DELAY_MS);
         }
         lastMqttReconnectAttempt = millis();
     }
