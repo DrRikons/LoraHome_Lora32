@@ -1,5 +1,7 @@
 # Project Summary: LoRa32 Boiler Control
 
+Gateway logging queues completed lines to one low-priority writer task, which exclusively writes UART and `/logs/active.log`; the file rotates to `/logs/archive/` at 1 MiB or daily. Lines use `[YYYY-MM-DD HH:MM:SS] [LEVEL] [Function] "message"`.
+
 Detailed implementation documentation and separate Sensor/Gateway workflow diagrams are in `FIRMWARE_GUIDE.md`.
 
 ## Architecture Overview
@@ -53,7 +55,7 @@ Detailed implementation documentation and separate Sensor/Gateway workflow diagr
 - Replaced deprecated `ICACHE_RAM_ATTR` with `IRAM_ATTR` for ESP32.
 - Handled NTP synchronization validation without relying on the non-standard `timeSync()` function.
 - Added cross-version compatibility support for `ArduinoJson` (v6 and v7).
-- Replaced `Serial.print` with native ESP-IDF `esp_log` macros, redirecting to an asynchronous FreeRTOS queue for non-blocking SD card logging.
+- Replaced ESP-IDF log interception and string parsing with queued UART/SD logging; calls capture their function name automatically, and a single writer owns the active/archive file handling.
 - Removed redundant function name injection (`[%s]`, `__func__`) from `ESP_LOG` statements.
 - Formatted human-readable date strings into the MQTT telemetry payload if the hardware clock is synced.
 - Prepended local datetime stamps to all asynchronous `esp_log` outputs (UART and SD card) when the clock is valid.

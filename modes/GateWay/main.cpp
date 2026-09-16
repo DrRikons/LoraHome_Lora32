@@ -14,12 +14,10 @@
 #include <SPI.h>
 #include <Crypto.h>
 #include <AES.h>
-#include <Elog.h>
+#include <GatewayLogSink.h>
 #include <uptime.h>
 #include <secrets.h> // WiFi and MQTT credentials
 
-// ELog configuration
-#define MYLOG 0  // Gateway log ID
 // NTP Configuration
 #define TZ_INFO "EET-2EEST,M3.5.0/3,M10.5.0/4" // Europe/Athens
 // MQTT Configuration
@@ -263,14 +261,14 @@ bool sendUpdateBeacon() {
     int txState = radio.startTransmit(&beacon, 1);
     if (txState == RADIOLIB_ERR_NONE) {
         if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            Logger.info(MYLOG, "::%s:: Update beacon transmitted." , string(__func__).substr(0, 5).c_str());
+            GW_LOG_INFO("Update beacon transmitted.");
             return true;
         } else {
-            Logger.warning(MYLOG, "::%s:: Update beacon TX timeout!", string(__func__).substr(0, 5).c_str());
+            GW_LOG_WARN("Update beacon TX timeout!");
             return false;
         }
     }
-    Logger.error(MYLOG, "::%s:: Update beacon startTransmit failed, code %d", string(__func__).substr(0, 5).c_str(), txState);
+    GW_LOG_ERROR("Update beacon startTransmit failed, code %d", txState);
     return false;
 }
 
@@ -313,17 +311,19 @@ void setup()
 
     setupBoards();
 
-    // Initialize Logger with Serial and SD output
-    // Register console output (Serial)
-    Logger.registerSerial(MYLOG, ELOG_LEVEL_DEBUG, "GW");
+    // FAT timestamps use the ESP32 system clock. Start at the project epoch
+    // until NTP supplies real UTC, rather than creating pre-2024 log files.
+    time_t bootClock;
+    time(&bootClock);
+    if (bootClock < (time_t)CUSTOM_EPOCH) {
+        struct timeval fallbackTime;
+        fallbackTime.tv_sec = (time_t)CUSTOM_EPOCH;
+        fallbackTime.tv_usec = 0;
+        settimeofday(&fallbackTime, nullptr);
+    }
 
-    // Configure and register SD card output
-    Logger.configureSd(SDCardSPI, SDCARD_CS, 2000000, SHARED_SPI);
-    // SD card is already initialized by setupBoards(), just register the logger
-    Logger.registerSd(MYLOG, ELOG_LEVEL_DEBUG, "gateway", ELOG_FLAG_NONE, 102400);
-
-    // Simulate the time by providing a fixed time to the RTC (You can also use the NTP time)
-    Logger.provideTime(2024, 01, 01, 0, 0, 0); //<-- CUSTOM_EPOCH
+    // Gateway logging writes each completed line directly to UART and the SD card.
+    gatewayLogSink.begin();
     // Initialize the FreeRTOS semaphore
     radioSemaphore = xSemaphoreCreateBinary();
 
@@ -346,15 +346,15 @@ void setup()
     refreshRtcTrustFromSystemClock();  // Check and set hasValidRtcTime based on current RTC time
     
     if (hasValidRtcTime) {
-        Logger.info(MYLOG, "::%s:: Recovered time from internal ESP32 RTC after soft reset.", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("Recovered time from internal ESP32 RTC after soft reset.");
     } else {
         configureSystemTime(); // Ensure SNTP is configured if RTC time is not valid
         time(&sysTime);
-        Logger.info(MYLOG, "::%s:: RTC not valid, syncing time from NTP server.", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("RTC not valid, syncing time from NTP server.");
         
         // Check if NTP sync succeeded
         if (!isClockValid(sysTime)) {
-            Logger.warning(MYLOG, "::%s:: NTP sync failed. setup will proceed with invalid time.", string(__func__).substr(0, 5).c_str());
+            GW_LOG_WARN("NTP sync failed. setup will proceed with invalid time.");
         }
     }
     
@@ -377,9 +377,9 @@ void initRadio() {
     int state = radio.begin();
 
     if (state == RADIOLIB_ERR_NONE) {
-        Logger.info(MYLOG, "::%s:: [%s]: Radio Initializing ... success!", string(__func__).substr(0, 5).c_str(), RADIO_TYPE_STR);
+        GW_LOG_INFO("[%s]: Radio Initializing ... success!", RADIO_TYPE_STR);
     } else {
-        Logger.error(MYLOG, "::%s:: [%s]: Radio Initializing ... failed, code %d", string(__func__).substr(0, 5).c_str(), RADIO_TYPE_STR, state);
+        GW_LOG_ERROR("[%s]: Radio Initializing ... failed, code %d", RADIO_TYPE_STR, state);
         while (true);
     }
 
@@ -398,10 +398,10 @@ void initRadio() {
     int configErrors = 0;
 
     if (radio.setFrequency(CONFIG_RADIO_FREQ) == RADIOLIB_ERR_INVALID_FREQUENCY) {
-        Logger.error(MYLOG, "::%s:: Selected frequency is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Selected frequency is invalid for this module!");
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: Freq: %.1f MHz OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_FREQ);
+        GW_LOG_INFO("Freq: %.1f MHz OK", CONFIG_RADIO_FREQ);
     }
 
     /*
@@ -412,10 +412,10 @@ void initRadio() {
     *   LR1121        : Allowed values are 62.5, 125.0, 250.0 and 500.0 kHz.
     * * * */
     if (radio.setBandwidth(CONFIG_RADIO_BW) == RADIOLIB_ERR_INVALID_BANDWIDTH) {
-        Logger.error(MYLOG, "::%s:: Selected bandwidth is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Selected bandwidth is invalid for this module!");
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: BW: %.1f kHz OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_BW);
+        GW_LOG_INFO("BW: %.1f kHz OK", CONFIG_RADIO_BW);
     }
 
 
@@ -427,10 +427,10 @@ void initRadio() {
     * LR1121        :  Allowed values range from 5 to 12.
     * * * */
     if (radio.setSpreadingFactor(9) == RADIOLIB_ERR_INVALID_SPREADING_FACTOR) {
-        Logger.error(MYLOG, "::%s:: Selected spreading factor is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Selected spreading factor is invalid for this module!");
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: SF: 9 OK", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("SF: 9 OK");
     }
 
     /*
@@ -440,10 +440,10 @@ void initRadio() {
     * LR1121        :  Allowed values range from 5 to 8.
     * * * */
     if (radio.setCodingRate(5) == RADIOLIB_ERR_INVALID_CODING_RATE) {
-        Logger.error(MYLOG, "::%s:: Selected coding rate is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Selected coding rate is invalid for this module!");
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: CR: 4/5 OK", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("CR: 4/5 OK");
     }
 
     /*
@@ -451,10 +451,10 @@ void initRadio() {
     * SX1278/SX1276/SX1268/SX1262/SX1280 : Sets LoRa sync word. Only available in LoRa mode.
     * * */
     if (radio.setSyncWord(0xAB) != RADIOLIB_ERR_NONE) {
-        Logger.error(MYLOG, "::%s:: Unable to set sync word!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Unable to set sync word!");
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: SW: 0xAB OK", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("SW: 0xAB OK");
     }
 
     /*
@@ -466,10 +466,10 @@ void initRadio() {
     * LR1121        :  Allowed values are in range from -17 to 22 dBm (high-power PA) or -18 to 13 dBm (High-frequency PA), PA Version range : -9 ~ 0dBm
     * * * */
     if (radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER) == RADIOLIB_ERR_INVALID_OUTPUT_POWER) {
-        Logger.error(MYLOG, "::%s:: Selected output power is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Selected output power is invalid for this module!");
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: TX Power: %ddBm OK", string(__func__).substr(0, 5).c_str(), CONFIG_RADIO_OUTPUT_POWER);
+        GW_LOG_INFO("TX Power: %ddBm OK", CONFIG_RADIO_OUTPUT_POWER);
     }
 
 #if !defined(USING_SX1280) && !defined(USING_LR1121) && !defined(USING_SX1280PA)
@@ -480,10 +480,10 @@ void initRadio() {
     * NOTE: set value to 0 to disable overcurrent protection
     * * * */
     if (radio.setCurrentLimit(140) == RADIOLIB_ERR_INVALID_CURRENT_LIMIT) {
-        Logger.error(MYLOG, "::%s:: Selected current limit is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Selected current limit is invalid for this module!");
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: Current Limit: 140 mA OK", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("Current Limit: 140 mA OK");
     }
 #endif
 
@@ -502,10 +502,10 @@ void initRadio() {
 
     // Enables or disables CRC check of received packets.
     if (radio.setCRC(true) == RADIOLIB_ERR_INVALID_CRC_CONFIGURATION) {
-        Logger.error(MYLOG, "::%s:: Selected CRC configuration is invalid for this module!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Selected CRC configuration is invalid for this module!");
         configErrors++;
     } else {
-        Logger.info(MYLOG, "::%s:: CRC: Enabled OK", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("CRC: Enabled OK");
     }
 
     // ============================================================================
@@ -513,11 +513,11 @@ void initRadio() {
     // ============================================================================
     
     if (configErrors > 0) {
-        Logger.warning(MYLOG, "::%s:: Radio configuration completed with %d error(s).", string(__func__).substr(0, 5).c_str(), configErrors);
-        Logger.warning(MYLOG, "::%s:: The radio may still function, but some parameters were not set correctly.", string(__func__).substr(0, 5).c_str());
-        Logger.warning(MYLOG, "::%s:: Please check hardware connections and power supply stability.", string(__func__).substr(0, 5).c_str());
+        GW_LOG_WARN("Radio configuration completed with %d error(s).", configErrors);
+        GW_LOG_WARN("The radio may still function, but some parameters were not set correctly.");
+        GW_LOG_WARN("Please check hardware connections and power supply stability.");
     } else {
-        Logger.info(MYLOG, "::%s:: All radio parameters configured successfully!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("All radio parameters configured successfully!");
     }
 
     // Delay to allow radio internal circuits to stabilize after configuration
@@ -526,14 +526,14 @@ void initRadio() {
 #if  defined(USING_LR1121)
 #if defined(USING_LR1121PA)
     if (CONFIG_RADIO_FREQ < 2400) {
-        Logger.info(MYLOG, "::%s:: LR1121 PA Version Using low frequency switch table for PA version", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("LR1121 PA Version Using low frequency switch table for PA version");
         radio.setRfSwitchTable(pa_version_rf_switch_dio_pins, low_freq_switch_table);
     } else {
-        Logger.info(MYLOG, "::%s:: LR1121 PA Version Using high frequency switch table for PA version", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("LR1121 PA Version Using high frequency switch table for PA version");
         radio.setRfSwitchTable(pa_version_rf_switch_dio_pins, high_freq_switch_table);
     }
 #else   //  Version without PA rf switch table
-    Logger.info(MYLOG, "::%s:: LR1121 without PA Version", string(__func__).substr(0, 5).c_str());
+    GW_LOG_INFO("LR1121 without PA Version");
     static const uint32_t rfswitch_dio_pins[] = {
         RADIOLIB_LR11X0_DIO5, RADIOLIB_LR11X0_DIO6,
         RADIOLIB_NC, RADIOLIB_NC, RADIOLIB_NC
@@ -564,7 +564,7 @@ void initRadio() {
     // NOTE: As long as DIO2 is configured to control RF switch,
     //       it can't be used as interrupt pin!
     if (radio.setDio2AsRfSwitch() != RADIOLIB_ERR_NONE) {
-        Logger.error(MYLOG, "::%s:: Failed to set DIO2 as RF switch!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("Failed to set DIO2 as RF switch!");
         while (true);
     }
 #endif //USING_SX1262
@@ -592,7 +592,7 @@ void initRadio() {
 #endif
 
 #ifdef RADIO_CTRL
-    Logger.info(MYLOG, "::%s:: Turn on LAN, Enter Rx mode.", string(__func__).substr(0, 5).c_str());
+    GW_LOG_INFO("Turn on LAN, Enter Rx mode.");
     /*
     * 2W and BPF LoRa LAN Control ,set HIGH turn on LAN ,RX Mode
     * */
@@ -604,9 +604,9 @@ void initRadio() {
     // start listening for LoRa packets
     state = radio.startReceive();
     if (state == RADIOLIB_ERR_NONE) {
-        Logger.info(MYLOG, "::%s:: Radio started listening successfully!", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("Radio started listening successfully!");
     } else {
-        Logger.error(MYLOG, "::%s:: Radio failed to start, code %d", string(__func__).substr(0, 5).c_str(), state);
+        GW_LOG_ERROR("Radio failed to start, code %d", state);
     }
 }
 
@@ -621,7 +621,7 @@ void loop()
         
         // Memory safety: Validate packet length against buffer size
         if (numBytes <= 0 || numBytes > sizeof(byteArr)) {
-            Logger.warning(MYLOG, "::%s:: Invalid packet length from radio: %d bytes", string(__func__).substr(0, 5).c_str(), numBytes);
+            GW_LOG_WARN("Invalid packet length from radio: %d bytes", numBytes);
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
             continue; // Skip to next semaphore check in loop
@@ -637,7 +637,7 @@ void loop()
             snr = String(radio.getSNR()) + "dB";
 
             // decrypt the received payload
-            Logger.debug(MYLOG, "::%s:: Received %d bytes from radio", string(__func__).substr(0, 5).c_str(), numBytes);
+            GW_LOG_DEBUG("Received %d bytes from radio", numBytes);
             if (numBytes == 20 || numBytes == sizeof(TelemetryPayload)) {
                 TelemetryPayload rxPayload;
                 // FIX: Cast to uint8_t* to treat both source and destination as raw byte arrays
@@ -666,7 +666,7 @@ void loop()
                 //ensure RTC is synced before transmiting timeoffset
                 if (!hasValidRtcTime) {
                     if (!refreshRtcTrustFromSystemClock()){
-                        Logger.warning(MYLOG, "::%s:: Unable to Sync from NTP server.", string(__func__).substr(0, 5).c_str());
+                        GW_LOG_WARN("Unable to Sync from NTP server.");
                     } 
                 } 
                 
@@ -678,7 +678,7 @@ void loop()
                     bool timeSyncPending = (txConfig.timeOffset > 0) && (rxPayload.needsTimeSync != 0);
                 } else {
                     txConfig.timeOffset = 0;
-                    Logger.warning(MYLOG, "::%s:: Update Beacon will be dropped this loop.", string(__func__).substr(0, 5).c_str());
+                    GW_LOG_WARN("Update Beacon will be dropped this loop.");
                 }
 
                 // determine and transmit the update beacon 
@@ -693,18 +693,18 @@ void loop()
                         int txState = radio.startTransmit((uint8_t*)&txConfig, sizeof(ConfigPayload)); // transmit sensor config
                         if (txState == RADIOLIB_ERR_NONE) {
                             if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(5000)) == pdTRUE) {
-                                Logger.info(MYLOG, "::%s:: Config Sent", string(__func__).substr(0, 5).c_str());
-                                Logger.debug(MYLOG, "::%s:: Config: Sleep: %u | DevMode: %u | TimeOffset: %lu",
-                                                          string(__func__).substr(0, 5).c_str(), txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
+                                GW_LOG_INFO("Config Sent");
+                                GW_LOG_DEBUG("Config: Sleep: %u | DevMode: %u | TimeOffset: %lu",
+                                             txConfig.sleepInterval, txConfig.isDevMode, (unsigned long)txConfig.timeOffset);
                             } else {
-                                Logger.error(MYLOG, "::%s:: Config TX timeout", string(__func__).substr(0, 5).c_str());
+                                GW_LOG_ERROR("Config TX timeout");
                             }
                         } else {
-                            Logger.error(MYLOG, "::%s:: Config startTransmit failed, code %d", string(__func__).substr(0, 5).c_str(), txState);
+                            GW_LOG_ERROR("Config startTransmit failed, code %d", txState);
                         }
                     }
                 } else {
-                     Logger.info(MYLOG, "::%s:: No config or time update pending.", string(__func__).substr(0, 5).c_str());
+                     GW_LOG_INFO("No config or time update pending.");
                 }
                 // --- END OF TIME-CRITICAL SECTION ---
                 // Clear any lingering semaphore from the TX operations
@@ -720,14 +720,14 @@ void loop()
                 // contain the core telemetry fields and must be published.
                 sensorHasTelemetry = (numBytes == 20 || numBytes == sizeof(TelemetryPayload));
                 if (sensorHasTelemetry) {
-                    Logger.debug(MYLOG, "::%s:: Sensor payload has data", string(__func__).substr(0, 5).c_str());
-                    Logger.debug(MYLOG, "::%s:: Reconstructing MAC Adress", string(__func__).substr(0, 5).c_str());
+                    GW_LOG_DEBUG("Sensor payload has data");
+                    GW_LOG_DEBUG("Reconstructing MAC Adress");
                     char macStr[18];
                     sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", 
                             rxPayload.mac[0], rxPayload.mac[1], rxPayload.mac[2],
                             rxPayload.mac[3], rxPayload.mac[4], rxPayload.mac[5]);
                     sensorMac = String(macStr);
-                    Logger.debug(MYLOG, "::%s:: Normalising telemetry values for debug", string(__func__).substr(0, 5).c_str());
+                    GW_LOG_DEBUG("Normalising telemetry values for debug");
                     sensorTemp = rxPayload.temperature / 100.0f;
                     sensorVcc = rxPayload.battVoltage / 1000.0f;
                     sensorBatt = rxPayload.battPercent;
@@ -743,13 +743,13 @@ void loop()
                         sensorTxPower = rxPayload.txPower;
                         sensorSNR = rxPayload.lastSNR;
                         sensorRSSI = rxPayload.lastRSSI;
-                        Logger.debug(MYLOG, "::%s:: DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm", 
-                                  string(__func__).substr(0, 5).c_str(), sensorCpuTemp, sensorFreeRam, sensorBattCurrent, sensorBattPower, sensorTxPower, sensorSNR, sensorRSSI);
+                        GW_LOG_DEBUG("DEV Mode -> CPU Temp: %dC | RAM: %uKB | I: %dmA | Pow: %dmW | TX: %ddBm | LastCfg SNR: %ddB | LastCfg RSSI: %ddBm",
+                                     sensorCpuTemp, sensorFreeRam, sensorBattCurrent, sensorBattPower, sensorTxPower, sensorSNR, sensorRSSI);
                     }        
-                    Logger.info(MYLOG, "::%s:: Radio Received packet! MAC: %s | Msg: %u", string(__func__).substr(0, 5).c_str(), macStr, msgCount);
-                    Logger.info(MYLOG, "::%s:: Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s", 
-                                  string(__func__).substr(0, 5).c_str(), sensorTemp, sensorVcc, sensorBatt, (unsigned long)sensorSleepInterval, 
-                                  sensorIsDevMode, sensorNeedsTimeSync ? "yes" : "no");
+                    GW_LOG_INFO("Radio Received packet! MAC: %s | Msg: %u", macStr, msgCount);
+                    GW_LOG_INFO("Temp: %.1fC | VCC: %.2fV | Batt: %d%% | Sleep: %lu | DevMode: %u | NeedsTimeSync: %s",
+                                sensorTemp, sensorVcc, sensorBatt, (unsigned long)sensorSleepInterval, sensorIsDevMode,
+                                sensorNeedsTimeSync ? "yes" : "no");
                     
                     // compose telemetry json and publish to mqtt broker                    
                     if (mqttClient.connected()) {
@@ -757,14 +757,14 @@ void loop()
                         jsonBuild(&rxPayload, docCore, &sensorMac, "core"); 
                         String telemetryDataTopic = mqttTopic(&sensorMac, "core");
                         mqttPublish(telemetryDataTopic.c_str(), docCore);
-                        Logger.debug(MYLOG, "::%s:: Sensor telemetry data published: %s : %s", string(__func__).substr(0, 5).c_str(), telemetryDataTopic.c_str(), docCore.as<String>().c_str());
+                        GW_LOG_DEBUG("Sensor telemetry data published: %s : %s", telemetryDataTopic.c_str(), docCore.as<String>().c_str());
 
                         if (rxPayload.isDevMode == 1){
                             StaticJsonDocument<512> docDev; 
                             jsonBuild(&rxPayload, docDev, &sensorMac, "dev");
                             String devTelemetryDataTopic = mqttTopic(&sensorMac, "dev");
                             mqttPublish(devTelemetryDataTopic.c_str(), docDev);
-                            Logger.debug(MYLOG, "::%s:: Sensor dev telemetry data published: %s : %s", string(__func__).substr(0, 5).c_str(), devTelemetryDataTopic.c_str(), docDev.as<String>().c_str());  
+                            GW_LOG_DEBUG("Sensor dev telemetry data published: %s : %s", devTelemetryDataTopic.c_str(), docDev.as<String>().c_str());
                         }
                     }
                     
@@ -774,19 +774,19 @@ void loop()
                 drawMain();
 
             } else {
-                Logger.warning(MYLOG, "::%s:: Received unknown packet of %d bytes", string(__func__).substr(0, 5).c_str(), numBytes);
+                GW_LOG_WARN("Received unknown packet of %d bytes", numBytes);
                 xSemaphoreTake(radioSemaphore, 0);
                 radio.startReceive();
             }
 
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
             // packet was received, but is malformed
-            Logger.error(MYLOG, "::%s:: CRC error!", string(__func__).substr(0, 5).c_str());
+            GW_LOG_ERROR("CRC error!");
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
         } else {
             // some other error occurred
-            Logger.error(MYLOG, "::%s:: Receive failed, code %d", string(__func__).substr(0, 5).c_str(), state);
+            GW_LOG_ERROR("Receive failed, code %d", state);
             xSemaphoreTake(radioSemaphore, 0);
             radio.startReceive();
         }
@@ -798,7 +798,7 @@ void loop()
     bool isWifiConnected = WiFi.isConnected();
     if (isWifiConnected) {
         if (!wasWifiConnected) {
-            Logger.info(MYLOG, "::%s:: WiFi connected. Device IP: %s", string(__func__).substr(0, 5).c_str(), WiFi.localIP().toString().c_str());
+            GW_LOG_INFO("WiFi connected. Device IP: %s", WiFi.localIP().toString().c_str());
             wasWifiConnected = true;
         }
         if (!mqttClient.connected()) {
@@ -838,11 +838,11 @@ void loop()
         }
     } else {
         if (wasWifiConnected) {
-            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting..", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
+            GW_LOG_WARN("WiFi %s. Reconnecting..", getWifiStatusString(WiFi.status()));
             wasWifiConnected = false;
         }
         if (millis() - lastWifiReconnectAttempt > WIFI_RECONNECT_DELAY_MS) {
-            Logger.warning(MYLOG, "::%s:: WiFi %s. Reconnecting...", string(__func__).substr(0, 5).c_str(), getWifiStatusString(WiFi.status()));
+            GW_LOG_WARN("WiFi %s. Reconnecting...", getWifiStatusString(WiFi.status()));
             WiFi.reconnect();
             lastWifiReconnectAttempt = millis();
         }
@@ -853,7 +853,7 @@ void loop()
         time_t now;
         time(&now);
         if (WiFi.isConnected() && !isClockValid(now)) {
-            Logger.warning(MYLOG, "::%s:: Time invalid, NTP syncing...", string(__func__).substr(0, 5).c_str());
+            GW_LOG_WARN("Time invalid, NTP syncing...");
             configureSystemTime();
         }
         lastNtpCheck = millis();
@@ -953,7 +953,7 @@ void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, con
                 break;
         }
     } else{
-        Logger.error(MYLOG, "::%s:: null pointer exception caused by rawPayload or mode", string(__func__).substr(0, 5).c_str());
+        GW_LOG_ERROR("null pointer exception caused by rawPayload or mode");
     }
 
     #undef TO_JSON_FIELD
@@ -968,32 +968,32 @@ void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, con
   
 bool mqttPublish(const char* topic, JsonDocument& doc, bool retained) {
     if (!mqttClient.connected()) {
-        Logger.warning(MYLOG, "::%s:: MQTT not connected. Cannot publish to %s", string(__func__).substr(0, 5).c_str(), topic);
+        GW_LOG_WARN("MQTT not connected. Cannot publish to %s", topic);
         return false;
     }
     char jsonBuffer[256];
     size_t n = serializeJson(doc, jsonBuffer);
     if (n > 0) {
         if (mqttClient.publish(topic, jsonBuffer, retained)) {
-            Logger.info(MYLOG, "::%s:: MQTT published to topic: %s", string(__func__).substr(0, 5).c_str(), topic);
-            Logger.debug(MYLOG, "::%s:: Payload: %s", string(__func__).substr(0, 5).c_str(), jsonBuffer);
+            GW_LOG_INFO("MQTT published to topic: %s", topic);
+            GW_LOG_DEBUG("Payload: %s", jsonBuffer);
             return true;
         } else {
-            Logger.error(MYLOG, "::%s:: MQTT publish failed to topic: %s", string(__func__).substr(0, 5).c_str(), topic);
+            GW_LOG_ERROR("MQTT publish failed to topic: %s", topic);
         }
     } else {
-        Logger.error(MYLOG, "::%s:: JSON serialization failed for topic: %s", string(__func__).substr(0, 5).c_str(), topic);
+        GW_LOG_ERROR("JSON serialization failed for topic: %s", topic);
     }
     return false;
 }
 
 void mqttConnect() {
     if (millis() - lastMqttReconnectAttempt > mqttReconnectDelayMs) {
-        Logger.info(MYLOG, "::%s:: Attempting MQTT connection...", string(__func__).substr(0, 5).c_str());
+        GW_LOG_INFO("Attempting MQTT connection...");
         String clientId = "LoraHomeGW-" + String((uint32_t)ESP.getEfuseMac(), HEX);
         
         if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
-            Logger.info(MYLOG, "::%s:: MQTT connected!", string(__func__).substr(0, 5).c_str());
+            GW_LOG_INFO("MQTT connected!");
             mqttConnected = true;
             mqttReconnectDelayMs = RECONNECT_DELAY_MS;
             GatewayStatus status{};
@@ -1007,7 +1007,7 @@ void mqttConnect() {
             String statusTopic = mqttTopic(nullptr, "gatewayStatus");
             mqttPublish(statusTopic.c_str(), statusDoc);
         } else {
-            Logger.warning(MYLOG, "::%s:: MQTT connect failed, rc=%d. Trying again later.", string(__func__).substr(0, 5).c_str(), mqttClient.state());
+            GW_LOG_WARN("MQTT connect failed, rc=%d. Trying again later.", mqttClient.state());
             mqttConnected = false;
             mqttReconnectDelayMs = min(mqttReconnectDelayMs * 2, MAX_MQTT_RECONNECT_DELAY_MS);
         }
