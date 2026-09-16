@@ -3,6 +3,14 @@ Based on https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/e
 
 For a complete firmware walkthrough, separate Sensor/Gateway architecture diagrams, and LoRa message flows, see [FIRMWARE_GUIDE.md](FIRMWARE_GUIDE.md).
 ## Configuration
+At boot, the Gateway reads `/config.json` from the SD-card root. If absent, it creates the file with blank WiFi/MQTT values and sensor defaults of 20 seconds and development mode enabled. Invalid fields retain those defaults.
+If a card is inserted after boot, the Gateway retries SD initialization every five seconds and creates the same initial configuration and log directories. A newly created configuration is reported as a template to edit; missing files do not generate read-only VFS errors.
+If the inserted card already contains a valid `/config.json`, its WiFi and MQTT settings are applied immediately without rebooting.
+
+```json
+{"wifi":{"ssid":"SSID","password":"PASSWORD"},"mqtt":{"host":"broker.example","user":"USER","password":"PASSWORD"},"sensor":{"defaultSleepSeconds":20,"defaultDevMode":true}}
+```
+
 The sensor node is configured remotely over a two-step LoRa downlink. To conserve power, the sensor listens for a configuration beacon once every 10 sleep cycles, or if its internal clock is not synchronized. It opens the beacon RX window immediately after the telemetry uplink; the Gateway waits 50 ms for this RX turnaround before transmitting the 1-byte beacon. Only if that beacon is received does the Sensor keep its radio on to listen for the full configuration payload. The reception logic dynamically allocates buffer space based on reported packet length to prevent false-negative evaluations or FIFO lockups during RX.
 
 ### Configuration Payload Format
@@ -24,6 +32,7 @@ The project is divided into two main modes:
 
 -   `GateWay`: The gateway node receives, decrypts, parses, and displays sensor data; it prioritizes the beacon/config reply before slower MQTT work. Telemetry AES-CTR nonces include each sensor MAC, a random boot nonce, and the message counter.
 -  **Logging & MQTT**: Gateway logging queues completed lines for one low-priority writer task, which exclusively writes UART and `/logs/active.log`; the file rotates into `/logs/archive/` at 1 MiB or a local-day change. Log lines use `[YYYY-MM-DD HH:MM:SS] [LEVEL] [Function] "message"`. Sent MQTT payloads are also automatically injected with an ISO-8601 formatted `timestamp` property once the NTP validates.
+Gateway radio events are always serviced before SD, WiFi, MQTT, display, or other background work; queued radio events defer that work to the next loop.
 Received sensor data is published securely over TLS as JSON payloads to separate topics. Gateway status is published to `lorahome/gateway/status`. Sensor data is published to `lorahome/sensor/<sensor_mac>/data` for operational mode, and `lorahome/sensor/<sensor_mac>/telemetry` for development mode.
 Gateway status contains radio RSSI/SNR, WiFi state, IP address, and free RAM. Free RAM is included in status messages but does not independently trigger publication.
 Both valid telemetry packet sizes are published: 20-byte operation-mode payloads publish core data, while 31-byte development payloads also publish the development metrics.

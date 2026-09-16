@@ -1,6 +1,11 @@
 # Project Summary: LoRa32 Boiler Control
 
 Gateway logging queues completed lines to one low-priority writer task, which exclusively writes UART and `/logs/active.log`; the file rotates to `/logs/archive/` at 1 MiB or daily. Lines use `[YYYY-MM-DD HH:MM:SS] [LEVEL] [Function] "message"`.
+Gateway reads `/config.json` on boot for WiFi, MQTT, and default sensor sleep/mode values; absent files are created with blank network values without read-only VFS errors, and invalid fields keep those defaults.
+When no card is present at boot, the Gateway retries SD initialization every five seconds after insertion.
+Valid configuration from a card inserted after boot is applied to WiFi and MQTT without rebooting.
+SD mount failures are emitted once through the Gateway logger instead of raw SD/VFS diagnostics.
+Gateway loop processing gives queued radio events priority over SD, network, display, and other background work.
 
 Detailed implementation documentation and separate Sensor/Gateway workflow diagrams are in `FIRMWARE_GUIDE.md`.
 

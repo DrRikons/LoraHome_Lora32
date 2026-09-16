@@ -8,14 +8,22 @@
 
 class GatewayLogSink {
 public:
-    void begin() {
-        SD.mkdir("/logs");
-        SD.mkdir("/logs/archive");
+    void begin(bool sdAvailable) {
+        sdReady() = sdAvailable;
+        if (sdReady()) {
+            SD.mkdir("/logs");
+            SD.mkdir("/logs/archive");
+            File active = SD.open("/logs/active.log", FILE_APPEND);
+            if (active) active.close();
+            else sdReady() = false;
+        }
         if (!queue()) queue() = xQueueCreate(32, sizeof(LogLine));
         if (queue() && !writerStarted()) {
             writerStarted() = xTaskCreatePinnedToCore(writerTask, "gatewayLogWriter", 4096, nullptr, 1, nullptr, 0) == pdPASS;
         }
     }
+
+    bool isSdReady() const { return sdReady(); }
 
     template <typename... Args>
     void write(const char* level, const char* functionName, const char* format, Args... args) {
@@ -43,6 +51,7 @@ private:
 
     static QueueHandle_t& queue() { static QueueHandle_t value = nullptr; return value; }
     static bool& writerStarted() { static bool value = false; return value; }
+    static bool& sdReady() { static bool value = false; return value; }
     static int& lastDay() { static int value = -1; return value; }
 
     static void writerTask(void*) {
@@ -56,19 +65,28 @@ private:
     }
 
     static void writeToSd(const char* line) {
-        if (SD.cardSize() == 0) return;
+        if (!sdReady()) return;
+        if (SD.cardType() == CARD_NONE) {
+            sdReady() = false;
+            return;
+        }
+        SD.mkdir("/logs");
+        SD.mkdir("/logs/archive");
         rotateIfNeeded();
-        File file = SD.open("/logs/active.log", FILE_WRITE);
+        File file = SD.open("/logs/active.log", FILE_APPEND);
         if (file) {
             file.print(line);
             file.close();
+        } else {
+            sdReady() = false;
         }
     }
 
     static void rotateIfNeeded() {
         File active = SD.open("/logs/active.log", FILE_READ);
-        bool sizeExceeded = active && active.size() >= MAX_ACTIVE_SIZE;
-        if (active) active.close();
+        if (!active) return;
+        bool sizeExceeded = active.size() >= MAX_ACTIVE_SIZE;
+        active.close();
         time_t now; time(&now);
         struct tm timeInfo;
         bool hasValidDay = now >= 1704067200UL && localtime_r(&now, &timeInfo);

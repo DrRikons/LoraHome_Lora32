@@ -14,6 +14,7 @@
 #include <SPI.h>
 #include <Crypto.h>
 #include <AES.h>
+#include <esp_log.h>
 #include <GatewayLogSink.h>
 #include <uptime.h>
 #include <secrets.h> // WiFi and MQTT credentials
@@ -191,6 +192,20 @@ static const unsigned long STATUS_HEARTBEAT_MS = 60000;
 static unsigned long mqttReconnectDelayMs = RECONNECT_DELAY_MS;
 static const unsigned long WIFI_RECONNECT_DELAY_MS = 10000;  
 static const unsigned long NTP_SYNC_DELAY_MS = 30000;  // Delay between NTP Syncs (30 seconds)
+static const unsigned long SD_RETRY_INTERVAL_MS = 5000;
+static unsigned long lastSdRetryMs = 0;
+
+struct GatewayConfig {
+    String wifiSsid;
+    String wifiPassword;
+    String mqttHost;
+    String mqttUser;
+    String mqttPassword;
+    uint8_t sensorSleepSeconds = 20;
+    bool sensorDevMode = true;
+};
+
+static GatewayConfig gatewayConfig;
 
 // Forward Function declarations
 void cryptPayload(uint8_t* data, size_t length, const uint8_t* mac, uint32_t bootNonceValue, uint16_t msgCount);
@@ -208,6 +223,10 @@ void mqttConnect();
 String mqttTopic(const String* mac, const char* mode);
 void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, const char* mode);
 void initRadio();
+bool loadGatewayConfig(bool sdAvailable, bool* created = nullptr);
+void maintainSdCard();
+bool tryMountSdCard();
+void applyNetworkConfiguration();
 
 WiFiClientSecure espClient; // Use secure client for TLS
 PubSubClient mqttClient(espClient);
@@ -225,6 +244,115 @@ void formatLocalTime(time_t utcTime, char* buffer, size_t bufferSize, const char
 
 void configureSystemTime() {
     configTzTime(TZ_INFO, "pool.ntp.org", "time.nist.gov", "time.google.com");
+}
+
+bool loadGatewayConfig(bool sdAvailable, bool* created) {
+    if (created) *created = false;
+    if (!sdAvailable) return false;
+    File file = SD.open("/config.json", FILE_APPEND);
+    if (!file) return false;
+    bool configIsEmpty = file.size() == 0;
+    file.close();
+
+    if (configIsEmpty) {
+        StaticJsonDocument<512> defaults;
+        defaults["wifi"]["ssid"] = gatewayConfig.wifiSsid;
+        defaults["wifi"]["password"] = gatewayConfig.wifiPassword;
+        defaults["mqtt"]["host"] = gatewayConfig.mqttHost;
+        defaults["mqtt"]["user"] = gatewayConfig.mqttUser;
+        defaults["mqtt"]["password"] = gatewayConfig.mqttPassword;
+        defaults["sensor"]["defaultSleepSeconds"] = gatewayConfig.sensorSleepSeconds;
+        defaults["sensor"]["defaultDevMode"] = gatewayConfig.sensorDevMode;
+        file = SD.open("/config.json", FILE_WRITE);
+        if (file) {
+            serializeJsonPretty(defaults, file);
+            file.close();
+            if (created) *created = true;
+        }
+        return false;
+    }
+
+    file = SD.open("/config.json", FILE_READ);
+    if (!file) return false;
+
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
+    if (error) return false;
+
+    JsonObject wifi = doc["wifi"];
+    const char* value = wifi["ssid"].as<const char*>();
+    if (value && value[0]) gatewayConfig.wifiSsid = value;
+    value = wifi["password"].as<const char*>();
+    if (value) gatewayConfig.wifiPassword = value;
+
+    JsonObject mqtt = doc["mqtt"];
+    value = mqtt["host"].as<const char*>();
+    if (value && value[0]) gatewayConfig.mqttHost = value;
+    value = mqtt["user"].as<const char*>();
+    if (value) gatewayConfig.mqttUser = value;
+    value = mqtt["password"].as<const char*>();
+    if (value) gatewayConfig.mqttPassword = value;
+
+    JsonObject sensor = doc["sensor"];
+    uint16_t sleepSeconds = sensor["defaultSleepSeconds"] | 0;
+    if (sleepSeconds >= 1 && sleepSeconds <= UINT8_MAX) gatewayConfig.sensorSleepSeconds = sleepSeconds;
+    if (!sensor["defaultDevMode"].isNull()) gatewayConfig.sensorDevMode = sensor["defaultDevMode"].as<bool>();
+
+    wifi["password"] = "***";
+    mqtt["password"] = "***";
+    String configTrace;
+    serializeJson(doc, configTrace);
+    GW_LOG_DEBUG("Parsed SD configuration: %s", configTrace.c_str());
+    return true;
+}
+
+void maintainSdCard() {
+    if (gatewayLogSink.isSdReady() || millis() - lastSdRetryMs < SD_RETRY_INTERVAL_MS) return;
+    lastSdRetryMs = millis();
+    if (tryMountSdCard()) {
+        gatewayLogSink.begin(true);
+        bool configCreated = false;
+        if (loadGatewayConfig(true, &configCreated)) {
+            GW_LOG_INFO("Loaded SD network configuration: WiFi SSID length %u, MQTT host length %u.",
+                        gatewayConfig.wifiSsid.length(), gatewayConfig.mqttHost.length());
+            applyNetworkConfiguration();
+            GW_LOG_INFO("SD card initialized and configuration applied.");
+        } else if (configCreated) {
+            GW_LOG_WARN("Created /config.json template; edit it to configure WiFi and MQTT.");
+        } else {
+            GW_LOG_WARN("SD card initialized but /config.json is unreadable or invalid.");
+        }
+    }
+}
+
+bool tryMountSdCard() {
+#if defined(SD_SHARE_SPI_BUS)
+    bool mounted = SD.begin(SDCARD_CS);
+#else
+    bool mounted = SD.begin(SDCARD_CS, SDCardSPI);
+#endif
+    if (mounted) deviceOnline |= SDCARD_ONLINE;
+    return mounted;
+}
+
+void applyNetworkConfiguration() {
+    mqttClient.disconnect();
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_STA);
+    WiFi.persistent(false);
+    if (gatewayConfig.wifiSsid.length() > 0) {
+        WiFi.begin(gatewayConfig.wifiSsid.c_str(), gatewayConfig.wifiPassword.c_str());
+        lastWifiReconnectAttempt = millis();
+    } else {
+        GW_LOG_WARN("WiFi is not configured; edit /config.json on the SD card.");
+    }
+
+    if (gatewayConfig.mqttHost.length() > 0) {
+        mqttClient.setServer(gatewayConfig.mqttHost.c_str(), MQTT_PORT);
+    } else {
+        GW_LOG_WARN("MQTT is not configured; edit /config.json on the SD card.");
+    }
 }
 
 bool refreshRtcTrustFromSystemClock() {
@@ -309,7 +437,13 @@ void setup()
 {
     uptime::calculateUptime();
 
+    // SD/VFS mount failures are reported by the Gateway logger below.
+    esp_log_level_set("sd_diskio", ESP_LOG_NONE);
+    esp_log_level_set("vfs_api", ESP_LOG_NONE);
+
     setupBoards();
+    bool sdAvailable = (deviceOnline & SDCARD_ONLINE) != 0;
+    bool loadedSdConfig = loadGatewayConfig(sdAvailable);
 
     // FAT timestamps use the ESP32 system clock. Start at the project epoch
     // until NTP supplies real UTC, rather than creating pre-2024 log files.
@@ -322,22 +456,20 @@ void setup()
         settimeofday(&fallbackTime, nullptr);
     }
 
-    // Gateway logging writes each completed line directly to UART and the SD card.
-    gatewayLogSink.begin();
+    // Gateway logging queues each completed line for the UART/SD writer task.
+    gatewayLogSink.begin(sdAvailable);
+    GW_LOG_INFO(loadedSdConfig ? "Loaded SD configuration." : "Using compiled default configuration.");
+    if (!sdAvailable) GW_LOG_ERROR("SD card does not exist or is unreadable.");
     // Initialize the FreeRTOS semaphore
     radioSemaphore = xSemaphoreCreateBinary();
 
     // Initialize WiFi and NTP in the background (non-blocking)
     WiFi.setHostname(WIFI_HOSTNAME);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    applyNetworkConfiguration();
 
     // Setup TLS client (use setInsecure for testing without CA cert, 
     // or provide CA cert using espClient.setCACert(root_ca) for production)
     espClient.setInsecure();
-
-    // Setup MQTT
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
 
     
     // Attempt to recover time from ESP32's hardware RTC (survives software resets)
@@ -612,7 +744,7 @@ void initRadio() {
 
 void loop()
 {
-    // Service the radio before any potentially blocking network maintenance.
+    // Radio processing always precedes SD, network, display, and other background work.
     while (xSemaphoreTake(radioSemaphore, 0) == pdTRUE) {
         
         // process received data from the radio 
@@ -659,9 +791,9 @@ void loop()
                 txConfig.header[1] = 'F'; // hardcoded
                 memcpy(txConfig.targetMac, rxPayload.mac, 6);
                 txConfig.networkKey = NETWORK_KEY;
-                txConfig.sleepInterval = 20; // Example config will be read from mqtt
+                txConfig.sleepInterval = gatewayConfig.sensorSleepSeconds;
                 txConfig.configVersion = 1;
-                txConfig.isDevMode = 1;      // Example config will be read from mqtt
+                txConfig.isDevMode = gatewayConfig.sensorDevMode ? 1 : 0;
 
                 //ensure RTC is synced before transmiting timeoffset
                 if (!hasValidRtcTime) {
@@ -792,6 +924,12 @@ void loop()
         }
 
     }
+
+    // A newly queued radio event takes priority over all background work.
+    if (uxSemaphoreGetCount(radioSemaphore) > 0) return;
+
+    // Background tasks run only while no radio event is pending.
+    maintainSdCard();
 
     // Connect WiFi/MQTT only after any pending downlink has been sent.
     static bool wasWifiConnected = false;
@@ -968,7 +1106,11 @@ void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, con
   
 bool mqttPublish(const char* topic, JsonDocument& doc, bool retained) {
     if (!mqttClient.connected()) {
-        GW_LOG_WARN("MQTT not connected. Cannot publish to %s", topic);
+        static unsigned long lastMqttUnavailableLogMs = 0;
+        if (millis() - lastMqttUnavailableLogMs >= 60000) {
+            GW_LOG_WARN("MQTT not connected. Cannot publish to %s", topic);
+            lastMqttUnavailableLogMs = millis();
+        }
         return false;
     }
     char jsonBuffer[256];
@@ -988,11 +1130,12 @@ bool mqttPublish(const char* topic, JsonDocument& doc, bool retained) {
 }
 
 void mqttConnect() {
+    if (gatewayConfig.mqttHost.length() == 0 || gatewayConfig.mqttUser.length() == 0) return;
     if (millis() - lastMqttReconnectAttempt > mqttReconnectDelayMs) {
         GW_LOG_INFO("Attempting MQTT connection...");
         String clientId = "LoraHomeGW-" + String((uint32_t)ESP.getEfuseMac(), HEX);
         
-        if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
+        if (mqttClient.connect(clientId.c_str(), gatewayConfig.mqttUser.c_str(), gatewayConfig.mqttPassword.c_str())) {
             GW_LOG_INFO("MQTT connected!");
             mqttConnected = true;
             mqttReconnectDelayMs = RECONNECT_DELAY_MS;

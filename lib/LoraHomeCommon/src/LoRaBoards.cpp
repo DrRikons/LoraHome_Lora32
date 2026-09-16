@@ -565,7 +565,6 @@ bool beginSDCard()
         deviceOnline |= SDCARD_ONLINE;
         return testSDWriteAndRead();
     } else {
-        Serial.println("Warning: Failed to init Sd Card");
     }
     return false;
 }
