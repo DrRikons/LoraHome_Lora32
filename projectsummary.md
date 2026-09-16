@@ -1,5 +1,7 @@
 # Project Summary: LoRa32 Boiler Control
 
+`CLOUD_IOT_HANDOFF.md` is the cloud-side integration contract and implementation handoff. It records the exact MQTT topics, current JSON schema/units, timestamp caveat, ingestion/storage guidance, security limitations, recommended MQTT-to-InfluxDB-to-Grafana architecture, and a ready-to-use AI implementation prompt.
+
 Gateway logging queues completed lines to one low-priority writer task, which exclusively writes UART and `/logs/active.log`; the file rotates to `/logs/archive/` at 1 MiB or daily. Lines use `[YYYY-MM-DD HH:MM:SS] [LEVEL] [Function] "message"`.
 Gateway reads `/config.json` on boot for WiFi, MQTT, and default sensor sleep/mode values; absent files are created with blank network values without read-only VFS errors, and invalid fields keep those defaults.
 When no card is present at boot, the Gateway retries SD initialization every five seconds after insertion.
