@@ -66,7 +66,7 @@ sequenceDiagram
     participant G as Gateway
 
     S->>S: Read sensors and RTC
-    S->>S: Build 20-byte normal or 31-byte dev telemetry
+    S->>S: Build 21-byte normal or 31-byte dev telemetry
     S->>R: startTransmit()
     R-->>G: Telemetry uplink
     R-->>S: TX-complete interrupt
@@ -77,7 +77,7 @@ sequenceDiagram
         G-->>R: 0xA5 update beacon
         R-->>S: RX-complete interrupt
         S->>R: startReceive() for configuration window
-        G-->>R: 19-byte ConfigPayload
+        G-->>R: 20-byte ConfigPayload
         R-->>S: RX-complete interrupt
         S->>S: Validate and apply configuration
     end
@@ -113,7 +113,7 @@ flowchart TD
     Read --> Decode[Decrypt telemetry]
     Decode --> Update{Configuration or time update needed?}
     Update -->|Yes| Beacon[Send update beacon]
-    Beacon --> Downlink[Send 19-byte ConfigPayload]
+    Beacon --> Downlink[Send 20-byte ConfigPayload]
     Update -->|No| Resume
     Downlink --> Resume[Return radio to RX]
     Resume --> Present[Update display and publish MQTT JSON]
@@ -172,7 +172,7 @@ The CTR nonce is constructed from the MAC, boot nonce, and message count. The Ga
 
 ### Configuration payload
 
-`ConfigPayload` is a packed 19-byte downlink:
+`ConfigPayload` is a packed 20-byte downlink:
 
 | Field | Bytes | Meaning |
 | --- | ---: | --- |
@@ -180,8 +180,9 @@ The CTR nonce is constructed from the MAC, boot nonce, and message count. The Ga
 | `targetMac` | 6 | Sensor MAC or all `FF` for broadcast |
 | `networkKey` | 4 | Shared configuration authorization value |
 | `sleepInterval` | 1 | Requested sleep duration in seconds |
-| `configVersion` | 1 | Protocol configuration version; currently `1` |
+| `configVersion` | 1 | Protocol configuration version; currently `2` |
 | `isDevMode` | 1 | Nonzero enables development mode |
+| `txPower` | 1 | Requested LoRa output power in dBm; the Sensor rejects unsupported values |
 | `timeOffset` | 4 | Seconds since `CUSTOM_EPOCH`; zero means no clock update |
 
 The Sensor accepts a configuration only after checking its exact length, `CF` header, target MAC/broadcast MAC, and `NETWORK_KEY`.

@@ -1,9 +1,10 @@
 # Project Summary: LoRa32 Boiler Control
 
-`CLOUD_IOT_HANDOFF.md` is the cloud-side integration contract and implementation handoff. It records the exact MQTT topics, current JSON schema/units, timestamp caveat, ingestion/storage guidance, security limitations, recommended MQTT-to-InfluxDB-to-Grafana architecture, and a ready-to-use AI implementation prompt.
+`CLOUD_IOT_HANDOFF.md` is the cloud-side integration contract and implementation handoff. It records the exact MQTT topics, configurable MQTT endpoint format, current JSON schema/units, timestamp caveat, ingestion/storage guidance, security limitations, recommended MQTT-to-InfluxDB-to-Grafana architecture, and a ready-to-use AI implementation prompt.
+Gateway tracks up to 16 sensor MACs in RAM and publishes retained `lorahome/sensor/<mac>/status` JSON (`online`, continuous Gateway-observed sensor `uptime`, and timestamp). A sensor changes offline after three missed advertised sleep intervals plus five seconds, and online on its next valid packet. Presence tracking resets on Gateway reboot, so old retained sensor statuses can be stale until their next packet.
 
 Gateway logging queues completed lines to one low-priority writer task, which exclusively writes UART and `/logs/active.log`; the file rotates to `/logs/archive/` at 1 MiB or daily. Lines use `[YYYY-MM-DD HH:MM:SS] [LEVEL] [Function] "message"`.
-Gateway reads `/config.json` on boot for WiFi, MQTT, and default sensor sleep/mode values; absent files are created with blank network values without read-only VFS errors, and invalid fields keep those defaults.
+Gateway reads `/config.json` on boot for WiFi, MQTT (bare hostname plus validated `port`, default `8883`), and default sensor sleep/mode values; absent files are created with blank network values without read-only VFS errors, and invalid fields keep those defaults.
 When no card is present at boot, the Gateway retries SD initialization every five seconds after insertion.
 Valid configuration from a card inserted after boot is applied to WiFi and MQTT without rebooting.
 SD mount failures are emitted once through the Gateway logger instead of raw SD/VFS diagnostics.
@@ -38,13 +39,14 @@ Detailed implementation documentation and separate Sensor/Gateway workflow diagr
   - **Size**: 20 bytes (Normal Operation Mode) or 31 bytes (Dev Mode with extra metrics).
   - **Nonce**: The public MAC, random per-boot nonce, and message counter scope AES-CTR encryption.
   - **Content**: Includes `sleepInterval`, `isDevMode`, `needsTimeSync` flags, and sensor readings.
-- **ConfigPayload**: 19-byte binary structure.
+- **ConfigPayload**: 20-byte binary structure.
   - `header`: 2 bytes (`"CF"`)
   - `targetMac`: 6 bytes
   - `networkKey`: 4 bytes
   - `sleepInterval`: 1 byte (deep sleep time in seconds)
-  - `configVersion`: 1 byte (currently `1`)
+  - `configVersion`: 1 byte (currently `2`)
   - `isDevMode`: 1 byte (`1` to enable, `0` to disable)
+  - `txPower`: 1 signed byte, Gateway-requested LoRa output power in dBm
   - `timeOffset`: 4 bytes (UTC epoch sync)
 
 ## Operating Modes
@@ -52,7 +54,8 @@ Detailed implementation documentation and separate Sensor/Gateway workflow diagr
 - **Development Mode**: Bypasses deep sleep for continuous operation and simulation/testing. Can be toggled remotely via the configuration payload or physically overridden via `DEV_MODE_PIN` (GPIO13). Configuration states survive soft resets via `RTC_NOINIT_ATTR` memory.
 - **Sensor logging**: Serial diagnostics are prefixed with UTC after synchronization, otherwise elapsed boot time.
 - **Downlink timing**: The Sensor enters beacon RX immediately after uplink; the Gateway waits 50 ms before beacon TX for radio turnaround.
-- **MQTT telemetry**: The Gateway publishes core data for both 20-byte operation-mode and 31-byte development-mode telemetry packets.
+- **Development power metric**: The pre-TX INA226 reading is retained as idle baseline. Development firmware samples INA226 during asynchronous TX and active RX windows, then sends their average in the existing `battPower` field on the next development telemetry cycle; normal-mode payloads and sizes are unchanged.
+- **MQTT telemetry**: The Gateway publishes core data for both 21-byte operation-mode and 31-byte development-mode telemetry packets. TX power is included in both formats so Gateway can detect and correct a mismatch.
 
 *Note: This file is intended to provide a condensed context for AI coding assistants. Keep it updated alongside major structural changes.*
 ## Recent Changes

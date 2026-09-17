@@ -6,6 +6,7 @@
 #include <Arduino.h> // For uint8_t, uint16_t, etc.
 #include <ArduinoJson.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <time.h>
 #include <math.h>
 
@@ -39,14 +40,14 @@ inline bool hasClockDrift(time_t currentTime, time_t referenceTime, double thres
     FIELD(uint8_t,  battPercent, "battPercent") \
     FIELD(uint8_t,  isDevMode, "isDevMode") \
     FIELD(uint8_t,  needsTimeSync, "needsTimeSync") \
-    FIELD(uint8_t,  sleepInterval, "sleepInterval")
+    FIELD(uint8_t,  sleepInterval, "sleepInterval") \
+    FIELD(int8_t,   txPower, "txPower")
 
 #define TELEMETRY_DEV_FIELDS(FIELD, ARRAY, STRING) \
     FIELD(int16_t,  battCurrent, "battCurrent") \
     FIELD(int16_t,  battPower, "battPower") \
     FIELD(uint16_t, freeRam, "freeRam") \
     FIELD(int8_t,   cpuTemp, "cpuTemp") \
-    FIELD(int8_t,   txPower, "txPower") \
     FIELD(int8_t,   lastSNR, "lastSNR") \
     FIELD(int16_t,  lastRSSI, "lastRSSI")
 
@@ -57,6 +58,7 @@ inline bool hasClockDrift(time_t currentTime, time_t referenceTime, double thres
    FIELD(uint8_t,  sleepInterval, "sleepInterval") \
    FIELD(uint8_t,  configVersion, "configVersion") \
    FIELD(uint8_t,  isDevMode, "isDevMode") \
+   FIELD(int8_t,   txPower, "txPower") \
    FIELD(uint32_t, timeOffset, "timeOffset")
 
 #define GATEWAY_STATUS(FIELD, ARRAY, STRING) \
@@ -94,8 +96,10 @@ struct __attribute__((packed)) GatewayStatus {
 
 };
 
+constexpr size_t TELEMETRY_CORE_SIZE = offsetof(TelemetryPayload, battCurrent);
+static_assert(TELEMETRY_CORE_SIZE == 21, "Telemetry core wire format must be 21 bytes");
 static_assert(sizeof(TelemetryPayload) == 31, "TelemetryPayload wire format must be 31 bytes");
-static_assert(sizeof(ConfigPayload) == 19, "ConfigPayload wire format must be 19 bytes");
+static_assert(sizeof(ConfigPayload) == 20, "ConfigPayload wire format must be 20 bytes");
 
 // ============================================================================
 // JSON Serialization Macros - MUST stay defined until after all uses!

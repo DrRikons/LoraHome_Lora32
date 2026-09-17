@@ -17,6 +17,7 @@
 #define DEV_MODE_PIN 13 // GPIO13 for dev mode toggle (pull low to enable)
 // Magic word to validate RTC memory integrity
 #define RTC_MAGIC_WORD 0xA1B2C3D4
+#define SENSOR_CONFIG_VERSION 2
 
 #if     defined(USING_SX1276)
 #ifndef CONFIG_RADIO_FREQ
@@ -250,9 +251,11 @@ struct SensorData {
 // Configuration structure
 struct Config {
   uint32_t magicWord;
+  uint8_t configVersion;
   uint32_t sleepInterval; // seconds
   uint8_t isDevMode; // Remote dev mode flag (0=false, 1=true)
-} config = {RTC_MAGIC_WORD, 20, 0}; // Default 20 seconds
+  int8_t txPower; // Gateway-configured transmit power in dBm
+} config = {RTC_MAGIC_WORD, SENSOR_CONFIG_VERSION, 20, 0, CONFIG_RADIO_OUTPUT_POWER};
 
 // RTC memory for config persistence
 RTC_NOINIT_ATTR Config rtcConfig; // NOINIT ensures it survives SW_CPU_RESET (ESP.restart)
@@ -325,7 +328,8 @@ void setup()
 
     // Early evaluate devMode to enable serial immediately if needed
     pinMode(DEV_MODE_PIN, INPUT_PULLUP);
-    if (digitalRead(DEV_MODE_PIN) == LOW || rtcConfig.isDevMode != 0) {
+    if (digitalRead(DEV_MODE_PIN) == LOW ||
+        (rtcConfig.configVersion == SENSOR_CONFIG_VERSION && rtcConfig.isDevMode != 0)) {
         serialEnabled = true;
     }
 
@@ -339,20 +343,23 @@ void setup()
 
     
     // Validate RTC memory using the magic word and basic bounds checking
-    if (config.magicWord != RTC_MAGIC_WORD || config.sleepInterval < 10 || config.sleepInterval > 86400) {
+    if (config.magicWord != RTC_MAGIC_WORD || config.configVersion != SENSOR_CONFIG_VERSION ||
+        config.sleepInterval < 10 || config.sleepInterval > 86400) {
         config.magicWord = RTC_MAGIC_WORD;
+        config.configVersion = SENSOR_CONFIG_VERSION;
         // TO DO - configure defauls centrally
         config.sleepInterval = 60;
         config.isDevMode = 0;
+        config.txPower = CONFIG_RADIO_OUTPUT_POWER;
         rtcConfig = config; // Initialize RTC memory with defaults on cold boot
         if (serialEnabled) {
-            Serial.printf("invalid rtcConfig, reinitialising to defaults: %u sleep=%u, devMode=%d\n",
-                          rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode); 
+            Serial.printf("invalid rtcConfig, reinitialising to defaults: %u sleep=%u, devMode=%d, txPower=%ddBm\n",
+                          rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode, rtcConfig.txPower);
         }
     } else{
             if (serialEnabled) {
-                Serial.printf("Boot rtcConfig is valid : %u sleep=%u, devMode=%d\n",
-                                rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode);
+                Serial.printf("Boot rtcConfig is valid : %u sleep=%u, devMode=%d, txPower=%ddBm\n",
+                                rtcConfig.magicWord, rtcConfig.sleepInterval, rtcConfig.isDevMode, rtcConfig.txPower);
             }
     }
 
@@ -410,23 +417,32 @@ void setup()
     radio.setSpreadingFactor(9);  // SF9 is a good balance of range and speed
     radio.setCodingRate(5);       // CR 4/5 is standard
     radio.setSyncWord(0xAB);
-    radio.setOutputPower(CONFIG_RADIO_OUTPUT_POWER);
+    state = radio.setOutputPower(config.txPower);
+    if (state != RADIOLIB_ERR_NONE) {
+        if (serialEnabled) {
+            Serial.printf("Configured TX power %ddBm rejected (state %d); using firmware default %ddBm\n",
+                          config.txPower, state, CONFIG_RADIO_OUTPUT_POWER);
+        }
+        config.txPower = CONFIG_RADIO_OUTPUT_POWER;
+        rtcConfig = config;
+        radio.setOutputPower(config.txPower);
+    }
     radio.setCRC(true);           // Enable CRC for data integrity
 
     // Set hardware interrupt callbacks for both RX and TX
     radio.setPacketSentAction(setFlag);
     radio.setPacketReceivedAction(setFlag);
 
-    // Display mode message
+    // Display operation mode at startup screen
     #ifdef HAS_DISPLAY
-    if (devMode && disp) { // Only show startup screen in dev mode
+    if (devMode && disp) {  //only in dev mode
         // Unique device identity (use MAC)
         uint64_t mac = ESP.getEfuseMac();
         char idBuf[17];
         sprintf(idBuf, "%08X%08X", (uint32_t)(mac >> 32), (uint32_t)mac);
         deviceId = String(idBuf);
 
-        const char *modeText = devMode ? "DEV MODE" : "OP MODE";
+        const char *modeText = "DEV MODE";
         disp->clearBuffer();
         disp->setFont(u8g2_font_pxplusibmvga9_mr);
         int16_t x = (disp->getDisplayWidth() - disp->getUTF8Width(modeText)) / 2;
@@ -438,24 +454,23 @@ void setup()
     }
     #endif
 
-    // In Operation Mode, we perform one cycle and then go to sleep immediately.
-    // In Developer Mode, we perform the first cycle here, then continue with more cycles in loop().
+    // In Op Mode, perform one cycle and go to deep sleep
+    // In Dev Mode, perform the first cycle, then continue in loop().
     wakeCycle();
 
     if (devMode) {
-        drawMain(); // Show initial data on display
+        drawMain(); 
     } else {
-        // In Operation Mode, loop() is never reached.
         enterDeepSleep();
     }
 }
 
 // Standard Arduino loop function.
-// Used in: ONLY Dev mode (Simulates the device lifecycle continuously. Bypassed in Operation mode via deep sleep).
+// Used ONLY in Dev mode (Simulates the device op lifecycle with serial logging and display updates).
 void loop()
 {
     if (devMode) {
-        // "Sleep" part of the simulated cycle
+       
         Serial.println("[DEV] --- Sleep ---");
         Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
 
@@ -463,12 +478,12 @@ void loop()
             disp->clearBuffer();
             disp->sendBuffer();
         }
-        delay(config.sleepInterval * 1000); // Sleep for the interval (matches esp_deep_sleep timer)
+        delay(config.sleepInterval * 1000); // Simulate deep sleep from cfg file
 
-        // "Wake" part of the simulated cycle
+        // run the operating cycle
         wakeCycle();
         
-        // "Display" part of the simulated cycle
+        // display data from the cycle
         Serial.println("[DEV] --- Display ---");
         // Rotate through all 4 screens
         for (int i = 0; i < 4; i++) {
@@ -476,7 +491,7 @@ void loop()
             delay(2000); // Show each screen for 2s
         }
     } else {
-        // This part is unreachable in Operation Mode because the device deep sleeps in setup().
+        
     }
 }
 
@@ -519,7 +534,7 @@ uint8_t getBatteryPercentage(float voltage) {
     return 100;
 }
 
-// Contains the logic for a single operational cycle: read, transmit, and check for updates.
+// single operational cycle: read, transmit, and check for updates.
 // Used in: Both Operation and Dev modes
 void wakeCycle() {
 
@@ -589,14 +604,14 @@ void transmitData()
     txPayload.isDevMode = (uint8_t)devMode;
     txPayload.needsTimeSync = isClockValid((time_t)sensorData.timestamp) ? 0 : 1;
     txPayload.sleepInterval = config.sleepInterval;
-    size_t txSize = 20; // Core payload size
+    txPayload.txPower = config.txPower;
+    size_t txSize = TELEMETRY_CORE_SIZE; // Core payload size
 
     if (devMode) {
         txPayload.battCurrent = (int16_t)sensorData.batteryCurrent;
         txPayload.battPower = (int16_t)sensorData.batteryPower;
         txPayload.freeRam = (uint16_t)sensorData.freeRam;
         txPayload.cpuTemp = (int8_t)sensorData.cpuTemp;
-        txPayload.txPower = (int8_t)CONFIG_RADIO_OUTPUT_POWER;
         txPayload.lastSNR = (int8_t)sensorData.lastSNR;
         txPayload.lastRSSI = (int16_t)sensorData.lastRSSI;
         txSize = sizeof(TelemetryPayload); // 31 bytes full size
@@ -762,6 +777,11 @@ bool listenForConfig()
                     // Verify header to ensure it's actually our config packet
                     if (rxConfig.header[0] == 'C' && rxConfig.header[1] == 'F') {
 
+                        if (rxConfig.configVersion != SENSOR_CONFIG_VERSION) {
+                            if (serialEnabled) Serial.printf("Unsupported config version %u.\n", rxConfig.configVersion);
+                            break;
+                        }
+
                         // Verify this config packet is meant for this specific device
                         uint8_t myMac[6];
                         esp_efuse_mac_get_default(myMac);
@@ -778,9 +798,20 @@ bool listenForConfig()
                             break; // Invalid key, terminate early
                         }
 
+                        int txPowerState = radio.setOutputPower(rxConfig.txPower);
+                        if (txPowerState != RADIOLIB_ERR_NONE) {
+                            if (serialEnabled) {
+                                Serial.printf("Rejected config TX power %ddBm (state %d).\n", rxConfig.txPower, txPowerState);
+                            }
+                            break;
+                        }
+
+                        bool txPowerChanged = config.txPower != rxConfig.txPower;
                         config.magicWord = RTC_MAGIC_WORD;
+                        config.configVersion = SENSOR_CONFIG_VERSION;
                         config.sleepInterval = rxConfig.sleepInterval;
                         config.isDevMode = (rxConfig.isDevMode > 0);
+                        config.txPower = rxConfig.txPower;
 
                         if (rxConfig.timeOffset > 0) {
                             uint32_t newTime = rxConfig.timeOffset + CUSTOM_EPOCH;
@@ -801,21 +832,21 @@ bool listenForConfig()
                         }
 
                         if (serialEnabled) {
-                            Serial.printf("received config: sleep=%u, devMode=%d\n",
-                                              rxConfig.sleepInterval, rxConfig.isDevMode);
+                            Serial.printf("received config: sleep=%u, devMode=%d, txPower=%ddBm\n",
+                                              rxConfig.sleepInterval, rxConfig.isDevMode, rxConfig.txPower);
                         }
 
                         rtcConfig = config; // Save to RTC
                         if (serialEnabled) {
-                                Serial.printf("Config applied: sleep=%u, devMode=%d\n",
-                                               rtcConfig.sleepInterval, rtcConfig.isDevMode);
+                                Serial.printf("Config applied: sleep=%u, devMode=%d, txPower=%ddBm\n",
+                                               rtcConfig.sleepInterval, rtcConfig.isDevMode, rtcConfig.txPower);
                             }
 
                         bool cfgMode = (digitalRead(DEV_MODE_PIN) == LOW) || (config.isDevMode != 0);
-                        if (devMode != cfgMode) {
+                        if (devMode != cfgMode || txPowerChanged) {
                             needsRestart = true;
                             if (serialEnabled) {
-                                Serial.printf("Soft restart triggered to apply %s mode.", (rxConfig.isDevMode ==1 ) ? "DEV" : "OP");
+                                Serial.printf("Soft restart triggered to apply %s mode and TX power.", (rxConfig.isDevMode ==1 ) ? "DEV" : "OP");
                             }
                         } 
                         configReceived = true;
@@ -919,7 +950,7 @@ void drawMain()
                 disp->setCursor(5, 15);
                 disp->printf("SNR:%.1f R:%.0f", sensorData.lastSNR, sensorData.lastRSSI);
                 disp->setCursor(5, 30);
-                disp->printf("TX Pwr: %ddBm", CONFIG_RADIO_OUTPUT_POWER);
+                disp->printf("TX Pwr: %ddBm", config.txPower);
                 disp->setCursor(5, 45);
                 disp->printf("TX Time: %lu ms", lastTxTime);
                 disp->setCursor(5, 60);

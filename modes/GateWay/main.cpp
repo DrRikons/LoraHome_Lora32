@@ -189,20 +189,39 @@ static const unsigned long RECONNECT_DELAY_MS = 1000;    // Delay between retrie
 static const unsigned long MAX_MQTT_RECONNECT_DELAY_MS = 60000;
 static const unsigned long STATUS_MIN_INTERVAL_MS = 5000;
 static const unsigned long STATUS_HEARTBEAT_MS = 60000;
+static const unsigned long SENSOR_STATUS_GRACE_MS = 5000;
+static const uint8_t MAX_TRACKED_SENSORS = 16;
 static unsigned long mqttReconnectDelayMs = RECONNECT_DELAY_MS;
 static const unsigned long WIFI_RECONNECT_DELAY_MS = 10000;  
 static const unsigned long NTP_SYNC_DELAY_MS = 30000;  // Delay between NTP Syncs (30 seconds)
 static const unsigned long SD_RETRY_INTERVAL_MS = 5000;
 static unsigned long lastSdRetryMs = 0;
 
+struct SensorPresence {
+    char mac[18] = {};
+    unsigned long lastPacketMs = 0;
+    unsigned long onlineSinceMs = 0;
+    uint32_t sleepIntervalSeconds = 0;
+    bool online = false;
+};
+
+struct SensorStatus {
+    bool online;
+    unsigned long uptime;
+};
+
+static SensorPresence sensorPresence[MAX_TRACKED_SENSORS];
+
 struct GatewayConfig {
     String wifiSsid;
     String wifiPassword;
     String mqttHost;
+    uint16_t mqttPort = MQTT_PORT;
     String mqttUser;
     String mqttPassword;
     uint8_t sensorSleepSeconds = 20;
     bool sensorDevMode = true;
+    int8_t sensorTxPower = CONFIG_RADIO_OUTPUT_POWER;
 };
 
 static GatewayConfig gatewayConfig;
@@ -227,6 +246,9 @@ bool loadGatewayConfig(bool sdAvailable, bool* created = nullptr);
 void maintainSdCard();
 bool tryMountSdCard();
 void applyNetworkConfiguration();
+SensorPresence* updateSensorPresence(const char* mac, uint32_t sleepIntervalSeconds);
+bool publishSensorStatus(const SensorPresence& presence);
+void publishTrackedSensorStatuses();
 
 WiFiClientSecure espClient; // Use secure client for TLS
 PubSubClient mqttClient(espClient);
@@ -259,10 +281,12 @@ bool loadGatewayConfig(bool sdAvailable, bool* created) {
         defaults["wifi"]["ssid"] = gatewayConfig.wifiSsid;
         defaults["wifi"]["password"] = gatewayConfig.wifiPassword;
         defaults["mqtt"]["host"] = gatewayConfig.mqttHost;
+        defaults["mqtt"]["port"] = gatewayConfig.mqttPort;
         defaults["mqtt"]["user"] = gatewayConfig.mqttUser;
         defaults["mqtt"]["password"] = gatewayConfig.mqttPassword;
         defaults["sensor"]["defaultSleepSeconds"] = gatewayConfig.sensorSleepSeconds;
         defaults["sensor"]["defaultDevMode"] = gatewayConfig.sensorDevMode;
+        defaults["sensor"]["defaultTxPower"] = gatewayConfig.sensorTxPower;
         file = SD.open("/config.json", FILE_WRITE);
         if (file) {
             serializeJsonPretty(defaults, file);
@@ -289,6 +313,8 @@ bool loadGatewayConfig(bool sdAvailable, bool* created) {
     JsonObject mqtt = doc["mqtt"];
     value = mqtt["host"].as<const char*>();
     if (value && value[0]) gatewayConfig.mqttHost = value;
+    uint32_t mqttPort = mqtt["port"] | MQTT_PORT;
+    if (mqttPort >= 1 && mqttPort <= UINT16_MAX) gatewayConfig.mqttPort = mqttPort;
     value = mqtt["user"].as<const char*>();
     if (value) gatewayConfig.mqttUser = value;
     value = mqtt["password"].as<const char*>();
@@ -298,6 +324,8 @@ bool loadGatewayConfig(bool sdAvailable, bool* created) {
     uint16_t sleepSeconds = sensor["defaultSleepSeconds"] | 0;
     if (sleepSeconds >= 1 && sleepSeconds <= UINT8_MAX) gatewayConfig.sensorSleepSeconds = sleepSeconds;
     if (!sensor["defaultDevMode"].isNull()) gatewayConfig.sensorDevMode = sensor["defaultDevMode"].as<bool>();
+    int16_t txPower = sensor["defaultTxPower"] | gatewayConfig.sensorTxPower;
+    if (txPower >= INT8_MIN && txPower <= INT8_MAX) gatewayConfig.sensorTxPower = (int8_t)txPower;
 
     wifi["password"] = "***";
     mqtt["password"] = "***";
@@ -349,7 +377,7 @@ void applyNetworkConfiguration() {
     }
 
     if (gatewayConfig.mqttHost.length() > 0) {
-        mqttClient.setServer(gatewayConfig.mqttHost.c_str(), MQTT_PORT);
+        mqttClient.setServer(gatewayConfig.mqttHost.c_str(), gatewayConfig.mqttPort);
     } else {
         GW_LOG_WARN("MQTT is not configured; edit /config.json on the SD card.");
     }
@@ -770,7 +798,7 @@ void loop()
 
             // decrypt the received payload
             GW_LOG_DEBUG("Received %d bytes from radio", numBytes);
-            if (numBytes == 20 || numBytes == sizeof(TelemetryPayload)) {
+            if (numBytes == TELEMETRY_CORE_SIZE || numBytes == sizeof(TelemetryPayload)) {
                 TelemetryPayload rxPayload;
                 // FIX: Cast to uint8_t* to treat both source and destination as raw byte arrays
                 // This prevents incorrect interpretation of bytes when copying to mixed-type struct
@@ -792,8 +820,9 @@ void loop()
                 memcpy(txConfig.targetMac, rxPayload.mac, 6);
                 txConfig.networkKey = NETWORK_KEY;
                 txConfig.sleepInterval = gatewayConfig.sensorSleepSeconds;
-                txConfig.configVersion = 1;
+                txConfig.configVersion = 2;
                 txConfig.isDevMode = gatewayConfig.sensorDevMode ? 1 : 0;
+                txConfig.txPower = gatewayConfig.sensorTxPower;
 
                 //ensure RTC is synced before transmiting timeoffset
                 if (!hasValidRtcTime) {
@@ -814,7 +843,9 @@ void loop()
                 }
 
                 // determine and transmit the update beacon 
-                bool sensorNeedsConfig = (rxPayload.sleepInterval != txConfig.sleepInterval) || ((rxPayload.isDevMode != 0) != (txConfig.isDevMode != 0));
+                bool sensorNeedsConfig = (rxPayload.sleepInterval != txConfig.sleepInterval) ||
+                                         ((rxPayload.isDevMode != 0) != (txConfig.isDevMode != 0)) ||
+                                         (rxPayload.txPower != txConfig.txPower);
                 
                 bool updatePending = (sensorNeedsConfig || rxPayload.needsTimeSync) && hasValidRtcTime; // enable beacon only if RTC is ok
                 if (updatePending) {
@@ -850,7 +881,7 @@ void loop()
 
                 // Both compact operation-mode and full development-mode packets
                 // contain the core telemetry fields and must be published.
-                sensorHasTelemetry = (numBytes == 20 || numBytes == sizeof(TelemetryPayload));
+                sensorHasTelemetry = (numBytes == TELEMETRY_CORE_SIZE || numBytes == sizeof(TelemetryPayload));
                 if (sensorHasTelemetry) {
                     GW_LOG_DEBUG("Sensor payload has data");
                     GW_LOG_DEBUG("Reconstructing MAC Adress");
@@ -867,6 +898,7 @@ void loop()
                     sensorIsDevMode = rxPayload.isDevMode;
                     sensorNeedsTimeSync = (rxPayload.needsTimeSync != 0);
                     sensorSleepInterval = rxPayload.sleepInterval;
+                    SensorPresence* presence = updateSensorPresence(macStr, sensorSleepInterval);
                     if (rxPayload.isDevMode == 1){
                         sensorBattCurrent = rxPayload.battCurrent;
                         sensorBattPower = rxPayload.battPower;
@@ -890,6 +922,10 @@ void loop()
                         String telemetryDataTopic = mqttTopic(&sensorMac, "core");
                         mqttPublish(telemetryDataTopic.c_str(), docCore);
                         GW_LOG_DEBUG("Sensor telemetry data published: %s : %s", telemetryDataTopic.c_str(), docCore.as<String>().c_str());
+
+                        if (presence) {
+                            publishSensorStatus(*presence);
+                        }
 
                         if (rxPayload.isDevMode == 1){
                             StaticJsonDocument<512> docDev; 
@@ -946,6 +982,9 @@ void loop()
         bool mqttJustConnected = mqttClient.connected() && !mqttWasConnected;
         mqttWasConnected = mqttClient.connected();
         mqttClient.loop();
+        if (mqttJustConnected) {
+            publishTrackedSensorStatuses();
+        }
         GatewayStatus status{};
         status.gatewayRssi = (int16_t)radio.getRSSI();
         status.gatewaySnr = radio.getSNR();
@@ -972,6 +1011,15 @@ void loop()
                 lastStatus = status;
                 hasPublishedStatus = true;
                 lastStatusPublishMs = millis();
+            }
+        }
+
+        for (SensorPresence& presence : sensorPresence) {
+            if (!presence.online || presence.sleepIntervalSeconds == 0) continue;
+            const unsigned long offlineAfterMs = (presence.sleepIntervalSeconds * 3UL * 1000UL) + SENSOR_STATUS_GRACE_MS;
+            if (millis() - presence.lastPacketMs >= offlineAfterMs) {
+                presence.online = false;
+                publishSensorStatus(presence);
             }
         }
     } else {
@@ -1017,6 +1065,10 @@ String mqttTopic(const String* mac, const char* mode) {
         if (!mac) return String(MQTT_TOPIC_PREFIX) + "/error";
         return String(MQTT_TOPIC_PREFIX) + "/sensor/" + mac->c_str() + "/telemetry";
     }
+    case 's': { // "sensorStatus" starts with 's'
+        if (!mac) return String(MQTT_TOPIC_PREFIX) + "/error";
+        return String(MQTT_TOPIC_PREFIX) + "/sensor/" + mac->c_str() + "/status";
+    }
     case 'g': { // "gatewayStatus" starts with 'g'
         return String(MQTT_TOPIC_PREFIX) + "/gateway/status";
     }
@@ -1026,7 +1078,54 @@ String mqttTopic(const String* mac, const char* mode) {
     // }
     default:
         return String(MQTT_TOPIC_PREFIX) + "/error";
-    }    
+    }
+}
+
+SensorPresence* updateSensorPresence(const char* mac, uint32_t sleepIntervalSeconds) {
+    SensorPresence* available = nullptr;
+    for (SensorPresence& presence : sensorPresence) {
+        if (presence.mac[0] == '\0') {
+            if (!available) available = &presence;
+            continue;
+        }
+        if (strcmp(presence.mac, mac) == 0) {
+            presence.lastPacketMs = millis();
+            presence.sleepIntervalSeconds = sleepIntervalSeconds;
+            if (!presence.online) presence.onlineSinceMs = presence.lastPacketMs;
+            presence.online = true;
+            return &presence;
+        }
+    }
+
+    if (!available) {
+        GW_LOG_WARN("Sensor presence table full; status unavailable for %s", mac);
+        return nullptr;
+    }
+
+    snprintf(available->mac, sizeof(available->mac), "%s", mac);
+    available->lastPacketMs = millis();
+    available->onlineSinceMs = available->lastPacketMs;
+    available->sleepIntervalSeconds = sleepIntervalSeconds;
+    available->online = true;
+    return available;
+}
+
+bool publishSensorStatus(const SensorPresence& presence) {
+    const unsigned long onlineUptimeSeconds = presence.online ? (millis() - presence.onlineSinceMs) / 1000UL : 0;
+    SensorStatus status{presence.online, onlineUptimeSeconds};
+    StaticJsonDocument<128> statusDoc;
+    jsonBuild(&status, statusDoc, nullptr, "sensorStatus");
+    String mac = presence.mac;
+    String statusTopic = mqttTopic(&mac, "sensorStatus");
+    return mqttPublish(statusTopic.c_str(), statusDoc, true);
+}
+
+void publishTrackedSensorStatuses() {
+    for (const SensorPresence& presence : sensorPresence) {
+        if (presence.mac[0] != '\0') {
+            publishSensorStatus(presence);
+        }
+    }
 }
 
 void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, const char* mode) {
@@ -1074,12 +1173,19 @@ void jsonBuild(const void* rawPayload, JsonDocument& doc, const String* mac, con
             }
             case 'd': { // "dev" starts with 'd'  
                 const TelemetryPayload& payload = *static_cast<const TelemetryPayload*>(rawPayload);
+                doc["txPower"] = payload.txPower;
                 TELEMETRY_DEV_FIELDS(TO_JSON_FIELD, TO_JSON_ARRAY, TO_JSON_STRING);
                 break;
             }
             case 'g': { // "gatewayStatus" starts with 'g'
                 const GatewayStatus& payload = *static_cast<const GatewayStatus*>(rawPayload);
                 GATEWAY_STATUS(TO_JSON_FIELD, TO_JSON_ARRAY, TO_JSON_STRING);
+                break;
+            }
+            case 's': { // "sensorStatus" starts with 's'
+                const SensorStatus& payload = *static_cast<const SensorStatus*>(rawPayload);
+                doc["online"] = payload.online;
+                doc["uptime"] = payload.uptime;
                 break;
             }
             case 'p': { // "payloadConfig" starts with 'p' (since 'c' is taken by core)

@@ -15,6 +15,7 @@ void test_gateway_parses_core_payload_fields() {
     payload.isDevMode = 1;
     payload.needsTimeSync = 1;
     payload.sleepInterval = 300;
+    payload.txPower = 17;
 
     GatewayTelemetryState parsed = parseTelemetryPayload(payload, TELEMETRY_CORE_SIZE);
 
@@ -25,6 +26,7 @@ void test_gateway_parses_core_payload_fields() {
     TEST_ASSERT_EQUAL_UINT8(99, parsed.batteryPercent);
     TEST_ASSERT_TRUE(parsed.needsTimeSync);
     TEST_ASSERT_EQUAL_UINT32(300, parsed.sleepIntervalSeconds);
+    TEST_ASSERT_EQUAL_INT8(17, parsed.txPowerdBm);
     TEST_ASSERT_FALSE(parsed.hasDevTelemetry);
 }
 
@@ -52,11 +54,12 @@ void test_gateway_parses_dev_payload_fields() {
 }
 
 void test_gateway_config_decision_uses_state_or_sync_flag() {
-    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 120, false, false, 123));
-    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 60, true, false, 123));
-    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 60, false, true, 123));
-    TEST_ASSERT_FALSE(gatewayShouldSendConfig(60, false, 60, false, true, 0));
-    TEST_ASSERT_FALSE(gatewayShouldSendConfig(60, false, 60, false, false, 123));
+    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 17, 120, false, 17, false, 123));
+    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 17, 60, true, 17, false, 123));
+    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 14, 60, false, 17, false, 123));
+    TEST_ASSERT_TRUE(gatewayShouldSendConfig(60, false, 17, 60, false, 17, true, 123));
+    TEST_ASSERT_FALSE(gatewayShouldSendConfig(60, false, 17, 60, false, 17, true, 0));
+    TEST_ASSERT_FALSE(gatewayShouldSendConfig(60, false, 17, 60, false, 17, false, 123));
 }
 
 int main(int, char**) {

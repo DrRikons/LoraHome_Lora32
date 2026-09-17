@@ -54,13 +54,13 @@ void test_end_to_end_unset_sensor_clock_requests_sync() {
 
     std::uint32_t gatewayTimeOffset = makeGatewayTimeOffset(true, static_cast<std::time_t>(CUSTOM_EPOCH + 7200));
     TEST_ASSERT_TRUE(parsed.needsTimeSync);
-    TEST_ASSERT_TRUE(gatewayShouldSendConfig(parsed.sleepIntervalSeconds, parsed.isDevMode != 0, parsed.sleepIntervalSeconds, parsed.isDevMode != 0, parsed.needsTimeSync, gatewayTimeOffset));
+    TEST_ASSERT_TRUE(gatewayShouldSendConfig(parsed.sleepIntervalSeconds, parsed.isDevMode != 0, parsed.txPowerdBm, parsed.sleepIntervalSeconds, parsed.isDevMode != 0, parsed.txPowerdBm, parsed.needsTimeSync, gatewayTimeOffset));
 }
 
 void test_end_to_end_gateway_without_trusted_time_skips_sync() {
     std::uint32_t gatewayTimeOffset = makeGatewayTimeOffset(false, static_cast<std::time_t>(CUSTOM_EPOCH + 7200));
     TEST_ASSERT_EQUAL_UINT32(0, gatewayTimeOffset);
-    TEST_ASSERT_FALSE(gatewayShouldSendConfig(60, false, 60, false, true, gatewayTimeOffset));
+    TEST_ASSERT_FALSE(gatewayShouldSendConfig(60, false, 17, 60, false, 17, true, gatewayTimeOffset));
 }
 
 int main(int, char**) {

@@ -11,9 +11,9 @@ namespace lora_home_test {
 
 constexpr std::uint32_t CUSTOM_EPOCH = 1704067200UL;
 constexpr std::uint8_t CONFIG_UPDATE_PENDING_FLAG = 0xA5;
-constexpr std::size_t TELEMETRY_CORE_SIZE = 20;
+constexpr std::size_t TELEMETRY_CORE_SIZE = 21;
 constexpr std::size_t TELEMETRY_FULL_SIZE = 31;
-constexpr std::size_t CONFIG_PAYLOAD_SIZE = 19;
+constexpr std::size_t CONFIG_PAYLOAD_SIZE = 20;
 
 #pragma pack(push, 1)
 struct TelemetryPayload {
@@ -26,11 +26,11 @@ struct TelemetryPayload {
     std::uint8_t isDevMode;
     std::uint8_t needsTimeSync;
     std::uint8_t sleepInterval;
+    std::int8_t txPower;
     std::int16_t battCurrent;
     std::int16_t battPower;
     std::uint16_t freeRam;
     std::int8_t cpuTemp;
-    std::int8_t txPower;
     std::int8_t lastSNR;
     std::int16_t lastRSSI;
 };
@@ -42,6 +42,7 @@ struct ConfigPayload {
     std::uint8_t sleepInterval;
     std::uint8_t configVersion;
     std::uint8_t isDevMode;
+    std::int8_t txPower;
     std::uint32_t timeOffset;
 };
 #pragma pack(pop)
@@ -106,6 +107,7 @@ inline void buildTelemetryPayload(const SensorTelemetryInput& input, TelemetryPa
     output.isDevMode = input.devMode ? 1 : 0;
     output.needsTimeSync = isClockValid(input.timestamp) ? 0 : 1;
     output.sleepInterval = input.sleepIntervalSeconds;
+    output.txPower = input.txPowerdBm;
 
     txSize = TELEMETRY_CORE_SIZE;
     if (input.devMode) {
@@ -113,7 +115,6 @@ inline void buildTelemetryPayload(const SensorTelemetryInput& input, TelemetryPa
         output.battPower = static_cast<std::int16_t>(input.batteryPowermW);
         output.freeRam = input.freeRamKB;
         output.cpuTemp = static_cast<std::int8_t>(input.cpuTempC);
-        output.txPower = input.txPowerdBm;
         output.lastSNR = static_cast<std::int8_t>(input.lastSNRdB);
         output.lastRSSI = static_cast<std::int16_t>(input.lastRSSIdBm);
         txSize = sizeof(TelemetryPayload);
@@ -159,13 +160,16 @@ inline std::uint32_t makeGatewayTimeOffset(bool hasTrustedRtc, std::time_t local
 inline bool gatewayShouldSendConfig(
     std::uint32_t sensorSleepInterval,
     bool sensorDevMode,
+    std::int8_t sensorTxPowerdBm,
     std::uint32_t targetSleepInterval,
     bool targetDevMode,
+    std::int8_t targetTxPowerdBm,
     bool sensorNeedsTimeSync,
     std::uint32_t gatewayTimeOffset
 ) {
     return (sensorSleepInterval != targetSleepInterval)
         || (sensorDevMode != targetDevMode)
+        || (sensorTxPowerdBm != targetTxPowerdBm)
         || (gatewayTimeOffset > 0 && sensorNeedsTimeSync);
 }
 

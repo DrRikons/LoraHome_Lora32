@@ -9,12 +9,12 @@ Use this document as the source of truth when asking an AI to build the cloud si
 ### Connectivity and broker requirements
 
 - MQTT protocol client: PubSubClient on ESP32.
-- Endpoint: a DNS host configured on the Gateway SD card; fixed port `8883`.
+- Endpoint: a bare DNS host and numeric port configured on the Gateway SD card; port defaults to `8883` when omitted or invalid. Do not include a scheme (such as `http://`) or a port suffix in `mqtt.host`.
 - Authentication: MQTT username and password from `/config.json` on the SD card.
 - Client ID: `LoraHomeGW-<ESP32-efuse-MAC-in-hex>`.
 - Topic root: lowercase `lorahome`.
 - QoS: default PubSubClient QoS 0. The Gateway does not subscribe to cloud topics.
-- Retention: only `lorahome/gateway/status` is published retained. Sensor messages are not retained.
+- Retention: `lorahome/gateway/status` and each `lorahome/sensor/<sensor_mac>/status` message are retained. Sensor `data` and `telemetry` messages are not retained.
 - Timestamps: every JSON payload has `timestamp`, formatted `YYYY-MM-DDTHH:MM:SS`, in the Gateway's `Europe/Athens` local time and with no UTC offset. It may be a 1970-era value before NTP synchronization. Treat it as an untrusted device timestamp; record an authoritative ingestion timestamp in UTC.
 - Delivery: messages are sent only while the Wi-Fi and broker connection are available. There is no offline queue or replay, so the cloud must tolerate gaps and duplicate messages.
 
@@ -27,8 +27,8 @@ The Gateway reads `/config.json` from its SD card. The cloud deployment supplies
 ```json
 {
   "wifi": { "ssid": "SITE_WIFI", "password": "SITE_WIFI_SECRET" },
-  "mqtt": { "host": "mqtt.example.net", "user": "gateway-site-01", "password": "LONG_RANDOM_SECRET" },
-  "sensor": { "defaultSleepSeconds": 20, "defaultDevMode": true }
+  "mqtt": { "host": "mqtt.example.net", "port": 8883, "user": "gateway-site-01", "password": "LONG_RANDOM_SECRET" },
+  "sensor": { "defaultSleepSeconds": 20, "defaultDevMode": true, "defaultTxPower": 17 }
 }
 ```
 
@@ -40,8 +40,9 @@ Topic names are case-sensitive. `<sensor_mac>` is uppercase, colon-separated hex
 
 | Topic | Producer behavior | JSON fields |
 | --- | --- | --- |
-| `lorahome/sensor/<sensor_mac>/data` | One message for every valid 20-byte or 31-byte sensor packet; non-retained. | `timestamp`, `mac`, `bootNonce`, `msgCount`, `temperature`, `battVoltage`, `battPercent`, `isDevMode`, `needsTimeSync`, `sleepInterval` |
+| `lorahome/sensor/<sensor_mac>/data` | One message for every valid 21-byte or 31-byte sensor packet; non-retained. | `timestamp`, `mac`, `bootNonce`, `msgCount`, `temperature`, `battVoltage`, `battPercent`, `isDevMode`, `needsTimeSync`, `sleepInterval`, `txPower` |
 | `lorahome/sensor/<sensor_mac>/telemetry` | Additional message only when the received sensor packet says development mode; non-retained. | `timestamp`, `battCurrent`, `battPower`, `freeRam`, `cpuTemp`, `txPower`, `lastSNR`, `lastRSSI` |
+| `lorahome/sensor/<sensor_mac>/status` | Retained after every valid sensor packet, when the Gateway reconnects to MQTT, and when the sensor becomes offline. The Gateway marks it offline after three missed advertised sleep intervals plus a 5-second grace period. | `timestamp`, `online`, `uptime` |
 | `lorahome/gateway/status` | On MQTT connection, then on meaningful status changes no more often than 5 seconds, plus a 60-second heartbeat; retained. | `timestamp`, `gatewayRssi`, `gatewaySnr`, `wifiStatus`, `ip`, `freeRam` |
 
 Example core telemetry:
@@ -57,7 +58,8 @@ Example core telemetry:
   "battPercent": 78,
   "isDevMode": 0,
   "needsTimeSync": 0,
-  "sleepInterval": 20
+  "sleepInterval": 20,
+  "txPower": 17
 }
 ```
 
@@ -76,9 +78,73 @@ Example development telemetry:
 }
 ```
 
+Example sensor status:
+
+```json
+{
+  "timestamp": "2026-09-16T14:03:21",
+  "online": true,
+  "uptime": 1260
+}
+```
+
+## Sensor configuration command contract
+
+The cloud control API publishes non-retained QoS 1 commands to:
+
+```text
+lorahome/sensor/<sensor_mac>/config
+```
+
+`<sensor_mac>` is the uppercase colon-separated MAC address already used in the
+sensor data topics. The Gateway must subscribe to `lorahome/sensor/+/config`,
+verify that the topic MAC identifies a known sensor, and relay or apply only
+validated configuration for that sensor.
+
+The command payload is JSON:
+
+```json
+{
+  "commandId": "uuid",
+  "schemaVersion": 1,
+  "expiresAt": "2026-09-17T12:00:00+00:00",
+  "config": {
+    "defaultSleepSeconds": 60,
+    "defaultDevMode": false
+  },
+  "signature": "hex-hmac-sha256"
+}
+```
+
+`config` must contain at least one field. `defaultSleepSeconds` is an integer
+from 10 through 86400; `defaultDevMode` is boolean. Reject unknown fields,
+expired commands, invalid topic MACs, and duplicate `commandId` values.
+
+The signature is HMAC-SHA256 using the shared `CONTROL_COMMAND_SECRET`. Compute
+it over UTF-8 JSON containing only `commandId`, `schemaVersion`, `expiresAt`, and
+`config`, serialized with lexicographically sorted keys and compact separators
+(`,` and `:`). Compare against the lowercase hexadecimal `signature` value using
+a constant-time comparison. Never log the shared secret.
+
+After processing, publish a non-retained QoS 1 result to:
+
+```text
+lorahome/sensor/<sensor_mac>/config/result
+```
+
+```json
+{
+  "commandId": "uuid",
+  "status": "applied"
+}
+```
+
+Valid result statuses are `applied`, `rejected`, and `expired`. The cloud uses
+this response to update the command status displayed through its control API.
+
 ## Field semantics and normalization
 
-The values below are raw values emitted by the current firmware. Preserve the raw value, then derive engineering units in the ingestion service or query layer.
+The telemetry values below are raw values emitted by the current firmware. Preserve raw telemetry values, then derive engineering units in the ingestion service or query layer. Sensor-status fields are Gateway-derived.
 
 | Field | Type | Meaning / unit | Cloud normalization |
 | --- | --- | --- | --- |
@@ -91,6 +157,8 @@ The values below are raw values emitted by the current firmware. Preserve the ra
 | `isDevMode` | integer flag | Sensor development mode (`0`/`1`). | Boolean/flag. |
 | `needsTimeSync` | integer flag | Sensor clock needs synchronization (`0`/`1`). | Boolean/flag and alert signal. |
 | `sleepInterval` | unsigned integer | Configured sensor sleep period in seconds. | Store as seconds. |
+| `online` | boolean | Gateway's current view of sensor presence. It becomes `false` after three missed advertised sleep intervals plus 5 seconds. | Store as the latest retained sensor-status value. Treat it as Gateway-observed, not a sensor self-report. |
+| `uptime` | unsigned integer | Seconds the Gateway has continuously considered this sensor online since its first packet or recovery from offline. | Store as seconds; it is `0` while offline and resets when the Gateway restarts. |
 | `battCurrent` | signed integer | INA226 current in mA, truncated to an integer. Negative is possible. | `battery_current_ma`. |
 | `battPower` | signed integer | INA226 power in mW, truncated to an integer. | `battery_power_mw`. |
 | `freeRam` | unsigned integer | Sensor free RAM in KiB on development telemetry; Gateway free heap in bytes on status. | Keep separate measurement/field names to avoid unit collision. |
@@ -129,6 +197,7 @@ Suggested InfluxDB measurements:
 | --- | --- | --- |
 | `sensor_reading` | `sensor_id`, `site` | `temperature_c`, `battery_voltage_v`, `battery_percent`, `sleep_interval_s`, `is_dev_mode`, `needs_time_sync`, raw counter/nonce |
 | `sensor_diagnostics` | `sensor_id`, `site` | current/power, RAM KiB, CPU temperature, TX power, last downlink SNR/RSSI |
+| `sensor_status` | `sensor_id`, `site` | online flag and continuous sensor online duration in seconds |
 | `gateway_status` | `gateway_id`, `site`, `wifi_status` | radio RSSI/SNR, free heap bytes, IP as optional field |
 | `ingestion_event` | `gateway_id`, `sensor_id`, `reason` | malformed/unknown-topic counters; retain short-term only |
 
@@ -137,6 +206,7 @@ Use `ingested_at` (UTC) as the primary write timestamp. Optionally preserve pars
 ## Initial dashboards and alerts
 
 - Boiler/sensor overview: latest temperature, battery voltage/percent, time since last core packet, and `needsTimeSync`.
+- Sensor presence: latest retained `online` state; the Gateway declares offline after three missed advertised sleep intervals plus five seconds.
 - Per-sensor history: temperature over time, expected versus observed reporting interval, and battery trend.
 - Gateway health: retained status age, Wi-Fi state, free heap, radio RSSI/SNR, and MQTT consumer lag/errors.
 - Development diagnostics: shown only for sensors in development mode; keep them out of primary operational dashboards.
@@ -153,12 +223,13 @@ Use `ingested_at` (UTC) as the primary write timestamp. Optionally preserve pars
 
 ## Prompt for a future implementation AI
 
-> Build the cloud backend described in `CLOUD_IOT_HANDOFF.md` for the existing LoRaHome ESP32 Gateway. Do not change firmware in the first phase. Provision a TLS MQTT broker, a durable MQTT-to-InfluxDB ingestion service, Grafana dashboards, and Grafana alerts. Subscribe to the exact lowercase `lorahome/#` topic contract and preserve raw values while deriving engineering-unit fields. Use UTC ingestion time as the database timestamp because the device timestamp is Athens local time without an offset and can be invalid before NTP sync. Implement strict validation, observability, credentials via environment/secrets management, Docker Compose for local development, and deployment documentation. Include automated tests with the sample payloads in this document. Do not implement cloud-to-device commands because the Gateway does not subscribe to MQTT.
+> Build the cloud backend described in `CLOUD_IOT_HANDOFF.md` for the existing LoRaHome ESP32 Gateway. Do not change firmware in the first phase. Provision a TLS MQTT broker, a durable MQTT-to-InfluxDB ingestion service, Grafana dashboards, and Grafana alerts. Subscribe to the exact lowercase `lorahome/#` topic contract and preserve raw values while deriving engineering-unit fields. Consume retained sensor-status messages as Gateway-observed presence, including their continuous online duration. Use UTC ingestion time as the database timestamp because the device timestamp is Athens local time without an offset and can be invalid before NTP sync. Implement strict validation, observability, credentials via environment/secrets management, Docker Compose for local development, and deployment documentation. Include automated tests with the sample payloads in this document. Do not implement cloud-to-device commands because the Gateway does not subscribe to MQTT.
 
 ## Known interface limitations to plan around
 
 - No MQTT QoS 1, persistent session, offline buffering, or replay: packet loss is expected.
 - No explicit gateway ID or site ID in MQTT topics/payloads. A single broker serving multiple gateways can collide when sensors share a MAC-derived topic; add a gateway/site namespace in a coordinated future firmware and cloud migration.
 - The status topic is global (`lorahome/gateway/status`) and retained, so it supports only one Gateway without topic changes.
+- Sensor presence is held only in a 16-entry Gateway RAM table. A Gateway restart cannot mark previously retained sensor statuses offline; treat their timestamps and the Gateway status age as staleness signals until the sensor transmits again.
 - Core and development messages are published separately and not transactionally.
 - The MQTT buffer is 256 bytes. Keep payload additions small or update the firmware buffer deliberately.
