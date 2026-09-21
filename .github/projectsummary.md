@@ -12,8 +12,11 @@
         *   `LoRaHome/sensor/<mac>/data`
         *   `LoRaHome/sensor/<mac>/telemetry`
 *   **Configuration:**
-    *   **Remote (LoRa):** 19-byte binary payload for sleep interval, dev mode, and time synchronization.
+    *   **Remote (LoRa):** 20-byte schema-v2 binary payload for the one-byte sleep interval, dev mode, TX power, and time synchronization.
     *   **Local:** `DEV_MODE_PIN` (GPIO13) for hardware override into development mode.
+    *   **Cloud (MQTT):** Gateway subscribes to `lorahome/sensor/+/config`; signed, non-expired commands override sleep (10–255 seconds), Dev Mode, and signed 8-bit TX-power requests (-128–127 dBm) for known Sensors until Gateway reboot. The Sensor rejects power unsupported by its installed radio. On load, valid SD configuration JSON is completed with missing supported objects and default keys, including `control.commandSecret`.
+    *   **Update cadence:** Sensor beacon checks are derived from the active sleep interval, targeting no more than 60 seconds between checks; sleep intervals of 60 seconds or longer check every wake.
+    *   **Link metrics:** The Sensor retains the last valid configuration-downlink SNR/RSSI in RTC memory across deep sleep and soft resets for later development telemetry.
 *   **Security:**
     *   **LoRa:** Telemetry is encrypted with AES-128-CTR using the public MAC, per-boot random nonce, and message counter as nonce material. Configuration downlinks are authenticated with a shared `NETWORK_KEY`.
     *   **MQTT:** Communication over TLS.

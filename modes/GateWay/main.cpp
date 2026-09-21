@@ -9,11 +9,13 @@
 #include <time.h>
 #include <math.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <LoRaHomeCommon.h>
 #include <SD.h>
 #include <SPI.h>
 #include <Crypto.h>
 #include <AES.h>
+#include <mbedtls/md.h>
 #include <esp_log.h>
 #include <GatewayLogSink.h>
 #include <uptime.h>
@@ -191,6 +193,7 @@ static const unsigned long STATUS_MIN_INTERVAL_MS = 5000;
 static const unsigned long STATUS_HEARTBEAT_MS = 60000;
 static const unsigned long SENSOR_STATUS_GRACE_MS = 5000;
 static const uint8_t MAX_TRACKED_SENSORS = 16;
+static const uint8_t MAX_PROCESSED_COMMANDS = 16;
 static unsigned long mqttReconnectDelayMs = RECONNECT_DELAY_MS;
 static const unsigned long WIFI_RECONNECT_DELAY_MS = 10000;  
 static const unsigned long NTP_SYNC_DELAY_MS = 30000;  // Delay between NTP Syncs (30 seconds)
@@ -203,6 +206,12 @@ struct SensorPresence {
     unsigned long onlineSinceMs = 0;
     uint32_t sleepIntervalSeconds = 0;
     bool online = false;
+    bool hasSleepOverride = false;
+    uint8_t sleepOverrideSeconds = 0;
+    bool hasDevModeOverride = false;
+    bool devModeOverride = false;
+    bool hasTxPowerOverride = false;
+    int8_t txPowerOverride = 0;
 };
 
 struct SensorStatus {
@@ -211,6 +220,8 @@ struct SensorStatus {
 };
 
 static SensorPresence sensorPresence[MAX_TRACKED_SENSORS];
+static char processedCommandIds[MAX_PROCESSED_COMMANDS][37] = {};
+static uint8_t nextProcessedCommandSlot = 0;
 
 struct GatewayConfig {
     String wifiSsid;
@@ -219,6 +230,7 @@ struct GatewayConfig {
     uint16_t mqttPort = MQTT_PORT;
     String mqttUser;
     String mqttPassword;
+    String controlCommandSecret;
     uint8_t sensorSleepSeconds = 20;
     bool sensorDevMode = true;
     int8_t sensorTxPower = CONFIG_RADIO_OUTPUT_POWER;
@@ -249,6 +261,10 @@ void applyNetworkConfiguration();
 SensorPresence* updateSensorPresence(const char* mac, uint32_t sleepIntervalSeconds);
 bool publishSensorStatus(const SensorPresence& presence);
 void publishTrackedSensorStatuses();
+SensorPresence* findSensorPresence(const char* mac);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void handleMqttConfigCommand(const char* topic, const byte* payload, unsigned int length);
+bool publishConfigResult(const char* mac, const char* commandId, const char* status);
 
 WiFiClientSecure espClient; // Use secure client for TLS
 PubSubClient mqttClient(espClient);
@@ -287,6 +303,7 @@ bool loadGatewayConfig(bool sdAvailable, bool* created) {
         defaults["sensor"]["defaultSleepSeconds"] = gatewayConfig.sensorSleepSeconds;
         defaults["sensor"]["defaultDevMode"] = gatewayConfig.sensorDevMode;
         defaults["sensor"]["defaultTxPower"] = gatewayConfig.sensorTxPower;
+        defaults["control"]["commandSecret"] = gatewayConfig.controlCommandSecret;
         file = SD.open("/config.json", FILE_WRITE);
         if (file) {
             serializeJsonPretty(defaults, file);
@@ -302,15 +319,63 @@ bool loadGatewayConfig(bool sdAvailable, bool* created) {
     StaticJsonDocument<512> doc;
     DeserializationError error = deserializeJson(doc, file);
     file.close();
-    if (error) return false;
+    if (error || !doc.is<JsonObject>()) return false;
 
-    JsonObject wifi = doc["wifi"];
+    bool configUpdated = false;
+    JsonObject wifi = doc["wifi"].as<JsonObject>();
+    if (wifi.isNull()) {
+        doc.remove("wifi");
+        wifi = doc.createNestedObject("wifi");
+        configUpdated = true;
+    }
+    if (!wifi.containsKey("ssid")) { wifi["ssid"] = gatewayConfig.wifiSsid; configUpdated = true; }
+    if (!wifi.containsKey("password")) { wifi["password"] = gatewayConfig.wifiPassword; configUpdated = true; }
+
+    JsonObject mqtt = doc["mqtt"].as<JsonObject>();
+    if (mqtt.isNull()) {
+        doc.remove("mqtt");
+        mqtt = doc.createNestedObject("mqtt");
+        configUpdated = true;
+    }
+    if (!mqtt.containsKey("host")) { mqtt["host"] = gatewayConfig.mqttHost; configUpdated = true; }
+    if (!mqtt.containsKey("port")) { mqtt["port"] = gatewayConfig.mqttPort; configUpdated = true; }
+    if (!mqtt.containsKey("user")) { mqtt["user"] = gatewayConfig.mqttUser; configUpdated = true; }
+    if (!mqtt.containsKey("password")) { mqtt["password"] = gatewayConfig.mqttPassword; configUpdated = true; }
+
+    JsonObject sensor = doc["sensor"].as<JsonObject>();
+    if (sensor.isNull()) {
+        doc.remove("sensor");
+        sensor = doc.createNestedObject("sensor");
+        configUpdated = true;
+    }
+    if (!sensor.containsKey("defaultSleepSeconds")) { sensor["defaultSleepSeconds"] = gatewayConfig.sensorSleepSeconds; configUpdated = true; }
+    if (!sensor.containsKey("defaultDevMode")) { sensor["defaultDevMode"] = gatewayConfig.sensorDevMode; configUpdated = true; }
+    if (!sensor.containsKey("defaultTxPower")) { sensor["defaultTxPower"] = gatewayConfig.sensorTxPower; configUpdated = true; }
+
+    JsonObject control = doc["control"].as<JsonObject>();
+    if (control.isNull()) {
+        doc.remove("control");
+        control = doc.createNestedObject("control");
+        configUpdated = true;
+    }
+    if (!control.containsKey("commandSecret")) { control["commandSecret"] = gatewayConfig.controlCommandSecret; configUpdated = true; }
+
+    if (configUpdated) {
+        file = SD.open("/config.json", FILE_WRITE);
+        if (!file) return false;
+        if (serializeJsonPretty(doc, file) == 0) {
+            file.close();
+            return false;
+        }
+        file.close();
+        GW_LOG_INFO("Added missing configuration defaults to /config.json.");
+    }
+
     const char* value = wifi["ssid"].as<const char*>();
     if (value && value[0]) gatewayConfig.wifiSsid = value;
     value = wifi["password"].as<const char*>();
     if (value) gatewayConfig.wifiPassword = value;
 
-    JsonObject mqtt = doc["mqtt"];
     value = mqtt["host"].as<const char*>();
     if (value && value[0]) gatewayConfig.mqttHost = value;
     uint32_t mqttPort = mqtt["port"] | MQTT_PORT;
@@ -320,12 +385,14 @@ bool loadGatewayConfig(bool sdAvailable, bool* created) {
     value = mqtt["password"].as<const char*>();
     if (value) gatewayConfig.mqttPassword = value;
 
-    JsonObject sensor = doc["sensor"];
-    uint16_t sleepSeconds = sensor["defaultSleepSeconds"] | 0;
-    if (sleepSeconds >= 1 && sleepSeconds <= UINT8_MAX) gatewayConfig.sensorSleepSeconds = sleepSeconds;
+    int32_t sleepSeconds = sensor["defaultSleepSeconds"] | 0;
+    if (sleepSeconds >= 10 && sleepSeconds <= UINT8_MAX) gatewayConfig.sensorSleepSeconds = (uint8_t)sleepSeconds;
     if (!sensor["defaultDevMode"].isNull()) gatewayConfig.sensorDevMode = sensor["defaultDevMode"].as<bool>();
     int16_t txPower = sensor["defaultTxPower"] | gatewayConfig.sensorTxPower;
     if (txPower >= INT8_MIN && txPower <= INT8_MAX) gatewayConfig.sensorTxPower = (int8_t)txPower;
+
+    value = control["commandSecret"].as<const char*>();
+    if (value && value[0]) gatewayConfig.controlCommandSecret = value;
 
     wifi["password"] = "***";
     mqtt["password"] = "***";
@@ -498,6 +565,8 @@ void setup()
     // Setup TLS client (use setInsecure for testing without CA cert, 
     // or provide CA cert using espClient.setCACert(root_ca) for production)
     espClient.setInsecure();
+    mqttClient.setBufferSize(512);
+    mqttClient.setCallback(mqttCallback);
 
     
     // Attempt to recover time from ESP32's hardware RTC (survives software resets)
@@ -814,15 +883,27 @@ void loop()
                 // This block must execute as fast as possible to meet the sensor's short RX window.
                 // construct sensor configuration payload
 
+                char targetMacStr[18];
+                sprintf(targetMacStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+                        rxPayload.mac[0], rxPayload.mac[1], rxPayload.mac[2],
+                        rxPayload.mac[3], rxPayload.mac[4], rxPayload.mac[5]);
+                SensorPresence* targetPresence = findSensorPresence(targetMacStr);
+
                 ConfigPayload txConfig;
                 txConfig.header[0] = 'C'; // harcoded
                 txConfig.header[1] = 'F'; // hardcoded
                 memcpy(txConfig.targetMac, rxPayload.mac, 6);
                 txConfig.networkKey = NETWORK_KEY;
-                txConfig.sleepInterval = gatewayConfig.sensorSleepSeconds;
+                txConfig.sleepInterval = (targetPresence && targetPresence->hasSleepOverride)
+                                             ? targetPresence->sleepOverrideSeconds
+                                             : gatewayConfig.sensorSleepSeconds;
                 txConfig.configVersion = 2;
-                txConfig.isDevMode = gatewayConfig.sensorDevMode ? 1 : 0;
-                txConfig.txPower = gatewayConfig.sensorTxPower;
+                txConfig.isDevMode = (targetPresence && targetPresence->hasDevModeOverride)
+                                         ? (targetPresence->devModeOverride ? 1 : 0)
+                                         : (gatewayConfig.sensorDevMode ? 1 : 0);
+                txConfig.txPower = (targetPresence && targetPresence->hasTxPowerOverride)
+                                       ? targetPresence->txPowerOverride
+                                       : gatewayConfig.sensorTxPower;
 
                 //ensure RTC is synced before transmiting timeoffset
                 if (!hasValidRtcTime) {
@@ -1081,6 +1162,257 @@ String mqttTopic(const String* mac, const char* mode) {
     }
 }
 
+SensorPresence* findSensorPresence(const char* mac) {
+    for (SensorPresence& presence : sensorPresence) {
+        if (presence.mac[0] != '\0' && strcmp(presence.mac, mac) == 0) {
+            return &presence;
+        }
+    }
+    return nullptr;
+}
+
+static bool isValidSensorMac(const char* mac) {
+    if (!mac || strlen(mac) != 17) return false;
+    for (uint8_t i = 0; i < 17; i++) {
+        if ((i + 1) % 3 == 0) {
+            if (mac[i] != ':') return false;
+        } else if (!((mac[i] >= '0' && mac[i] <= '9') || (mac[i] >= 'A' && mac[i] <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool getConfigCommandMac(const char* topic, char* mac) {
+    const char prefix[] = MQTT_TOPIC_PREFIX "/sensor/";
+    const size_t prefixLength = sizeof(prefix) - 1;
+    if (!topic || strncmp(topic, prefix, prefixLength) != 0) return false;
+    if (strlen(topic) != prefixLength + 17 + strlen("/config")) return false;
+    memcpy(mac, topic + prefixLength, 17);
+    mac[17] = '\0';
+    return isValidSensorMac(mac) && strcmp(topic + prefixLength + 17, "/config") == 0;
+}
+
+static bool isValidCommandId(const char* commandId) {
+    if (!commandId || strlen(commandId) != 36) return false;
+    for (uint8_t i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (commandId[i] != '-') return false;
+        } else if (!isxdigit((unsigned char)commandId[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parseCommandExpiry(const char* expiresAt, time_t* expiresAtUtc) {
+    if (!expiresAt || strlen(expiresAt) != 25 ||
+        expiresAt[4] != '-' || expiresAt[7] != '-' || expiresAt[10] != 'T' ||
+        expiresAt[13] != ':' || expiresAt[16] != ':' || strcmp(expiresAt + 19, "+00:00") != 0) {
+        return false;
+    }
+
+    struct tm expires = {};
+    if (sscanf(expiresAt, "%4d-%2d-%2dT%2d:%2d:%2d", &expires.tm_year, &expires.tm_mon,
+               &expires.tm_mday, &expires.tm_hour, &expires.tm_min, &expires.tm_sec) != 6) {
+        return false;
+    }
+    expires.tm_year -= 1900;
+    expires.tm_mon -= 1;
+
+    // Convert the validated UTC calendar value without using mktime(), which
+    // applies the Gateway's Europe/Athens timezone, or timegm(), which is not
+    // available in this ESP32 toolchain.
+    int year = expires.tm_year + 1900;
+    unsigned int month = (unsigned int)expires.tm_mon + 1;
+    unsigned int day = (unsigned int)expires.tm_mday;
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned int yearOfEra = (unsigned int)(year - era * 400);
+    const unsigned int marchMonth = month > 2 ? month - 3 : month + 9;
+    const unsigned int dayOfYear = (153 * marchMonth + 2) / 5 + day - 1;
+    const unsigned int dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+    const int64_t daysSinceEpoch = (int64_t)era * 146097 + dayOfEra - 719468;
+    time_t parsed = (time_t)(daysSinceEpoch * 86400 + expires.tm_hour * 3600 +
+                             expires.tm_min * 60 + expires.tm_sec);
+    if (parsed < (time_t)CUSTOM_EPOCH) return false;
+
+    struct tm verified = {};
+    gmtime_r(&parsed, &verified);
+    if (verified.tm_year != expires.tm_year || verified.tm_mon != expires.tm_mon ||
+        verified.tm_mday != expires.tm_mday || verified.tm_hour != expires.tm_hour ||
+        verified.tm_min != expires.tm_min || verified.tm_sec != expires.tm_sec) {
+        return false;
+    }
+    *expiresAtUtc = parsed;
+    return true;
+}
+
+static bool isDuplicateCommand(const char* commandId) {
+    for (const char* processedId : processedCommandIds) {
+        if (processedId[0] != '\0' && strcmp(processedId, commandId) == 0) return true;
+    }
+    return false;
+}
+
+static void rememberCommand(const char* commandId) {
+    strncpy(processedCommandIds[nextProcessedCommandSlot], commandId,
+            sizeof(processedCommandIds[nextProcessedCommandSlot]) - 1);
+    processedCommandIds[nextProcessedCommandSlot][sizeof(processedCommandIds[nextProcessedCommandSlot]) - 1] = '\0';
+    nextProcessedCommandSlot = (nextProcessedCommandSlot + 1) % MAX_PROCESSED_COMMANDS;
+}
+
+static bool verifyCommandSignature(const char* signature, const String& canonicalJson) {
+    if (!signature || strlen(signature) != 64 || gatewayConfig.controlCommandSecret.length() == 0) return false;
+
+    uint8_t digest[32];
+    const mbedtls_md_info_t* mdInfo = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!mdInfo || mbedtls_md_hmac(mdInfo,
+                                   (const unsigned char*)gatewayConfig.controlCommandSecret.c_str(),
+                                   gatewayConfig.controlCommandSecret.length(),
+                                   (const unsigned char*)canonicalJson.c_str(),
+                                   canonicalJson.length(), digest) != 0) {
+        return false;
+    }
+
+    static const char hex[] = "0123456789abcdef";
+    uint8_t difference = 0;
+    for (uint8_t i = 0; i < sizeof(digest); i++) {
+        char high = hex[digest[i] >> 4];
+        char low = hex[digest[i] & 0x0F];
+        difference |= (uint8_t)(high ^ signature[i * 2]);
+        difference |= (uint8_t)(low ^ signature[i * 2 + 1]);
+    }
+    return difference == 0;
+}
+
+bool publishConfigResult(const char* mac, const char* commandId, const char* status) {
+    StaticJsonDocument<128> result;
+    result["commandId"] = commandId;
+    result["status"] = status;
+    char payload[128];
+    size_t length = serializeJson(result, payload, sizeof(payload));
+    String topic = String(MQTT_TOPIC_PREFIX) + "/sensor/" + mac + "/config/result";
+    return length > 0 && mqttClient.publish(topic.c_str(), payload, false);
+}
+
+void handleMqttConfigCommand(const char* topic, const byte* payload, unsigned int length) {
+    char mac[18] = {};
+    if (!getConfigCommandMac(topic, mac)) {
+        GW_LOG_WARN("Rejected MQTT config command with invalid topic");
+        return;
+    }
+
+    StaticJsonDocument<384> command;
+    if (length == 0 || length > 256 || deserializeJson(command, payload, length)) {
+        GW_LOG_WARN("Rejected MQTT config command for %s: invalid JSON", mac);
+        return;
+    }
+
+    const char* commandId = command["commandId"].as<const char*>();
+    const char* expiresAt = command["expiresAt"].as<const char*>();
+    const char* signature = command["signature"].as<const char*>();
+    JsonObjectConst config = command["config"].as<JsonObjectConst>();
+    if (!isValidCommandId(commandId) || !expiresAt || !signature || config.isNull() ||
+        command.size() != 5 || !command.containsKey("schemaVersion") || command["schemaVersion"].as<int>() != 1 ||
+        !command.containsKey("commandId") || !command.containsKey("expiresAt") || !command.containsKey("config") ||
+        !command.containsKey("signature")) {
+        if (isValidCommandId(commandId)) publishConfigResult(mac, commandId, "rejected");
+        GW_LOG_WARN("Rejected MQTT config command for %s: invalid schema", mac);
+        return;
+    }
+
+    bool hasSleep = config.containsKey("defaultSleepSeconds");
+    bool hasDevMode = config.containsKey("defaultDevMode");
+    bool hasTxPower = config.containsKey("defaultTxPower");
+    if (config.size() == 0 || config.size() != (hasSleep ? 1 : 0) + (hasDevMode ? 1 : 0) + (hasTxPower ? 1 : 0) ||
+        (hasSleep && !config["defaultSleepSeconds"].is<int>()) ||
+        (hasDevMode && !config["defaultDevMode"].is<bool>()) ||
+        (hasTxPower && !config["defaultTxPower"].is<int>())) {
+        publishConfigResult(mac, commandId, "rejected");
+        GW_LOG_WARN("Rejected MQTT config command %s: invalid config fields", commandId);
+        return;
+    }
+
+    int sleepSeconds = hasSleep ? config["defaultSleepSeconds"].as<int>() : 0;
+    if (hasSleep && (sleepSeconds < 10 || sleepSeconds > UINT8_MAX)) {
+        publishConfigResult(mac, commandId, "rejected");
+        GW_LOG_WARN("Rejected MQTT config command %s: sleep interval out of range", commandId);
+        return;
+    }
+
+    int txPower = hasTxPower ? config["defaultTxPower"].as<int>() : 0;
+    if (hasTxPower && (txPower < INT8_MIN || txPower > INT8_MAX)) {
+        publishConfigResult(mac, commandId, "rejected");
+        GW_LOG_WARN("Rejected MQTT config command %s: TX power out of range", commandId);
+        return;
+    }
+
+    StaticJsonDocument<256> canonical;
+    canonical["commandId"] = commandId;
+    JsonObject canonicalConfig = canonical.createNestedObject("config");
+    if (hasDevMode) canonicalConfig["defaultDevMode"] = config["defaultDevMode"].as<bool>();
+    if (hasSleep) canonicalConfig["defaultSleepSeconds"] = sleepSeconds;
+    if (hasTxPower) canonicalConfig["defaultTxPower"] = txPower;
+    canonical["expiresAt"] = expiresAt;
+    canonical["schemaVersion"] = 1;
+    String canonicalJson;
+    serializeJson(canonical, canonicalJson);
+    if (!verifyCommandSignature(signature, canonicalJson)) {
+        publishConfigResult(mac, commandId, "rejected");
+        GW_LOG_WARN("Rejected MQTT config command %s: invalid signature", commandId);
+        return;
+    }
+
+    if (isDuplicateCommand(commandId)) {
+        publishConfigResult(mac, commandId, "rejected");
+        GW_LOG_WARN("Rejected duplicate MQTT config command %s", commandId);
+        return;
+    }
+
+    time_t expiresAtUtc;
+    time_t now;
+    time(&now);
+    if (!parseCommandExpiry(expiresAt, &expiresAtUtc) || !isClockValid(now)) {
+        publishConfigResult(mac, commandId, "rejected");
+        GW_LOG_WARN("Rejected MQTT config command %s: cannot validate expiry", commandId);
+        return;
+    }
+    if (now >= expiresAtUtc) {
+        rememberCommand(commandId);
+        publishConfigResult(mac, commandId, "expired");
+        GW_LOG_WARN("Expired MQTT config command %s", commandId);
+        return;
+    }
+
+    SensorPresence* sensor = findSensorPresence(mac);
+    if (!sensor) {
+        publishConfigResult(mac, commandId, "rejected");
+        GW_LOG_WARN("Rejected MQTT config command %s: unknown sensor %s", commandId, mac);
+        return;
+    }
+
+    if (hasSleep) {
+        sensor->hasSleepOverride = true;
+        sensor->sleepOverrideSeconds = (uint8_t)sleepSeconds;
+    }
+    if (hasDevMode) {
+        sensor->hasDevModeOverride = true;
+        sensor->devModeOverride = config["defaultDevMode"].as<bool>();
+    }
+    if (hasTxPower) {
+        sensor->hasTxPowerOverride = true;
+        sensor->txPowerOverride = (int8_t)txPower;
+    }
+    rememberCommand(commandId);
+    publishConfigResult(mac, commandId, "applied");
+    GW_LOG_INFO("Applied MQTT config command %s for %s", commandId, mac);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    handleMqttConfigCommand(topic, payload, length);
+}
+
 SensorPresence* updateSensorPresence(const char* mac, uint32_t sleepIntervalSeconds) {
     SensorPresence* available = nullptr;
     for (SensorPresence& presence : sensorPresence) {
@@ -1245,6 +1577,11 @@ void mqttConnect() {
             GW_LOG_INFO("MQTT connected!");
             mqttConnected = true;
             mqttReconnectDelayMs = RECONNECT_DELAY_MS;
+            if (!mqttClient.subscribe(MQTT_TOPIC_PREFIX "/sensor/+/config", 1)) {
+                GW_LOG_ERROR("MQTT config subscription failed");
+            } else {
+                GW_LOG_INFO("MQTT config subscription active");
+            }
             GatewayStatus status{};
             status.gatewayRssi = (int16_t)radio.getRSSI();
             status.gatewaySnr = radio.getSNR();

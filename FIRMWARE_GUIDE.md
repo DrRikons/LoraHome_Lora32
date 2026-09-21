@@ -88,7 +88,7 @@ sequenceDiagram
 
 - `rtcConfig` uses `RTC_NOINIT_ATTR`, so the accepted sleep interval and remote development-mode setting survive soft resets and deep sleep.
 - `counter`, `wakeCycleCount`, and `bootNonce` use RTC memory. `bootNonce` is generated with `esp_random()` on a cold boot and retained through deep sleep.
-- A configuration update resets `wakeCycleCount`; otherwise the Sensor checks for an update every ten wake cycles.
+- The Sensor derives its beacon-check cadence from the configured sleep interval, targeting no more than 60 seconds between periodic checks. Sleep intervals of 60 seconds or longer check every wake. The counter resets after every check so an absent beacon does not cause continuous RX polling.
 - The Sensor treats the RTC as unsynchronized until it differs from the expected boot epoch progression. A valid downlink `timeOffset` sets the ESP32 system clock in UTC.
 - Sensor serial diagnostics are prefixed with UTC (`YYYY-MM-DDTHH:MM:SSZ`) after synchronization, or elapsed boot time (`+<seconds>s`) beforehand.
 
@@ -160,7 +160,7 @@ Both firmware images register RadioLib packet-sent and packet-received callbacks
 
 ### Telemetry payload
 
-`TelemetryPayload` is packed and is either 20 bytes (normal) or 31 bytes (development):
+`TelemetryPayload` is packed and is either 21 bytes (normal) or 31 bytes (development):
 
 | Area | Fields | Encryption |
 | --- | --- | --- |
@@ -172,20 +172,24 @@ The CTR nonce is constructed from the MAC, boot nonce, and message count. The Ga
 
 ### Configuration payload
 
-`ConfigPayload` is a packed 20-byte downlink:
+`ConfigPayload` is a packed 20-byte schema-v2 downlink:
 
 | Field | Bytes | Meaning |
 | --- | ---: | --- |
 | `header` | 2 | `CF`, quick packet discriminator |
 | `targetMac` | 6 | Sensor MAC or all `FF` for broadcast |
 | `networkKey` | 4 | Shared configuration authorization value |
-| `sleepInterval` | 1 | Requested sleep duration in seconds |
+| `sleepInterval` | 1 | Requested sleep duration in seconds; valid range 10–255 |
 | `configVersion` | 1 | Protocol configuration version; currently `2` |
 | `isDevMode` | 1 | Nonzero enables development mode |
 | `txPower` | 1 | Requested LoRa output power in dBm; the Sensor rejects unsupported values |
 | `timeOffset` | 4 | Seconds since `CUSTOM_EPOCH`; zero means no clock update |
 
 The Sensor accepts a configuration only after checking its exact length, `CF` header, target MAC/broadcast MAC, and `NETWORK_KEY`.
+
+### Cloud configuration commands
+
+The Gateway subscribes to `lorahome/sensor/+/config`. It validates the handoff JSON command's UUID, schema version, expiry, allowed fields, HMAC-SHA256 signature, duplicate state, and known Sensor MAC before retaining a per-sensor sleep/Dev Mode override for its next LoRa downlink. The schema-v2 LoRa sleep field is one byte and accepts 10–255 seconds; the cloud must enforce this firmware limit. The HMAC secret is read from `control.commandSecret` in Gateway SD configuration.
 
 ## Build and deployment
 

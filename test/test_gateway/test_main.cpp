@@ -14,7 +14,7 @@ void test_gateway_parses_core_payload_fields() {
     payload.battPercent = 99;
     payload.isDevMode = 1;
     payload.needsTimeSync = 1;
-    payload.sleepInterval = 300;
+    payload.sleepInterval = 240;
     payload.txPower = 17;
 
     GatewayTelemetryState parsed = parseTelemetryPayload(payload, TELEMETRY_CORE_SIZE);
@@ -25,7 +25,7 @@ void test_gateway_parses_core_payload_fields() {
     TEST_ASSERT_FLOAT_WITHIN(0.01f, 4.14f, parsed.batteryVoltageV);
     TEST_ASSERT_EQUAL_UINT8(99, parsed.batteryPercent);
     TEST_ASSERT_TRUE(parsed.needsTimeSync);
-    TEST_ASSERT_EQUAL_UINT32(300, parsed.sleepIntervalSeconds);
+    TEST_ASSERT_EQUAL_UINT32(240, parsed.sleepIntervalSeconds);
     TEST_ASSERT_EQUAL_INT8(17, parsed.txPowerdBm);
     TEST_ASSERT_FALSE(parsed.hasDevTelemetry);
 }

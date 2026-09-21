@@ -17,6 +17,7 @@
 #define DEV_MODE_PIN 13 // GPIO13 for dev mode toggle (pull low to enable)
 // Magic word to validate RTC memory integrity
 #define RTC_MAGIC_WORD 0xA1B2C3D4
+#define RTC_LINK_METRICS_MAGIC 0x4C4D4554
 #define SENSOR_CONFIG_VERSION 2
 
 #if     defined(USING_SX1276)
@@ -163,10 +164,19 @@ static SemaphoreHandle_t radioSemaphore = NULL;
 RTC_DATA_ATTR static uint16_t counter = 0;
 RTC_DATA_ATTR static uint8_t wakeCycleCount = 0;
 RTC_DATA_ATTR static uint32_t bootNonce = 0;
+
+struct LinkMetrics {
+  uint32_t magicWord;
+  float lastSNR;
+  float lastRSSI;
+};
+
+RTC_NOINIT_ATTR LinkMetrics rtcLinkMetrics;
 static String payload;
 static uint32_t lastTxTime = 0;
 static uint32_t lastRxTime = 0;
 static uint32_t lastBeaconRxTime = 0;
+static const uint8_t UPDATE_CHECK_MAX_INTERVAL_SECONDS = 60;
 // Transmission details
 static String deviceId;
 static int screenNum = -1;
@@ -324,6 +334,12 @@ void setup()
     if (bootNonce == 0) {
         bootNonce = esp_random();
         if (bootNonce == 0) bootNonce = 1;
+    }
+
+    if (rtcLinkMetrics.magicWord != RTC_LINK_METRICS_MAGIC) {
+        rtcLinkMetrics.magicWord = RTC_LINK_METRICS_MAGIC;
+        rtcLinkMetrics.lastSNR = 0;
+        rtcLinkMetrics.lastRSSI = 0;
     }
 
     // Early evaluate devMode to enable serial immediately if needed
@@ -544,7 +560,7 @@ void wakeCycle() {
     if (serialEnabled) Serial.println("--- Transmit ---");
     transmitData();
 
-    if (serialEnabled) Serial.println("--- Receive ---");
+
     checkForUpdates();
 }   
 
@@ -552,6 +568,9 @@ void wakeCycle() {
 // Used in: Both Operation and Dev modes
 void readSensors()
 {   
+    // Preserve the most recent valid config-downlink metrics across deep sleep and soft resets.
+    sensorData.lastSNR = rtcLinkMetrics.lastSNR;
+    sensorData.lastRSSI = rtcLinkMetrics.lastRSSI;
     
     // Read DS18B20 temperature
     sensors.requestTemperatures();
@@ -672,22 +691,30 @@ void transmitData()
     
 }
 
-// Checks for pending gateway updates based on wake cycle count or invalid clock.
+// Checks for pending gateway updates at least every 60 seconds or when the clock is invalid.
 // Used in: Both Operation and Dev modes
 void checkForUpdates() {
     wakeCycleCount++;
+    uint8_t cyclesBetweenChecks = 1;
+    if (config.sleepInterval > 0) {
+        cyclesBetweenChecks = UPDATE_CHECK_MAX_INTERVAL_SECONDS / config.sleepInterval;
+        if (cyclesBetweenChecks == 0) cyclesBetweenChecks = 1;
+    }
     if (serialEnabled) {
-        Serial.printf("Wakecycle: %d\n", wakeCycleCount);
+        Serial.printf("Wakecycle: %d/%d\n", wakeCycleCount, cyclesBetweenChecks);
     }
 
-    bool needsUpdateCheck = (wakeCycleCount >= 10) || !isClockValid(sensorData.timestamp);
+    bool updateIntervalReached = wakeCycleCount >= cyclesBetweenChecks;
+    bool needsUpdateCheck = updateIntervalReached || !isClockValid(sensorData.timestamp);
     if (needsUpdateCheck) {
+        // Schedule the next periodic check even when no update beacon is pending.
+        wakeCycleCount = 0;
         if (serialEnabled) {
-            Serial.printf("Checking for updates. Reason: %s\n", (wakeCycleCount >= 10) ? "10 cycles passed" : "Time not synced");
+            Serial.printf("Checking for updates. Reason: %s\n", updateIntervalReached ? "update interval reached" : "Time not synced");
         }
         if (waitForUpdateBeacon()) {
             if (listenForConfig()) {
-                wakeCycleCount = 0; // Reset counter only on successful config reception
+                wakeCycleCount = 0; // Keep the periodic counter reset after successful config reception
             } else {
                 if (serialEnabled) {
                     Serial.println("Failed to Receive Config after beacon.");
@@ -766,8 +793,8 @@ bool listenForConfig()
                 int state = radio.readData((uint8_t*)&rxConfig, sizeof(ConfigPayload));
 
                 if (state == RADIOLIB_ERR_NONE) {
-                    sensorData.lastSNR = radio.getSNR();
-                    sensorData.lastRSSI = radio.getRSSI();
+                    float receivedSNR = radio.getSNR();
+                    float receivedRSSI = radio.getRSSI();
 
                     if (serialEnabled) {
                         uint32_t packetToA = radio.getTimeOnAir(sizeof(ConfigPayload)) / 1000; // Returns microseconds, convert to ms
@@ -797,6 +824,11 @@ bool listenForConfig()
                             if (serialEnabled) Serial.println("Invalid network key. Terminating RX.");
                             break; // Invalid key, terminate early
                         }
+
+                        sensorData.lastSNR = receivedSNR;
+                        sensorData.lastRSSI = receivedRSSI;
+                        rtcLinkMetrics.lastSNR = receivedSNR;
+                        rtcLinkMetrics.lastRSSI = receivedRSSI;
 
                         int txPowerState = radio.setOutputPower(rxConfig.txPower);
                         if (txPowerState != RADIOLIB_ERR_NONE) {

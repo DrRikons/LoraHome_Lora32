@@ -3,15 +3,17 @@ Based on https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/e
 
 For a complete firmware walkthrough, separate Sensor/Gateway architecture diagrams, and LoRa message flows, see [FIRMWARE_GUIDE.md](FIRMWARE_GUIDE.md).
 ## Configuration
-At boot, the Gateway reads `/config.json` from the SD-card root. If absent, it creates the file with blank WiFi/MQTT values, MQTT TLS port `8883`, and sensor defaults of 20 seconds and development mode enabled. Invalid fields retain those defaults.
+At boot, the Gateway reads `/config.json` from the SD-card root. If absent, it creates the file with blank WiFi/MQTT values, MQTT TLS port `8883`, sensor defaults, and an empty `control.commandSecret`. A valid JSON configuration missing any supported section or key is completed with its current default value; invalid fields retain those defaults.
 If a card is inserted after boot, the Gateway retries SD initialization every five seconds and creates the same initial configuration and log directories. A newly created configuration is reported as a template to edit; missing files do not generate read-only VFS errors.
 If the inserted card already contains a valid `/config.json`, its WiFi and MQTT settings are applied immediately without rebooting.
 
 ```json
-{"wifi":{"ssid":"SSID","password":"PASSWORD"},"mqtt":{"host":"broker.example","port":8883,"user":"USER","password":"PASSWORD"},"sensor":{"defaultSleepSeconds":20,"defaultDevMode":true,"defaultTxPower":17}}
+{"wifi":{"ssid":"SSID","password":"PASSWORD"},"mqtt":{"host":"broker.example","port":8883,"user":"USER","password":"PASSWORD"},"sensor":{"defaultSleepSeconds":20,"defaultDevMode":true,"defaultTxPower":17},"control":{"commandSecret":"PRIVATE_SHARED_SECRET"}}
 ```
 
-The sensor node is configured remotely over a two-step LoRa downlink. To conserve power, the sensor listens for a configuration beacon once every 10 sleep cycles, or if its internal clock is not synchronized. It opens the beacon RX window immediately after the telemetry uplink; the Gateway waits 50 ms for this RX turnaround before transmitting the 1-byte beacon. Only if that beacon is received does the Sensor keep its radio on to listen for the full configuration payload. The reception logic dynamically allocates buffer space based on reported packet length to prevent false-negative evaluations or FIFO lockups during RX.
+The sensor node is configured remotely over a two-step LoRa downlink. To conserve power, it checks for a configuration beacon at least every 60 seconds (or every wake for sleep intervals of 60 seconds or more), and whenever its clock is not synchronized. It opens the beacon RX window immediately after the telemetry uplink; the Gateway waits 50 ms for this RX turnaround before transmitting the 1-byte beacon. Only if that beacon is received does the Sensor keep its radio on to listen for the full configuration payload. The reception logic dynamically allocates buffer space based on reported packet length to prevent false-negative evaluations or FIFO lockups during RX.
+
+The Gateway subscribes to `lorahome/sensor/+/config` for signed cloud commands. Commands can override sleep interval (10–255 seconds), Dev Mode, and TX power (-128–127 dBm request range) for a known sensor; the Gateway verifies the HMAC-SHA256 signature, expiry, command UUID, and duplicate status before applying the override to the next Sensor downlink. The Sensor rejects power values unsupported by its installed radio. Set `control.commandSecret` on the Gateway SD card to the cloud service's shared secret.
 
 ### Configuration Payload Format
 
@@ -19,7 +21,7 @@ The configuration payload is a 20-byte binary structure (`ConfigPayload`):
 -   `header`: 2 bytes (`"CF"`) to reject noise.
 -   `targetMac`: 6 bytes. Target MAC address (or `FF:FF:FF:FF:FF:FF` for broadcast).
 -   `networkKey`: 4 bytes. Shared secret key (`NETWORK_KEY`) to prevent unauthorized spoofing.
--   `sleepInterval`: 1 byte. Time in seconds that the device will deep sleep.
+-   `sleepInterval`: 1 byte. Time in seconds that the device will deep sleep (10–255).
 -   `configVersion`: 1 byte. Current configuration schema version (`2`).
 -   `isDevMode`: 1 byte. `1` to enable developer mode continuously without deep sleeping, `0` to disable.
 -   `txPower`: 1 signed byte. Requested LoRa output power in dBm; invalid values for the installed radio are rejected.
@@ -44,10 +46,10 @@ The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/m
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*
 
 ## Telemetry Payload Format
-To maximize LoRa time-on-air efficiency, the sensor transmits telemetry as a packed binary C++ `struct`. The `TelemetryPayload` size is dynamic: 21 bytes in normal Operation Mode and 31 bytes in Dev Mode (which includes extra debugging metrics). The Gateway-configured TX power is present in both formats so it can request an update when they differ. Its public MAC, random boot nonce, and message counter form the AES-CTR nonce; the remainder is encrypted.
+To maximize LoRa time-on-air efficiency, the sensor transmits telemetry as a packed binary C++ `struct`. The `TelemetryPayload` size is dynamic: 21 bytes in normal Operation Mode and 31 bytes in Dev Mode (which includes extra debugging metrics). The Gateway-configured TX power and one-byte sleep interval are present in both formats so it can request an update when they differ. Its public MAC, random boot nonce, and message counter form the AES-CTR nonce; the remainder is encrypted.
 *(Note: The `TelemetryPayload` and `ConfigPayload` structs are defined in `payloads.h` for reusability across Gateway and Sensor modes. Any floating point values like temperature are multiplied before transmission. The Gateway divides them upon receipt to restore the decimal values).*
 
-*Note: SNR and RSSI metrics represent the signal quality of the last received configuration packet from the gateway.*
+*Note: SNR and RSSI metrics represent the signal quality of the last received configuration packet from the gateway and persist across sensor deep sleep and soft resets.*
 
 ## Automation
 This repository includes a GitHub Action (`issue-commenter.yml`) that automatically posts a comment to any GitHub Issue referenced in a commit message (e.g., `#123`).

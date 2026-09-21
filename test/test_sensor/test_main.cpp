@@ -45,10 +45,21 @@ void test_sensor_uses_compact_and_full_sizes() {
     TEST_ASSERT_EQUAL_UINT32(TELEMETRY_FULL_SIZE, txSize);
 }
 
+void test_sensor_configuration_checks_target_sixty_seconds() {
+    TEST_ASSERT_EQUAL_UINT8(6, configurationCheckCycles(10));
+    TEST_ASSERT_EQUAL_UINT8(5, configurationCheckCycles(12));
+    TEST_ASSERT_EQUAL_UINT8(3, configurationCheckCycles(20));
+    TEST_ASSERT_EQUAL_UINT8(2, configurationCheckCycles(25));
+    TEST_ASSERT_EQUAL_UINT8(1, configurationCheckCycles(40));
+    TEST_ASSERT_EQUAL_UINT8(1, configurationCheckCycles(60));
+    TEST_ASSERT_EQUAL_UINT8(1, configurationCheckCycles(120));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_sensor_marks_unset_clock_for_sync);
     RUN_TEST(test_sensor_marks_valid_clock_as_synced);
     RUN_TEST(test_sensor_uses_compact_and_full_sizes);
+    RUN_TEST(test_sensor_configuration_checks_target_sixty_seconds);
     return UNITY_END();
 }

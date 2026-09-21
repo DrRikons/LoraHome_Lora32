@@ -58,6 +58,13 @@ inline bool hasClockDrift(std::time_t currentTime, std::time_t referenceTime, do
     return std::fabs(std::difftime(currentTime, referenceTime)) > thresholdSeconds;
 }
 
+inline std::uint8_t configurationCheckCycles(std::uint8_t sleepIntervalSeconds,
+                                             std::uint8_t maximumCheckIntervalSeconds = 60) {
+    if (sleepIntervalSeconds == 0) return 1;
+    const std::uint8_t cycles = maximumCheckIntervalSeconds / sleepIntervalSeconds;
+    return cycles == 0 ? 1 : cycles;
+}
+
 struct SensorTelemetryInput {
     std::uint8_t mac[6];
     std::uint32_t bootNonce;
