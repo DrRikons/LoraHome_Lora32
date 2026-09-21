@@ -25,10 +25,9 @@ Static review of `modes/Sensor/main.cpp` on 2026-09-21. No hardware current meas
    - Typical chip current is about 330 uA operating and 0.5 uA in shutdown.
    - Implemented INA226 power-down before ESP32 deep sleep. Deep-sleep wake resets and initializes it for the next reading.
 
-5. **Medium: the DS18B20 conversion can keep the ESP32 awake for 750 ms.**
-   - `requestTemperatures()` is blocking.
-   - A 12-bit conversion can take 750 ms; 9-bit takes 93.75 ms.
-   - Use 9- or 10-bit resolution unless finer resolution is required, or overlap an asynchronous conversion with other initialization.
+5. **Resolved: the DS18B20 conversion kept the ESP32 awake for up to 750 ms.**
+   - `requestTemperatures()` remains blocking, but the sensor now uses 9-bit resolution.
+   - Temperature has 0.5 C steps, is displayed with one decimal (for example `45.5`), and conversion takes at most 93.75 ms.
 
 6. **Medium: an invalid clock forces a receive window on every wake.**
    - `checkForUpdates()` checks for a beacon whenever time is invalid.

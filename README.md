@@ -42,6 +42,7 @@ Both valid telemetry packet sizes are published: 21-byte operation-mode payloads
 -   `Sensor`: The sensor node that reads temperature and battery metrics, encrypts them, and sends the data to the gateway before entering a deep sleep state.
 
 Before ESP32 deep sleep, the Sensor places both the LoRa radio and INA226 into their low-power modes. If radio initialization fails, it enters a five-minute fail-safe sleep before retrying instead of remaining awake.
+The DS18B20 uses 9-bit resolution for 0.5 C steps displayed with one decimal and a maximum 93.75 ms conversion time.
 
 The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/main.cpp` (a legacy `GateWay.ino` is also retained for Arduino IDE compatibility).
 

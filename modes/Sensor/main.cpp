@@ -416,6 +416,7 @@ void setup()
 
     // Initialize sensors
     sensors.begin();
+    sensors.setResolution(9); // 0.5 C steps, displayed with one decimal; 93.75 ms max conversion
     ina226Initialized = ina226.init(); // Initialize INA226
     if (ina226Initialized) {
         ina226.setResistorRange(0.1, 1); // 0.1 ohm shunt, range 1

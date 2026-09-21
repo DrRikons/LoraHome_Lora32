@@ -25,6 +25,7 @@ flowchart LR
 ### Responsibilities
 
 The Sensor samples the boiler temperature and battery condition, transmits compact telemetry, briefly listens for a configuration response when needed, then sleeps. It is designed to spend almost all of its time in deep sleep.
+The DS18B20 is configured for 9-bit resolution, giving 0.5 C steps with one-decimal presentation and a maximum 93.75 ms conversion time.
 
 It supports two modes:
 

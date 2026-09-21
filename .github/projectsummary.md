@@ -18,6 +18,7 @@
     *   **Update cadence:** Sensor beacon checks are derived from the active sleep interval, targeting no more than 60 seconds between checks; sleep intervals of 60 seconds or longer check every wake.
     *   **Link metrics:** The Sensor retains the last valid configuration-downlink SNR/RSSI in RTC memory across deep sleep and soft resets for later development telemetry.
     *   **Sleep shutdown:** Before operation-mode deep sleep, the Sensor sleeps the LoRa radio and powers down the INA226. Radio initialization failures retry after a five-minute fail-safe deep sleep.
+    *   **Temperature conversion:** The DS18B20 uses 9-bit resolution for 0.5 C steps and a maximum 93.75 ms blocking conversion.
 *   **Security:**
     *   **LoRa:** Telemetry is encrypted with AES-128-CTR using the public MAC, per-boot random nonce, and message counter as nonce material. Configuration downlinks are authenticated with a shared `NETWORK_KEY`.
     *   **MQTT:** Communication over TLS.
