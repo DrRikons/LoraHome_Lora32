@@ -61,7 +61,7 @@ This repository includes a GitHub Action (`issue-commenter.yml`) that automatica
 When running in `devMode` (either via the `DEV_MODE_PIN` or remote configuration), the sensor accurately simulates its full operational cycle without entering deep sleep. The simulation loop is: Wake -> Transmit -> Short RX for beacon -> (Optional) Long RX for config -> Update Display -> Pause (for the configured sleep duration). This allows for comprehensive testing of the entire device lifecycle without requiring physical resets.
 *Note: The codebase uses hardware interrupt-driven, asynchronous RX/TX routines to prevent blocking loops and hangs. Serial logging is managed by a manual `serialEnabled` flag, which is forced `true` in Dev Mode but can be toggled in Operation Mode for testing.*
 
-In development mode, the INA226 reading taken before TX remains the idle baseline. The sensor samples board power throughout the asynchronous TX and any active post-TX RX windows; the average is published through the existing `battPower` development field on the next telemetry cycle. This keeps the 31-byte payload unchanged and avoids an extra uplink.
+In development mode, the INA226 reading taken before TX remains the idle baseline. The sensor samples voltage and signed current every 20 ms throughout asynchronous TX and active post-TX RX windows. Their signed power average is published through the existing `battPower` development field on the next telemetry cycle. Current direction is determined by the configured shunt orientation. This keeps the 31-byte payload unchanged and avoids an extra uplink.
 
 Sensor serial diagnostics are prefixed with UTC after time synchronization, or elapsed boot time while the RTC is unsynchronized.
 

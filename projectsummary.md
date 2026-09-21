@@ -61,7 +61,7 @@ Sensor temperature uses 9-bit DS18B20 resolution (0.5 C steps, one-decimal displ
 - **Sensor logging**: Serial diagnostics are prefixed with UTC after synchronization, otherwise elapsed boot time.
 - **Sensor link metrics**: Last configuration-downlink SNR/RSSI persist in RTC memory across deep sleep and soft resets so the next development telemetry packet reports them.
 - **Downlink timing**: The Sensor enters beacon RX immediately after uplink; the Gateway waits 50 ms before beacon TX for radio turnaround.
-- **Development power metric**: The pre-TX INA226 reading is retained as idle baseline. Development firmware samples INA226 during asynchronous TX and active RX windows, then sends their average in the existing `battPower` field on the next development telemetry cycle; normal-mode payloads and sizes are unchanged.
+- **Development power metric**: The pre-TX INA226 reading is retained as idle baseline. Development firmware samples voltage and signed current every 20 ms during asynchronous TX and active RX windows, then sends the signed power average in the existing `battPower` field on the next development telemetry cycle; normal-mode payloads and sizes are unchanged.
 - **MQTT telemetry**: The Gateway publishes core data for both 21-byte operation-mode and 31-byte development-mode telemetry packets. TX power and the one-byte sleep interval are included in both formats so Gateway can detect and correct a mismatch.
 
 *Note: This file is intended to provide a condensed context for AI coding assistants. Keep it updated alongside major structural changes.*

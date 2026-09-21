@@ -22,4 +22,4 @@
 *   **Security:**
     *   **LoRa:** Telemetry is encrypted with AES-128-CTR using the public MAC, per-boot random nonce, and message counter as nonce material. Configuration downlinks are authenticated with a shared `NETWORK_KEY`.
     *   **MQTT:** Communication over TLS.
-*   **Development power metric:** The pre-TX INA226 value is the idle baseline. Development mode samples INA226 while LoRa TX and active RX windows run, and reports the completed window average in the existing `battPower` field on the following telemetry cycle; no wire-format change is required.
+*   **Development power metric:** The pre-TX INA226 value is the idle baseline. Development mode samples voltage and signed current every 20 ms while LoRa TX and active RX windows run, and reports the signed power average in the existing `battPower` field on the following telemetry cycle; no wire-format change is required.

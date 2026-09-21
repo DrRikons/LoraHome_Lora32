@@ -29,18 +29,18 @@ Static review of `modes/Sensor/main.cpp` on 2026-09-21. No hardware current meas
    - `requestTemperatures()` remains blocking, but the sensor now uses 9-bit resolution.
    - Temperature has 0.5 C steps, is displayed with one decimal (for example `45.5`), and conversion takes at most 93.75 ms.
 
-6. **Medium: an invalid clock forces a receive window on every wake.**
+6. **Accepted by design: an invalid clock forces a receive window on every wake.**
    - `checkForUpdates()` checks for a beacon whenever time is invalid.
    - If the gateway is unavailable, repeated RX windows add avoidable consumption.
-   - Add retry backoff after several unsuccessful synchronization attempts.
+   - This behavior is intentionally retained so an unsynchronized Sensor checks for gateway time on every wake.
 
-7. **Medium: charge and power telemetry do not match the documentation.**
-   - The firmware takes one INA226 snapshot before TX; it does not average readings during TX and RX.
-   - Negative current is assumed to mean charging, but polarity depends on shunt orientation.
-   - Calculate signed power as bus voltage multiplied by signed current rather than relying on the INA226 power register for reverse flow.
-   - Confirm that `setResistorRange(0.1, 1)` matches the installed shunt and calibrate it.
-   - Check the result of `ina226.init()` and mark readings invalid when initialization fails.
-   - Update the README claim when this behavior is implemented or remove the inaccurate claim separately.
+7. **Resolved: charge and power telemetry did not match the documentation.**
+   - Development mode now samples INA226 voltage and signed current every 20 ms while asynchronous LoRa TX/RX windows are active.
+   - The completed average is sent in `battPower` on the next development telemetry cycle; the first cycle uses the idle reading.
+   - Signed power is calculated as bus voltage multiplied by signed current instead of using the INA226 power register.
+   - The display reports signed `I` and `P` values without assuming that negative current always means charging.
+   - Shunt resistance, current range, and direction are explicit firmware constants and must match the installed wiring.
+   - INA226 initialization failure is checked and produces zeroed battery readings instead of unchecked I2C data.
 
 8. **Low: voltage-derived state of charge is unreliable while charging.**
    - The lookup reports 100% at 4.15 V from one instantaneous sample.
@@ -52,18 +52,14 @@ Static review of `modes/Sensor/main.cpp` on 2026-09-21. No hardware current meas
 - The onboard charger is fixed at 500 mA and is not controlled by firmware.
 - Use a protected cell rated for at least the board's 500 mA charge current.
 - Verify that the INA226 shunt is physically in the battery path. Otherwise it may measure load current but not charging current.
-- Radio standby plus INA226 continuous operation alone use about 46 mAh/day. An ideal 2000 mAh cell would last about 43 days before accounting for the ESP32, regulator, display, sensor conversions, TX, or RX.
+- Before issues 1 and 4 were fixed, radio standby plus INA226 continuous operation alone used about 46 mAh/day.
 - Measure sleep current at the battery with USB disconnected after applying fixes. Board regulators, the OLED, charger circuitry, and external sensor modules can dominate the final result.
 
-## Recommended implementation order
+## Remaining recommendations
 
 1. Use a protected battery and define a low-voltage policy.
-2. Put the LoRa radio to sleep before ESP32 deep sleep.
-3. Add fail-safe deep sleep when radio initialization fails.
-4. Use INA226 triggered conversion and power-down modes.
-5. Reduce or overlap DS18B20 conversion time.
-6. Add time-sync receive backoff.
-7. Calibrate and validate charge telemetry.
+2. Verify the INA226 shunt resistance and current direction against the installed wiring.
+3. Filter or otherwise improve voltage-derived state-of-charge reporting.
 
 ## References
 

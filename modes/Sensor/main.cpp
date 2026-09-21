@@ -155,6 +155,10 @@ static const Module::RfSwitchMode_t low_freq_switch_table[] = {
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature sensors(&oneWire);
 INA226_WE ina226 = INA226_WE(0x40); // INA226 at default I2C address 0x40
+static constexpr float INA226_SHUNT_OHMS = 0.1f;
+static constexpr float INA226_MAX_CURRENT_AMPS = 1.0f;
+// Change to -1.0f if the installed shunt direction should be inverted.
+static constexpr float INA226_CURRENT_DIRECTION = 1.0f;
 
 
 // save transmission state between loops
@@ -179,6 +183,11 @@ static uint32_t lastBeaconRxTime = 0;
 static const uint8_t UPDATE_CHECK_MAX_INTERVAL_SECONDS = 60;
 static const uint32_t RADIO_INIT_RETRY_INTERVAL_SECONDS = 300;
 static bool ina226Initialized = false;
+static const uint32_t ACTIVE_POWER_SAMPLE_INTERVAL_MS = 20;
+static float activePowerSampleSumMw = 0.0f;
+static uint16_t activePowerSampleCount = 0;
+static float completedActivePowerMw = 0.0f;
+static bool completedActivePowerValid = false;
 // Transmission details
 static String deviceId;
 static int screenNum = -1;
@@ -282,6 +291,10 @@ bool waitForUpdateBeacon();
 bool listenForConfig();
 void drawMain();
 void flushSerialOutput();
+void beginActivePowerSampling();
+void sampleActivePower();
+void finishActivePowerSampling();
+bool waitForRadioEvent(uint32_t timeoutMs);
 
 // Check if current time reflects true NTP sync (not just boot epoch + drift)
 bool isClockValid(time_t currentTime) {
@@ -419,7 +432,7 @@ void setup()
     sensors.setResolution(9); // 0.5 C steps, displayed with one decimal; 93.75 ms max conversion
     ina226Initialized = ina226.init(); // Initialize INA226
     if (ina226Initialized) {
-        ina226.setResistorRange(0.1, 1); // 0.1 ohm shunt, range 1
+        ina226.setResistorRange(INA226_SHUNT_OHMS, INA226_MAX_CURRENT_AMPS);
     } else if (serialEnabled) {
         Serial.println("INA226 init failed; power readings may be invalid.");
     }
@@ -557,18 +570,67 @@ uint8_t getBatteryPercentage(float voltage) {
     return 100;
 }
 
+// Starts a development-mode measurement window for LoRa TX and active RX power.
+void beginActivePowerSampling() {
+    activePowerSampleSumMw = 0.0f;
+    activePowerSampleCount = 0;
+}
+
+// Samples signed battery power. V * mA yields mW.
+void sampleActivePower() {
+    if (!devMode || !ina226Initialized) {
+        return;
+    }
+
+    float voltage = ina226.getBusVoltage_V();
+    float current = ina226.getCurrent_mA() * INA226_CURRENT_DIRECTION;
+    activePowerSampleSumMw += voltage * current;
+    activePowerSampleCount++;
+}
+
+// Retains the completed average for the next development telemetry packet.
+void finishActivePowerSampling() {
+    if (devMode && activePowerSampleCount > 0) {
+        completedActivePowerMw = activePowerSampleSumMw / activePowerSampleCount;
+        completedActivePowerValid = true;
+    }
+}
+
+// Waits for a radio interrupt while periodically sampling power in development mode.
+bool waitForRadioEvent(uint32_t timeoutMs) {
+    uint32_t startTime = millis();
+
+    while (millis() - startTime < timeoutMs) {
+        uint32_t elapsed = millis() - startTime;
+        uint32_t remaining = timeoutMs - elapsed;
+        uint32_t waitMs = (devMode && ina226Initialized && remaining > ACTIVE_POWER_SAMPLE_INTERVAL_MS)
+                            ? ACTIVE_POWER_SAMPLE_INTERVAL_MS
+                            : remaining;
+
+        if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(waitMs)) == pdTRUE) {
+            sampleActivePower();
+            return true;
+        }
+        sampleActivePower();
+    }
+
+    return false;
+}
+
 // single operational cycle: read, transmit, and check for updates.
 // Used in: Both Operation and Dev modes
 void wakeCycle() {
 
     if (serialEnabled) Serial.println("\n--- Wake, Read Sensors ---");
     readSensors();
+    beginActivePowerSampling();
     
     if (serialEnabled) Serial.println("--- Transmit ---");
     transmitData();
 
 
     checkForUpdates();
+    finishActivePowerSampling();
 }   
 
 // Reads data from connected sensors (DS18B20, INA226) and internal ESP32 metrics (CPU temp, RAM).
@@ -583,11 +645,23 @@ void readSensors()
     sensors.requestTemperatures();
     sensorData.temperature = sensors.getTempCByIndex(0);
 
-    // Read INA226 data
-    sensorData.batteryVoltage = ina226.getBusVoltage_V();
-    sensorData.batteryCurrent = ina226.getCurrent_mA();
-    sensorData.batteryPower = ina226.getBusPower();
-    sensorData.batteryPercent = getBatteryPercentage(sensorData.batteryVoltage);
+    // Read INA226 data. Power is calculated from signed current so charge and
+    // discharge direction is preserved instead of using the unsigned power register.
+    if (ina226Initialized) {
+        sensorData.batteryVoltage = ina226.getBusVoltage_V();
+        sensorData.batteryCurrent = ina226.getCurrent_mA() * INA226_CURRENT_DIRECTION;
+        float idlePowerMw = sensorData.batteryVoltage * sensorData.batteryCurrent;
+        sensorData.batteryPower = (devMode && completedActivePowerValid)
+                                  ? completedActivePowerMw
+                                  : idlePowerMw;
+        completedActivePowerValid = false;
+        sensorData.batteryPercent = getBatteryPercentage(sensorData.batteryVoltage);
+    } else {
+        sensorData.batteryVoltage = 0.0f;
+        sensorData.batteryCurrent = 0.0f;
+        sensorData.batteryPower = 0.0f;
+        sensorData.batteryPercent = 0;
+    }
 
     // Read ESP32 internals
     sensorData.cpuTemp = temperatureRead();
@@ -674,6 +748,7 @@ void transmitData()
         radio.standby();
         return;
     }
+    sampleActivePower();
 
     if (serialEnabled) {
         Serial.printf("Transmitting binary payload (%d bytes): %s\n", txSize, payload.c_str());
@@ -681,7 +756,7 @@ void transmitData()
 
     // Wait for transmission to complete (with 5 second timeout) using FreeRTOS Block state
     uint32_t startWait = millis();
-    if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    if (!waitForRadioEvent(5000)) {
         if (serialEnabled) Serial.println("Warning: TX timeout!");
     }
     lastTxTime = millis() - startWait;
@@ -737,6 +812,7 @@ bool waitForUpdateBeacon()
 {
     xSemaphoreTake(radioSemaphore, 0); // Clear semaphore
     radio.startReceive();// Start non-blocking background reception
+    sampleActivePower();
     unsigned long startTime = millis();
     // Allow the gateway enough scheduling headroom to switch from RX to TX.
     uint32_t beaconAirtimeMs = (radio.getTimeOnAir(1) / 1000) + 250;
@@ -745,7 +821,7 @@ bool waitForUpdateBeacon()
         uint32_t remaining = beaconAirtimeMs > elapsed ? beaconAirtimeMs - elapsed : 0;
         if (remaining == 0) break;
 
-        if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(remaining)) == pdTRUE) {
+        if (waitForRadioEvent(remaining)) {
             int numBytes = radio.getPacketLength();
             uint8_t rxBuffer[256];
             int state = radio.readData(rxBuffer, numBytes);
@@ -764,6 +840,7 @@ bool waitForUpdateBeacon()
                 Serial.printf("RX Error: %d. Retrying...\n", state);
             }
             radio.startReceive(); 
+            sampleActivePower();
         }
         if (serialEnabled) {
                     Serial.printf("timeout while trying to find beacon.");
@@ -784,6 +861,7 @@ bool listenForConfig()
 {
     xSemaphoreTake(radioSemaphore, 0); // Clear semaphore
     radio.startReceive(); // Start non-blocking background reception
+    sampleActivePower();
     unsigned long startTime = millis();
     bool configReceived = false;
     bool needsRestart = false;
@@ -793,7 +871,7 @@ bool listenForConfig()
         uint32_t remaining = 5000 > elapsed ? 5000 - elapsed : 0;
         if (remaining == 0) break;
 
-        if (xSemaphoreTake(radioSemaphore, pdMS_TO_TICKS(remaining)) == pdTRUE) {
+        if (waitForRadioEvent(remaining)) {
             // Verify packet length matches our expected Config struct size
             if (radio.getPacketLength() == sizeof(ConfigPayload)) {
                 ConfigPayload rxConfig;
@@ -990,13 +1068,9 @@ void drawMain()
 
             case 1: // Power Details
                 disp->setCursor(5, 15);
-                if (sensorData.batteryCurrent < 0) {
-                    disp->printf("Chg: %.0fmA", sensorData.batteryCurrent);
-                } else {
-                    disp->printf("Curr: %.0fmA", sensorData.batteryCurrent);
-                }
+                disp->printf("I: %+.0fmA", sensorData.batteryCurrent);
                 disp->setCursor(5, 30);
-                disp->printf("Power: %.0fmW", sensorData.batteryPower);
+                disp->printf("P: %+.0fmW", sensorData.batteryPower);
                 disp->setCursor(5, 45);
                 disp->printf("RAM: %u KB", sensorData.freeRam);
                 break;
