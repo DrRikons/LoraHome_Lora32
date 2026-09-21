@@ -187,6 +187,9 @@ static const uint32_t LOW_BATTERY_SLEEP_INTERVAL_SECONDS = 3600;
 static constexpr float LOW_BATTERY_CUTOFF_VOLTS = 3.2f;
 static constexpr float LOW_BATTERY_RECOVERY_VOLTS = 3.4f;
 static bool ina226Initialized = false;
+static const uint32_t DS18B20_CONVERSION_TIME_MS = 94;
+static uint32_t temperatureConversionStartedAt = 0;
+static bool temperatureConversionPending = false;
 static const uint32_t ACTIVE_POWER_SAMPLE_INTERVAL_MS = 20;
 static float activePowerSampleSumMw = 0.0f;
 static uint16_t activePowerSampleCount = 0;
@@ -299,6 +302,8 @@ void beginActivePowerSampling();
 void sampleActivePower();
 void finishActivePowerSampling();
 bool waitForRadioEvent(uint32_t timeoutMs);
+void startTemperatureConversion();
+bool batteryRequiresLockout(float voltage);
 
 // Check if current time reflects true NTP sync (not just boot epoch + drift)
 bool isClockValid(time_t currentTime) {
@@ -434,11 +439,27 @@ void setup()
     // Initialize sensors
     sensors.begin();
     sensors.setResolution(9); // 0.5 C steps, displayed with one decimal; 93.75 ms max conversion
+    sensors.setWaitForConversion(false);
+    startTemperatureConversion(); // Overlap conversion with INA226 and radio initialization
     ina226Initialized = ina226.init(); // Initialize INA226
     if (ina226Initialized) {
         ina226.setResistorRange(INA226_SHUNT_OHMS, INA226_MAX_CURRENT_AMPS);
     } else if (serialEnabled) {
         Serial.println("INA226 init failed; power readings may be invalid.");
+    }
+
+    // Avoid paying the radio initialization cost while the battery is locked out.
+    if (ina226Initialized) {
+        delay(3); // Allow the initial 1.1 ms shunt + bus conversions to complete.
+        float earlyBatteryVoltage = ina226.getBusVoltage_V();
+        if (batteryRequiresLockout(earlyBatteryVoltage)) {
+            if (serialEnabled) {
+                Serial.printf("Battery %.2fV below safe operating threshold; skipping radio initialization.\n",
+                              earlyBatteryVoltage);
+            }
+            enterDeepSleep(LOW_BATTERY_SLEEP_INTERVAL_SECONDS);
+            return;
+        }
     }
 
     // Radio setup (same as before, but only if not sleeping)
@@ -518,6 +539,7 @@ void loop()
             disp->clearBuffer();
             disp->sendBuffer();
         }
+        startTemperatureConversion(); // Complete during the simulated sleep interval
         delay(config.sleepInterval * 1000); // Simulate deep sleep from cfg file
 
         // run the operating cycle
@@ -621,6 +643,20 @@ bool waitForRadioEvent(uint32_t timeoutMs) {
     return false;
 }
 
+void startTemperatureConversion() {
+    sensors.requestTemperatures();
+    temperatureConversionStartedAt = millis();
+    temperatureConversionPending = true;
+}
+
+bool batteryRequiresLockout(float voltage) {
+    bool batteryStillLow = lowBatteryLockout
+                           ? voltage < LOW_BATTERY_RECOVERY_VOLTS
+                           : voltage <= LOW_BATTERY_CUTOFF_VOLTS;
+    lowBatteryLockout = batteryStillLow;
+    return batteryStillLow;
+}
+
 // single operational cycle: read, transmit, and check for updates.
 // Used in: Both Operation and Dev modes
 void wakeCycle() {
@@ -628,20 +664,13 @@ void wakeCycle() {
     if (serialEnabled) Serial.println("\n--- Wake, Read Sensors ---");
     readSensors();
 
-    if (ina226Initialized) {
-        bool batteryStillLow = lowBatteryLockout
-                               ? sensorData.batteryVoltage < LOW_BATTERY_RECOVERY_VOLTS
-                               : sensorData.batteryVoltage <= LOW_BATTERY_CUTOFF_VOLTS;
-        if (batteryStillLow) {
-            lowBatteryLockout = true;
+    if (ina226Initialized && batteryRequiresLockout(sensorData.batteryVoltage)) {
             if (serialEnabled) {
                 Serial.printf("Battery %.2fV below safe operating threshold; suppressing radio and sleeping.\n",
                               sensorData.batteryVoltage);
             }
             enterDeepSleep(LOW_BATTERY_SLEEP_INTERVAL_SECONDS);
             return;
-        }
-        lowBatteryLockout = false;
     }
 
     beginActivePowerSampling();
@@ -662,9 +691,16 @@ void readSensors()
     sensorData.lastSNR = rtcLinkMetrics.lastSNR;
     sensorData.lastRSSI = rtcLinkMetrics.lastRSSI;
     
-    // Read DS18B20 temperature
-    sensors.requestTemperatures();
+    // Read the asynchronous DS18B20 conversion started during initialization or Dev sleep.
+    if (!temperatureConversionPending) {
+        startTemperatureConversion();
+    }
+    uint32_t conversionElapsed = millis() - temperatureConversionStartedAt;
+    if (conversionElapsed < DS18B20_CONVERSION_TIME_MS) {
+        delay(DS18B20_CONVERSION_TIME_MS - conversionElapsed);
+    }
     sensorData.temperature = sensors.getTempCByIndex(0);
+    temperatureConversionPending = false;
 
     // Read INA226 data. Power is calculated from signed current so charge and
     // discharge direction is preserved instead of using the unsigned power register.

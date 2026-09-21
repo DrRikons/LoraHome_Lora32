@@ -28,6 +28,7 @@ The Sensor samples the boiler temperature and battery condition, transmits compa
 The DS18B20 is configured for 9-bit resolution, giving 0.5 C steps with one-decimal presentation and a maximum 93.75 ms conversion time.
 In development mode, INA226 voltage and signed current are sampled every 20 ms during asynchronous LoRa TX and active RX. The signed power average is transmitted in `battPower` on the following cycle.
 At 3.2 V or below, a retained low-voltage lockout suppresses radio activity and deep-sleeps for one hour. Normal operation resumes at 3.4 V; this safety policy overrides development mode but does not replace a protected cell.
+The voltage check occurs before radio initialization. DS18B20 conversion runs asynchronously during initialization or the development-mode simulated sleep, with only any remaining conversion time waited in `readSensors()`.
 
 It supports two modes:
 

@@ -12,12 +12,13 @@ Gateway loop processing gives queued radio events priority over SD, network, dis
 Gateway subscribes to `lorahome/sensor/+/config` and accepts signed, non-expired per-sensor MQTT overrides for Dev Mode, 10–255 second sleep intervals, and signed 8-bit TX-power requests (-128–127 dBm). Commands require a known Sensor MAC, unique UUID, and HMAC-SHA256 with `control.commandSecret` from Gateway SD configuration; accepted overrides are used by the next LoRa downlink and live only in Gateway RAM. The Sensor rejects TX-power requests unsupported by its installed radio; cloud implementations must enforce the fixed sleep range and signed-8-bit TX-power range.
 
 Detailed implementation documentation and separate Sensor/Gateway workflow diagrams are in `FIRMWARE_GUIDE.md`.
-The pending Sensor power-consumption and battery-charging audit is recorded in `SENSOR_POWER_REVIEW.md`.
+The Sensor power audits are recorded in `SENSOR_POWER_REVIEW.md` and the non-destructive follow-up `SENSOR_POWER_REVIEW_FOLLOWUP.md`.
 
 Sensors derive their periodic update-beacon cadence from the configured sleep interval, targeting no more than 60 seconds between checks; sleep intervals of 60 seconds or longer check every wake. The counter resets after each check so an absent beacon does not cause continuous RX polling.
 Before operation-mode deep sleep, Sensors put the LoRa radio to sleep and the INA226 into power-down mode. A radio initialization failure uses a five-minute fail-safe sleep before retrying.
 Sensor temperature uses 9-bit DS18B20 resolution (0.5 C steps, one-decimal display) to limit blocking conversion time to 93.75 ms.
 Sensor low-voltage lockout suppresses radio activity at 3.2 V or below, sleeps for one hour, and requires recovery to 3.4 V. It overrides Dev Mode but does not replace a protected battery.
+The lockout voltage is checked before radio initialization. The 9-bit DS18B20 conversion runs asynchronously during peripheral/radio initialization or Dev Mode's simulated sleep.
 
 ## Architecture Overview
 1.  **Gateway (`modes/GateWay/main.cpp`)**: 

@@ -20,6 +20,7 @@
     *   **Sleep shutdown:** Before operation-mode deep sleep, the Sensor sleeps the LoRa radio and powers down the INA226. Radio initialization failures retry after a five-minute fail-safe deep sleep.
     *   **Temperature conversion:** The DS18B20 uses 9-bit resolution for 0.5 C steps and a maximum 93.75 ms blocking conversion.
     *   **Low-voltage lockout:** At 3.2 V or below, the Sensor suppresses radio activity and deep-sleeps for one hour. A retained lockout requires recovery to 3.4 V and overrides development mode; a protected battery is still required.
+    *   **Wake optimization:** Battery lockout is checked before radio initialization, and asynchronous DS18B20 conversion overlaps initialization or development-mode simulated sleep.
 *   **Security:**
     *   **LoRa:** Telemetry is encrypted with AES-128-CTR using the public MAC, per-boot random nonce, and message counter as nonce material. Configuration downlinks are authenticated with a shared `NETWORK_KEY`.
     *   **MQTT:** Communication over TLS.

@@ -44,6 +44,7 @@ Both valid telemetry packet sizes are published: 21-byte operation-mode payloads
 Before ESP32 deep sleep, the Sensor places both the LoRa radio and INA226 into their low-power modes. If radio initialization fails, it enters a five-minute fail-safe sleep before retrying instead of remaining awake.
 The DS18B20 uses 9-bit resolution for 0.5 C steps displayed with one decimal and a maximum 93.75 ms conversion time.
 At 3.2 V or below, the Sensor suppresses radio activity and sleeps for one hour. Normal operation resumes after the battery recovers to 3.4 V. This firmware policy also applies in development mode and does not replace the T3 V1.6.1 requirement for a protected lithium-ion cell.
+The low-battery check runs before radio initialization. DS18B20 conversion is asynchronous and overlaps peripheral/radio initialization, or the simulated sleep interval in development mode.
 
 The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/main.cpp` (a legacy `GateWay.ino` is also retained for Arduino IDE compatibility).
 
