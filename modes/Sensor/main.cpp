@@ -177,6 +177,8 @@ static uint32_t lastTxTime = 0;
 static uint32_t lastRxTime = 0;
 static uint32_t lastBeaconRxTime = 0;
 static const uint8_t UPDATE_CHECK_MAX_INTERVAL_SECONDS = 60;
+static const uint32_t RADIO_INIT_RETRY_INTERVAL_SECONDS = 300;
+static bool ina226Initialized = false;
 // Transmission details
 static String deviceId;
 static int screenNum = -1;
@@ -273,7 +275,7 @@ RTC_NOINIT_ATTR Config rtcConfig; // NOINIT ensures it survives SW_CPU_RESET (ES
 // Function Prototypes
 void readSensors();
 void transmitData();
-void enterDeepSleep();
+void enterDeepSleep(uint32_t sleepSeconds = 0);
 void wakeCycle();
 void checkForUpdates();
 bool waitForUpdateBeacon();
@@ -414,8 +416,12 @@ void setup()
 
     // Initialize sensors
     sensors.begin();
-    ina226.init(); // Initialize INA226
-    ina226.setResistorRange(0.1, 1); // 0.1 ohm shunt, range 1
+    ina226Initialized = ina226.init(); // Initialize INA226
+    if (ina226Initialized) {
+        ina226.setResistorRange(0.1, 1); // 0.1 ohm shunt, range 1
+    } else if (serialEnabled) {
+        Serial.println("INA226 init failed; power readings may be invalid.");
+    }
 
     // Radio setup (same as before, but only if not sleeping)
     int state = radio.begin();
@@ -424,9 +430,9 @@ void setup()
             Serial.print(F("Radio init failed: "));
             Serial.println(state);
         }
+        enterDeepSleep(RADIO_INIT_RETRY_INTERVAL_SECONDS);
         return;
     }
-
     // Set radio parameters (same as before)
     radio.setFrequency(CONFIG_RADIO_FREQ);
     radio.setBandwidth(CONFIG_RADIO_BW);
@@ -921,15 +927,31 @@ bool listenForConfig()
 
 // Handles sleep timing, conditionally triggering the configuration listener, and deep sleeping the ESP32.
 // Used in: Both Operation and Dev modes (skips actual esp_deep_sleep_start in Dev mode)
-void enterDeepSleep()
+void enterDeepSleep(uint32_t sleepSeconds)
 {
+    uint32_t requestedSleepSeconds = sleepSeconds > 0 ? sleepSeconds : config.sleepInterval;
+
     if (serialEnabled) {
-        Serial.printf("Entering deep sleep for %d seconds\n", config.sleepInterval);
+        Serial.printf("Entering deep sleep for %u seconds\n", requestedSleepSeconds);
+    }
+
+    // Attempt this even after an initialization failure so a partially responsive
+    // external radio is not left in standby while the ESP32 sleeps.
+    int16_t radioSleepState = radio.sleep();
+    if (radioSleepState != RADIOLIB_ERR_NONE && serialEnabled) {
+        Serial.printf("Radio sleep failed: %d\n", radioSleepState);
+    }
+
+    if (ina226Initialized) {
+        ina226.setMeasureMode(INA226_POWER_DOWN);
+    }
+
+    if (serialEnabled) {
         flushSerialOutput();
     }
 
     // Configure wake up timer
-    esp_sleep_enable_timer_wakeup(config.sleepInterval * 1000000ULL); // microseconds
+    esp_sleep_enable_timer_wakeup(requestedSleepSeconds * 1000000ULL); // microseconds
 
     // Enter deep sleep
     esp_deep_sleep_start();

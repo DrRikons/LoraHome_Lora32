@@ -15,6 +15,7 @@ Detailed implementation documentation and separate Sensor/Gateway workflow diagr
 The pending Sensor power-consumption and battery-charging audit is recorded in `SENSOR_POWER_REVIEW.md`.
 
 Sensors derive their periodic update-beacon cadence from the configured sleep interval, targeting no more than 60 seconds between checks; sleep intervals of 60 seconds or longer check every wake. The counter resets after each check so an absent beacon does not cause continuous RX polling.
+Before operation-mode deep sleep, Sensors put the LoRa radio to sleep and the INA226 into power-down mode. A radio initialization failure uses a five-minute fail-safe sleep before retrying.
 
 ## Architecture Overview
 1.  **Gateway (`modes/GateWay/main.cpp`)**: 

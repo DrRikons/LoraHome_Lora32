@@ -28,7 +28,7 @@ The Sensor samples the boiler temperature and battery condition, transmits compa
 
 It supports two modes:
 
-- **Operation mode:** performs one wake cycle in `setup()` and enters ESP32 deep sleep. `loop()` is not reached.
+- **Operation mode:** performs one wake cycle in `setup()`, puts the LoRa radio and INA226 into low-power modes, and enters ESP32 deep sleep. A radio initialization failure enters a five-minute fail-safe sleep before retrying.
 - **Development mode:** does not deep sleep. `loop()` delays for the configured interval, runs the same wake cycle, and refreshes the display. It can be enabled with GPIO13 held LOW or remotely with configuration.
 
 ### Sensor architecture

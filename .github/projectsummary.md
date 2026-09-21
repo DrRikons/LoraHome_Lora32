@@ -17,6 +17,7 @@
     *   **Cloud (MQTT):** Gateway subscribes to `lorahome/sensor/+/config`; signed, non-expired commands override sleep (10–255 seconds), Dev Mode, and signed 8-bit TX-power requests (-128–127 dBm) for known Sensors until Gateway reboot. The Sensor rejects power unsupported by its installed radio. On load, valid SD configuration JSON is completed with missing supported objects and default keys, including `control.commandSecret`.
     *   **Update cadence:** Sensor beacon checks are derived from the active sleep interval, targeting no more than 60 seconds between checks; sleep intervals of 60 seconds or longer check every wake.
     *   **Link metrics:** The Sensor retains the last valid configuration-downlink SNR/RSSI in RTC memory across deep sleep and soft resets for later development telemetry.
+    *   **Sleep shutdown:** Before operation-mode deep sleep, the Sensor sleeps the LoRa radio and powers down the INA226. Radio initialization failures retry after a five-minute fail-safe deep sleep.
 *   **Security:**
     *   **LoRa:** Telemetry is encrypted with AES-128-CTR using the public MAC, per-boot random nonce, and message counter as nonce material. Configuration downlinks are authenticated with a shared `NETWORK_KEY`.
     *   **MQTT:** Communication over TLS.

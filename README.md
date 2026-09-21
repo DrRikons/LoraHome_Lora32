@@ -41,6 +41,8 @@ Gateway status contains radio RSSI/SNR, WiFi state, IP address, and free RAM. Fr
 Both valid telemetry packet sizes are published: 21-byte operation-mode payloads publish core data, while 31-byte development payloads also publish the development metrics.
 -   `Sensor`: The sensor node that reads temperature and battery metrics, encrypts them, and sends the data to the gateway before entering a deep sleep state.
 
+Before ESP32 deep sleep, the Sensor places both the LoRa radio and INA226 into their low-power modes. If radio initialization fails, it enters a five-minute fail-safe sleep before retrying instead of remaining awake.
+
 The core logic files are located in `modes/Sensor/main.cpp` and `modes/GateWay/main.cpp` (a legacy `GateWay.ino` is also retained for Arduino IDE compatibility).
 
 *Note: All functions in `main.cpp` are documented inline to indicate whether they are executed in normal Operation mode, Development mode, or both.*

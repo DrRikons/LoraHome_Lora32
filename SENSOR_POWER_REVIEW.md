@@ -4,26 +4,26 @@ Static review of `modes/Sensor/main.cpp` on 2026-09-21. No hardware current meas
 
 ## Findings
 
-1. **High: SX1276 remains in standby during ESP32 deep sleep.**
-   - `transmitData()` and the receive paths finish with `radio.standby()`.
-   - `enterDeepSleep()` starts ESP32 deep sleep without calling `radio.sleep()`.
+1. **Resolved: SX1276 remained in standby during ESP32 deep sleep.**
+   - Previously, `transmitData()` and the receive paths finished with `radio.standby()`.
+   - Previously, `enterDeepSleep()` started ESP32 deep sleep without calling `radio.sleep()`.
    - SX1276 standby is approximately 1.6 mA, while radio sleep is approximately 0.2 uA.
-   - Call `radio.sleep()` immediately before ESP32 deep sleep and handle any returned error.
+   - Implemented `radio.sleep()` immediately before ESP32 deep sleep with error reporting.
 
-2. **High: radio initialization failure leaves the ESP32 awake indefinitely.**
-   - `setup()` returns when `radio.begin()` fails.
-   - Operation-mode `loop()` is empty, so the device never reaches deep sleep.
-   - Enter a long fail-safe sleep and retry on a later wake.
+2. **Resolved: radio initialization failure left the ESP32 awake indefinitely.**
+   - Previously, `setup()` returned when `radio.begin()` failed.
+   - Because operation-mode `loop()` is empty, the device did not reach deep sleep.
+   - Implemented a five-minute fail-safe deep sleep before retrying initialization.
 
 3. **High: the board has no BMS and firmware has no low-voltage policy.**
    - Battery percentage becomes 0 below 3.0 V, but sensing and full-power transmission continue.
    - LilyGO requires a protected lithium-ion battery for the T3 V1.6.1.
    - Add a conservative low-voltage long-sleep/cutoff policy, but do not treat firmware as a substitute for cell protection.
 
-4. **Medium: INA226 stays in continuous-conversion mode during sleep.**
-   - The INA226 is initialized but never placed in power-down mode.
+4. **Resolved: INA226 stayed in continuous-conversion mode during sleep.**
+   - Previously, the INA226 was initialized but never placed in power-down mode.
    - Typical chip current is about 330 uA operating and 0.5 uA in shutdown.
-   - Prefer a triggered reading after wake and power-down before ESP32 deep sleep.
+   - Implemented INA226 power-down before ESP32 deep sleep. Deep-sleep wake resets and initializes it for the next reading.
 
 5. **Medium: the DS18B20 conversion can keep the ESP32 awake for 750 ms.**
    - `requestTemperatures()` is blocking.
