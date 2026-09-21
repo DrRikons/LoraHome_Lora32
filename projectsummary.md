@@ -17,6 +17,7 @@ The pending Sensor power-consumption and battery-charging audit is recorded in `
 Sensors derive their periodic update-beacon cadence from the configured sleep interval, targeting no more than 60 seconds between checks; sleep intervals of 60 seconds or longer check every wake. The counter resets after each check so an absent beacon does not cause continuous RX polling.
 Before operation-mode deep sleep, Sensors put the LoRa radio to sleep and the INA226 into power-down mode. A radio initialization failure uses a five-minute fail-safe sleep before retrying.
 Sensor temperature uses 9-bit DS18B20 resolution (0.5 C steps, one-decimal display) to limit blocking conversion time to 93.75 ms.
+Sensor low-voltage lockout suppresses radio activity at 3.2 V or below, sleeps for one hour, and requires recovery to 3.4 V. It overrides Dev Mode but does not replace a protected battery.
 
 ## Architecture Overview
 1.  **Gateway (`modes/GateWay/main.cpp`)**: 

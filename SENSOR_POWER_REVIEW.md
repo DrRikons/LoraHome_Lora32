@@ -15,10 +15,12 @@ Static review of `modes/Sensor/main.cpp` on 2026-09-21. No hardware current meas
    - Because operation-mode `loop()` is empty, the device did not reach deep sleep.
    - Implemented a five-minute fail-safe deep sleep before retrying initialization.
 
-3. **High: the board has no BMS and firmware has no low-voltage policy.**
-   - Battery percentage becomes 0 below 3.0 V, but sensing and full-power transmission continue.
+3. **Resolved in firmware: the board has no BMS and previously had no low-voltage policy.**
+   - At 3.2 V or below, firmware now suppresses radio TX/RX and enters a one-hour deep sleep.
+   - A retained lockout requires recovery to 3.4 V before normal operation resumes, preventing rapid cycling near the threshold.
+   - The policy also overrides development mode.
    - LilyGO requires a protected lithium-ion battery for the T3 V1.6.1.
-   - Add a conservative low-voltage long-sleep/cutoff policy, but do not treat firmware as a substitute for cell protection.
+   - Firmware is not a substitute for cell protection; a protected battery remains mandatory.
 
 4. **Resolved: INA226 stayed in continuous-conversion mode during sleep.**
    - Previously, the INA226 was initialized but never placed in power-down mode.
@@ -57,7 +59,7 @@ Static review of `modes/Sensor/main.cpp` on 2026-09-21. No hardware current meas
 
 ## Remaining recommendations
 
-1. Use a protected battery and define a low-voltage policy.
+1. Use a protected battery despite the firmware low-voltage policy.
 2. Verify the INA226 shunt resistance and current direction against the installed wiring.
 3. Filter or otherwise improve voltage-derived state-of-charge reporting.
 

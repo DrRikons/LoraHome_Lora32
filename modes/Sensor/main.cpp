@@ -168,6 +168,7 @@ static SemaphoreHandle_t radioSemaphore = NULL;
 RTC_DATA_ATTR static uint16_t counter = 0;
 RTC_DATA_ATTR static uint8_t wakeCycleCount = 0;
 RTC_DATA_ATTR static uint32_t bootNonce = 0;
+RTC_DATA_ATTR static bool lowBatteryLockout = false;
 
 struct LinkMetrics {
   uint32_t magicWord;
@@ -182,6 +183,9 @@ static uint32_t lastRxTime = 0;
 static uint32_t lastBeaconRxTime = 0;
 static const uint8_t UPDATE_CHECK_MAX_INTERVAL_SECONDS = 60;
 static const uint32_t RADIO_INIT_RETRY_INTERVAL_SECONDS = 300;
+static const uint32_t LOW_BATTERY_SLEEP_INTERVAL_SECONDS = 3600;
+static constexpr float LOW_BATTERY_CUTOFF_VOLTS = 3.2f;
+static constexpr float LOW_BATTERY_RECOVERY_VOLTS = 3.4f;
 static bool ina226Initialized = false;
 static const uint32_t ACTIVE_POWER_SAMPLE_INTERVAL_MS = 20;
 static float activePowerSampleSumMw = 0.0f;
@@ -623,6 +627,23 @@ void wakeCycle() {
 
     if (serialEnabled) Serial.println("\n--- Wake, Read Sensors ---");
     readSensors();
+
+    if (ina226Initialized) {
+        bool batteryStillLow = lowBatteryLockout
+                               ? sensorData.batteryVoltage < LOW_BATTERY_RECOVERY_VOLTS
+                               : sensorData.batteryVoltage <= LOW_BATTERY_CUTOFF_VOLTS;
+        if (batteryStillLow) {
+            lowBatteryLockout = true;
+            if (serialEnabled) {
+                Serial.printf("Battery %.2fV below safe operating threshold; suppressing radio and sleeping.\n",
+                              sensorData.batteryVoltage);
+            }
+            enterDeepSleep(LOW_BATTERY_SLEEP_INTERVAL_SECONDS);
+            return;
+        }
+        lowBatteryLockout = false;
+    }
+
     beginActivePowerSampling();
     
     if (serialEnabled) Serial.println("--- Transmit ---");
